@@ -1,0 +1,121 @@
+/* DO NOT EDIT — generated from packages/design-tokens/tokens.json by packages/design-tokens/scripts/generate.mjs.
+Change the JSON and re-run `pnpm --filter @panda/design-tokens build`. */
+
+/* Graphite & Brass — desktop (dark only; the renderer sets color-scheme: dark). */
+:root {
+  /* Surfaces: a five-step ladder plus `overlay` for anything that floats. */
+  --app-bg: #121315;
+  --sidebar: #17181b;
+  --panel-soft: #181a1e;
+  --panel: #1b1d21;
+  --panel-strong: #23262b;
+  --panel-hover: #22252a;
+  --hover-wash: rgba(255, 255, 255, 0.06);
+  --hover-wash-strong: rgba(255, 255, 255, 0.1);
+  --scrim: rgba(4, 6, 10, 0.62);
+  --overlay: #1e2126;
+  --input-bg: #11151d;
+
+  /* Hairlines: soft = internal division, base = component edge, hi = hover. */
+  --line-soft: #262a31;
+  --line: #30343b;
+  --line-hi: #3d434c;
+
+  /* Four text levels. If you need a fifth, the layout is wrong. */
+  --text: #f0f2f4;
+  --muted: #a3abb6;
+  --subtle: #727b88;
+  --placeholder: #5d6672;
+
+  /* The one accent. Every selected state derives from here. */
+  --accent-solid: #8f6b27;
+  --accent-on: #fff6e2;
+  --accent-text: #d0a85d;
+  --accent-text-hi: #e7c98c;
+  --accent-edge: rgba(208, 168, 93, 0.34);
+  --accent-edge-strong: rgba(208, 168, 93, 0.62);
+  --accent-wash: rgba(208, 168, 93, 0.13);
+  --accent-wash-strong: rgba(208, 168, 93, 0.26);
+
+  /* Status colours are semantic only — never decorative. */
+  --run-solid: #2f6948;
+  --run-on: #eafff2;
+  --run-text: #66c98b;
+  --run-edge: rgba(102, 201, 139, 0.28);
+  --run-wash: rgba(102, 201, 139, 0.13);
+  --warn-solid: #6a5426;
+  --warn-on: #f5e4bd;
+  --warn-text: #dfb45f;
+  --warn-edge: rgba(223, 180, 95, 0.28);
+  --warn-wash: rgba(223, 180, 95, 0.12);
+  --danger-solid: #753641;
+  --danger-on: #ffe4e8;
+  --danger-text: #ef6a7a;
+  --danger-edge: rgba(239, 106, 122, 0.28);
+  --danger-wash: rgba(239, 106, 122, 0.12);
+  --info-solid: #2a5480;
+  --info-on: #eaf3ff;
+  --info-text: #7ab7ff;
+  --info-edge: rgba(122, 183, 255, 0.3);
+  --info-wash: rgba(122, 183, 255, 0.13);
+  --agent-solid: #4c3475;
+  --agent-on: #f3ecff;
+  --agent-text: #b78bff;
+  --agent-edge: rgba(183, 139, 255, 0.3);
+  --agent-wash: rgba(183, 139, 255, 0.12);
+
+  --focus-ring: 0 0 0 3px rgba(208, 168, 93, 0.24);
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
+
+  /* Radii — the single biggest lever on personality. */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 14px;
+  --r-pill: 999px;
+
+  /* Two control heights, and one border width. */
+  --ctl-h: 34px;
+  --ctl-h-sm: 28px;
+  --bw: 1px;
+  --icon-glyph: 17px;
+
+  /* Motion: one curve, both durations under 200ms. */
+  --motion-enter: 140ms;
+  --motion-exit: 100ms;
+  --motion-ease: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* Scrollbars: the same numbers the Flutter ScrollbarTheme reads. */
+  --sb-w: 10px;
+  --sb-inset: 3px;
+  --sb-radius: 999px;
+  --sb-thumb: rgba(140, 151, 166, 0.34);
+  --sb-thumb-hover: rgba(166, 179, 194, 0.52);
+  --sb-track: transparent;
+
+  /* Only floating surfaces get a real shadow; the rest use the ladder. */
+  --elev-card: inset 0px 1px 0px rgba(255, 255, 255, 0.035);
+  --elev-button: inset 0px 1px 0px rgba(255, 255, 255, 0.07);
+  --elev-popover: 0px 20px 48px rgba(4, 6, 10, 0.56), inset 0px 1px 0px rgba(255, 255, 255, 0.04);
+  --panel-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.028) 0%, transparent 42%);
+  --overlay-sheen: linear-gradient(180deg, #23262b 0%, #1c1f24 100%);
+
+  /* ---- Back-compat aliases -------------------------------------------
+     Scaffolding for the incremental styles.css migration. Blue is NO LONGER
+     a selection colour — it is informational only — so `--blue` maps to
+     --info-text and any rule still using it for 'active' must move to
+     --accent-*. Delete this block once styles.css references none of them. */
+  --accent: var(--accent-text);
+  --green: var(--run-text);
+  --red: var(--danger-text);
+  --yellow: var(--warn-text);
+  --blue: var(--info-text);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-enter: 0ms;
+    --motion-exit: 0ms;
+  }
+}

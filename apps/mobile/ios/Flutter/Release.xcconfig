@@ -1,0 +1,8 @@
+#include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"
+#include "Generated.xcconfig"
+
+// Signing identity. Placeholders only — the real team and bundle id live in the
+// gitignored Signing.xcconfig, which overrides these when it is present.
+PANDA_TEAM_ID =
+PANDA_BUNDLE_ID = dev.pandacode.mobile
+#include? "Signing.xcconfig"

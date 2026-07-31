@@ -1,0 +1,13 @@
+{
+  "name": "@panda/design-tokens",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Single source of truth for the Panda Code design system (Graphite & Brass). Generates CSS custom properties for the Electron renderer and a Dart ThemeExtension for the Flutter app.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "node scripts/generate.mjs",
+    "test": "node --test",
+    "typecheck": "node --check scripts/generate.mjs"
+  }
+}

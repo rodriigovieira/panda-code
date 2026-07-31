@@ -1,0 +1,70 @@
+# Public CI. Proves the code is correct; it does not produce artifacts.
+#
+# Everything here runs on GitHub-hosted runners and needs NO secrets. Release
+# jobs that need signing certificates, an App Store key, or a live deployment
+# live in the private repo and run on a self-hosted Mac.
+#
+# Do not attach a self-hosted runner to this repository. On a public repo a fork
+# PR can modify the workflow it runs under, which would execute untrusted code on
+# the machine holding the signing certificates.
+
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typescript:
+    name: Typecheck & test (TS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # The relay suite runs fully in-process via convex-test — no deployment,
+      # no network, no credentials.
+      - name: Test
+        run: pnpm test
+
+  flutter:
+    name: Analyze (Flutter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.41.6
+
+      - name: Install
+        working-directory: apps/mobile
+        run: flutter pub get
+
+      # Analyze only. A real build needs Apple signing material, which by design
+      # does not exist in this repository.
+      - name: Analyze
+        working-directory: apps/mobile
+        run: flutter analyze

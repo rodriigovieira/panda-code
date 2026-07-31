@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Panda Code</title>
+    <link rel="icon" href="assets/panda-code-icon.png?v=20260731-real-icon" />
+    <link rel="apple-touch-icon" href="assets/panda-code-icon.png?v=20260731-real-icon" />
+    <meta
+      name="description"
+      content="A local-first macOS app for running Claude Code and Codex sessions, with an optional self-hosted phone companion."
+    />
+    <style>
+      :root {
+        --bg: #111315;
+        --bg-2: #15181b;
+        --panel: #1b1d21;
+        --panel-2: #202329;
+        --line: #30343b;
+        --line-soft: #262a31;
+        --text: #f1f3f5;
+        --muted: #a5adb8;
+        --subtle: #747d8b;
+        --brass: #d0a85d;
+        --brass-strong: #b98932;
+        --brass-soft: rgba(208, 168, 93, 0.14);
+        --brass-line: rgba(208, 168, 93, 0.38);
+        --green: #66c98b;
+        --red: #ef6a7a;
+        --blue: #86a9d8;
+        --mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+        color-scheme: dark;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        overflow-x: hidden;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      code,
+      pre {
+        font-family: var(--mono);
+      }
+
+      .wrap {
+        width: min(1180px, calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .nav {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        border-bottom: 1px solid var(--line-soft);
+        background: rgba(17, 19, 21, 0.92);
+        backdrop-filter: blur(16px);
+      }
+
+      .nav-inner {
+        min-height: 60px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        text-decoration: none;
+        font-weight: 760;
+      }
+
+      .mark {
+        width: 38px;
+        height: 38px;
+        border: 1px solid rgba(208, 168, 93, 0.32);
+        border-radius: 10px;
+        display: block;
+        background: #121315;
+        box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05) inset;
+      }
+
+      .brand span:last-child span {
+        color: var(--brass);
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .nav-links a {
+        min-height: 32px;
+        display: inline-flex;
+        align-items: center;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 0 12px;
+        background: #171a1f;
+        color: var(--muted);
+        text-decoration: none;
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .nav-links a:hover {
+        color: var(--text);
+        border-color: var(--brass-line);
+      }
+
+      .hero {
+        padding: 58px 0 44px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+
+      .hero-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 0.72fr) minmax(520px, 1.28fr);
+        gap: 34px;
+        align-items: center;
+      }
+
+      .eyebrow {
+        margin: 0 0 14px;
+        color: var(--brass);
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        letter-spacing: 0;
+      }
+
+      figure {
+        margin: 0;
+      }
+
+      h1 {
+        margin: 0;
+        max-width: 11ch;
+        font-size: 58px;
+        line-height: 0.98;
+        font-weight: 780;
+      }
+
+      .lede {
+        margin: 20px 0 0;
+        max-width: 57ch;
+        color: var(--muted);
+        font-size: 17px;
+        line-height: 1.62;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 26px;
+      }
+
+      .btn {
+        min-height: 42px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 8px;
+        border: 1px solid transparent;
+        padding: 0 15px;
+        text-decoration: none;
+        font-weight: 720;
+        font-size: 14px;
+      }
+
+      .btn.primary {
+        background: var(--brass-strong);
+        border-color: var(--brass-line);
+        color: #fff6df;
+      }
+
+      .btn.secondary {
+        background: var(--panel-2);
+        border-color: var(--line);
+        color: var(--text);
+      }
+
+      .meta-row {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        margin-top: 26px;
+      }
+
+      .metric {
+        border-top: 1px solid var(--line-soft);
+        padding-top: 12px;
+      }
+
+      .metric strong {
+        display: block;
+        font-size: 18px;
+      }
+
+      .metric span {
+        display: block;
+        margin-top: 3px;
+        color: var(--subtle);
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      .shot {
+        scroll-margin-top: 92px;
+        width: 100%;
+        max-width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        overflow: hidden;
+        background: #0d0f11;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+      }
+
+      .shot img {
+        width: 100%;
+        display: block;
+      }
+
+      .caption {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 42px;
+        padding: 0 14px;
+        border-top: 1px solid var(--line-soft);
+        color: var(--subtle);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .caption span {
+        min-width: 0;
+      }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--green);
+        font-weight: 720;
+      }
+
+      .status::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: var(--green);
+      }
+
+      section {
+        padding: 46px 0;
+        border-bottom: 1px solid var(--line-soft);
+      }
+
+      .section-head {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 22px;
+        margin-bottom: 22px;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: 32px;
+        line-height: 1.12;
+      }
+
+      .section-head p {
+        margin: 0;
+        max-width: 56ch;
+        color: var(--muted);
+        line-height: 1.58;
+      }
+
+      .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .feature {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        padding: 16px;
+      }
+
+      .feature .num {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 28px;
+        height: 24px;
+        margin-bottom: 14px;
+        border-radius: 6px;
+        background: var(--brass-soft);
+        color: var(--brass);
+        font-family: var(--mono);
+        font-size: 12px;
+        font-weight: 820;
+      }
+
+      .feature h3 {
+        margin: 0 0 8px;
+        font-size: 15px;
+      }
+
+      .feature p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      .mobile-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.05fr) minmax(310px, 0.95fr);
+        gap: 28px;
+        align-items: center;
+      }
+
+      .hero-grid > *,
+      .mobile-grid > *,
+      .install > * {
+        min-width: 0;
+      }
+
+      .steps {
+        display: grid;
+        gap: 12px;
+      }
+
+      .step {
+        display: grid;
+        grid-template-columns: 12px minmax(0, 1fr);
+        gap: 12px;
+        align-items: start;
+      }
+
+      .step::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        margin-top: 8px;
+        border-radius: 999px;
+        background: var(--brass);
+      }
+
+      .step h3 {
+        margin: 0 0 5px;
+        font-size: 15px;
+      }
+
+      .step p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      .install {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(320px, 0.82fr);
+        gap: 18px;
+        align-items: stretch;
+      }
+
+      .terminal {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #15171a;
+        overflow: hidden;
+      }
+
+      .terminal-head {
+        min-height: 38px;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 0 13px;
+        border-bottom: 1px solid var(--line-soft);
+        color: var(--subtle);
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #4a515d;
+      }
+
+      pre {
+        margin: 0;
+        padding: 16px;
+        overflow-x: auto;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.75;
+      }
+
+      pre b {
+        color: var(--text);
+        font-weight: 650;
+      }
+
+      .doc-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .doc-link {
+        min-width: 0;
+        min-height: 48px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        padding: 0 14px;
+        color: var(--text);
+        text-decoration: none;
+        font-weight: 700;
+      }
+
+      .doc-link span {
+        color: var(--subtle);
+        font-family: var(--mono);
+        font-size: 12px;
+        font-weight: 650;
+      }
+
+      .doc-link:hover {
+        border-color: var(--brass-line);
+      }
+
+      .footer {
+        padding: 30px 0 46px;
+        color: var(--subtle);
+        font-size: 13px;
+      }
+
+      @media (max-width: 960px) {
+        .hero-grid,
+        .mobile-grid,
+        .install {
+          grid-template-columns: 1fr;
+        }
+
+        .feature-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        h1 {
+          max-width: 12ch;
+          font-size: 48px;
+        }
+      }
+
+      @media (max-width: 640px) {
+        .wrap {
+          width: min(100% - 28px, 1180px);
+        }
+
+        .nav-inner {
+          align-items: flex-start;
+          flex-direction: column;
+          padding: 12px 0;
+        }
+
+        .nav-links {
+          justify-content: flex-start;
+        }
+
+        .hero {
+          padding-top: 34px;
+        }
+
+        h1 {
+          font-size: 40px;
+        }
+
+        h2 {
+          font-size: 28px;
+        }
+
+        .lede {
+          font-size: 16px;
+        }
+
+        .hero .lede,
+        .section-head p,
+        .feature p,
+        .step p,
+        .metric span {
+          overflow-wrap: anywhere;
+        }
+
+        .btn {
+          flex: 1 1 145px;
+          padding: 0 12px;
+        }
+
+        .meta-row,
+        .feature-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .shot {
+          border-radius: 8px;
+        }
+
+        .shot img {
+          max-width: 100%;
+          height: auto;
+        }
+
+        .section-head {
+          display: block;
+        }
+
+        .section-head p {
+          margin-top: 10px;
+        }
+
+        .caption {
+          align-items: flex-start;
+          flex-direction: column;
+          padding: 10px 12px;
+        }
+
+        .caption span:first-child {
+          overflow-wrap: anywhere;
+        }
+
+        pre {
+          white-space: pre-wrap;
+          overflow-wrap: anywhere;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <nav class="nav">
+      <div class="wrap nav-inner">
+        <a class="brand" href="#top" aria-label="Panda Code home">
+          <img class="mark" src="assets/panda-code-icon.png?v=20260731-real-icon" alt="" />
+          <span>Panda<span>Code</span></span>
+        </a>
+        <div class="nav-links" aria-label="Primary">
+          <a href="#desktop">Desktop</a>
+          <a href="#mobile">Mobile</a>
+          <a href="#install">Install</a>
+          <a href="https://github.com/rodriigovieira/panda-code">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+    <main id="top">
+      <header class="hero">
+        <div class="wrap hero-grid">
+          <div>
+            <p class="eyebrow">Local-first macOS agent workbench</p>
+            <h1>Panda Code</h1>
+            <p class="lede">
+              Run Claude Code and Codex as persistent threaded sessions on your
+              Mac. Keep long jobs alive, review structured output, and optionally
+              pair a phone through a relay you host yourself.
+            </p>
+            <div class="actions">
+              <a class="btn primary" href="#install">Build from source</a>
+              <a class="btn secondary" href="https://github.com/rodriigovieira/panda-code">View repository</a>
+            </div>
+            <div class="meta-row" aria-label="Project traits">
+              <div class="metric">
+                <strong>Local by default</strong>
+                <span>No account, hosted API, or project upload in desktop mode.</span>
+              </div>
+              <div class="metric">
+                <strong>Two runtimes</strong>
+                <span>Claude Code and Codex run as external CLIs you control.</span>
+              </div>
+              <div class="metric">
+                <strong>Self-hosted phone</strong>
+                <span>Optional Convex relay carries ciphertext plus routing metadata.</span>
+              </div>
+            </div>
+          </div>
+
+          <figure class="shot" id="desktop">
+            <img
+              src="assets/panda-code-desktop-screen.png?v=20260731-sanitized"
+              alt="Panda Code desktop app showing threaded coding-agent sessions"
+            />
+            <figcaption class="caption">
+              <span>Desktop app: sections, approvals, transcript state, and live session status.</span>
+              <span class="status">2 running</span>
+            </figcaption>
+          </figure>
+        </div>
+      </header>
+
+      <section>
+        <div class="wrap">
+          <div class="section-head">
+            <h2>Built for sessions that keep moving.</h2>
+            <p>
+              Panda Code turns agent work into a persistent workspace instead of a
+              pile of terminal windows. The app tracks state, cost, and attention
+              without taking ownership of your code or credentials.
+            </p>
+          </div>
+          <div class="feature-grid">
+            <article class="feature">
+              <span class="num">01</span>
+              <h3>Threaded sections</h3>
+              <p>Run multiple agent threads side by side and return to the one that needs input.</p>
+            </article>
+            <article class="feature">
+              <span class="num">02</span>
+              <h3>Readable transcripts</h3>
+              <p>Tool calls, diffs, approvals, and reasoning markers render as structured conversation state.</p>
+            </article>
+            <article class="feature">
+              <span class="num">03</span>
+              <h3>Runtime controls</h3>
+              <p>Switch provider defaults, model, effort, and permissions without rebuilding your workflow.</p>
+            </article>
+            <article class="feature">
+              <span class="num">04</span>
+              <h3>Usage visibility</h3>
+              <p>See token and cost totals by session and over time while the work is still active.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="mobile">
+        <div class="wrap mobile-grid">
+          <figure class="shot">
+            <img
+              src="assets/panda-code-mobile-product-screens.png?v=20260731-ios"
+              alt="Panda Code mobile app screens showing session list, transcript, and approval flow"
+            />
+            <figcaption class="caption">
+              <span>Mobile companion: session list, transcript view, and approval flow.</span>
+              <span>Flutter</span>
+            </figcaption>
+          </figure>
+
+          <div>
+            <p class="eyebrow">Optional companion</p>
+            <h2>Use your phone without trusting someone else's server.</h2>
+            <p class="lede">
+              The mobile app pairs with your Mac through a Convex deployment you
+              own. Content fields are encrypted before they touch the relay; the
+              relay only keeps the metadata it needs to route updates.
+            </p>
+            <div class="steps">
+              <div class="step">
+                <div>
+                  <h3>Create your relay</h3>
+                  <p>Deploy the Convex functions under your own account and keep the URL in your local config.</p>
+                </div>
+              </div>
+              <div class="step">
+                <div>
+                  <h3>Pair with a QR code</h3>
+                  <p>The QR payload carries the one-time pairing code and the shared encryption key.</p>
+                </div>
+              </div>
+              <div class="step">
+                <div>
+                  <h3>Approve from anywhere</h3>
+                  <p>Review waiting sessions, send follow-ups, and approve or deny requested actions.</p>
+                </div>
+              </div>
+            </div>
+            <div class="actions">
+              <a class="btn primary" href="self-hosting.html">Self-hosting guide</a>
+              <a class="btn secondary" href="protocol.html">Protocol details</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="install">
+        <div class="wrap install">
+          <div>
+            <div class="section-head">
+              <h2>Build it locally.</h2>
+            </div>
+            <div class="terminal">
+              <div class="terminal-head"><span class="dot"></span><span class="dot"></span><span class="dot"></span> install</div>
+              <pre><b>git clone https://github.com/rodriigovieira/panda-code.git</b>
+<b>cd panda-code</b>
+<b>pnpm install</b>
+<b>pnpm --dir apps/desktop package:mac</b></pre>
+            </div>
+          </div>
+
+          <div class="doc-list" aria-label="Documentation">
+            <a class="doc-link" href="https://github.com/rodriigovieira/panda-code/blob/main/AGENTS.md">Agent setup <span>AGENTS.md</span></a>
+            <a class="doc-link" href="self-hosting.html">Phone relay setup <span>docs</span></a>
+            <a class="doc-link" href="protocol.html">Crypto and protocol <span>docs</span></a>
+            <a class="doc-link" href="https://github.com/rodriigovieira/panda-code/blob/main/SECURITY.md">Security policy <span>GitHub</span></a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="wrap">
+        Apache-2.0. Panda Code is independent and unaffiliated with Anthropic or OpenAI.
+      </div>
+    </footer>
+  </body>
+</html>

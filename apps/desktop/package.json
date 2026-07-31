@@ -1,0 +1,69 @@
+{
+  "name": "@panda-code/desktop",
+  "productName": "Panda Code",
+  "version": "0.1.0",
+  "description": "A macOS-first Electron app for running Claude Code sessions as threaded sections.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "packageManager": "pnpm@11.3.0",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "pnpm typecheck && electron-vite build",
+    "package:mac": "pnpm build && electron-builder --mac dir --arm64",
+    "postinstall": "node scripts/fix-node-pty.mjs",
+    "preview": "electron-vite preview",
+    "test": "vitest run",
+    "probe:codex": "node --import ./scripts/ts-resolve.mjs scripts/codex-probe.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "convex": "^1.17.0",
+    "lucide-react": "^0.475.0",
+    "marked": "^18.0.6",
+    "node-pty": "^1.0.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@panda/design-tokens": "workspace:*",
+    "@types/node": "^22.13.1",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^34.0.2",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^3.0.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0",
+    "vitest": "^4.1.9"
+  },
+  "build": {
+    "appId": "com.pandapdv.pandacode",
+    "productName": "Panda Code",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "**/node_modules/node-pty/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "target": [
+        "dir"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "identity": null
+    }
+  }
+}

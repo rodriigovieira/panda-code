@@ -1,0 +1,6 @@
+[allowlist]
+description = "Public mirror false positives"
+paths = [
+  '''^docs/crypto-vectors\.json$''',
+  '''^apps/mobile/ios/Podfile\.lock$''',
+]

@@ -1,0 +1,10 @@
+# TS/JS workspace members only. The Flutter app (apps/mobile) is managed by Melos
+# (see melos.yaml), NOT pnpm — do not add it here.
+packages:
+  - "convex-relay"
+  - "apps/desktop"
+  - "packages/*"
+allowBuilds:
+  electron: true
+  esbuild: true
+  node-pty: true

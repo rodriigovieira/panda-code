@@ -1,0 +1,17 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "build": {
+      // This task writes into apps/desktop and apps/mobile — outside its own
+      // package — which Turbo cannot fingerprint as outputs. Leave it uncached so a
+      // token change can never be served from a stale cache entry; it runs in
+      // milliseconds, so there is nothing to gain from caching it anyway.
+      "cache": false,
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": []
+    }
+  }
+}

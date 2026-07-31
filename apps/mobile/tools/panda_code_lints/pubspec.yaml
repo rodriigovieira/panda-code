@@ -1,0 +1,11 @@
+name: panda_code_lints
+description: Project-specific lint rules for the Panda Code mobile app.
+publish_to: none
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  analyzer: ^7.3.0
+  analyzer_plugin: ^0.13.0
+  custom_lint_builder: ^0.7.6

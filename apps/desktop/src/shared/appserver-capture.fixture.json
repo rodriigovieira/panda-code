@@ -1,0 +1,389 @@
+[
+  {
+    "method": "remoteControl/status/changed",
+    "params": {
+      "status": "disabled",
+      "serverName": "Example-MacBook",
+      "installationId": "00000000-0000-4000-8000-000000000000",
+      "environmentId": null
+    }
+  },
+  {
+    "method": "thread/started",
+    "params": {
+      "thread": {
+        "id": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+        "sessionId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "",
+        "ephemeral": false,
+        "modelProvider": "openai",
+        "createdAt": 1784187334,
+        "updatedAt": 1784187334,
+        "recencyAt": 1784187334,
+        "status": {
+          "type": "idle"
+        },
+        "path": "/Users/example/.codex/sessions/2026/07/16/rollout-2026-07-16T04-35-34-019f69da-2d82-7eb2-9a6e-bc5925d867c5.jsonl",
+        "cwd": "/tmp/codex-phase3",
+        "cliVersion": "0.142.3",
+        "source": "vscode",
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": null,
+        "name": null,
+        "turns": []
+      }
+    }
+  },
+  {
+    "method": "mcpServer/startupStatus/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "name": "sites-design-picker",
+      "status": "starting",
+      "error": null
+    }
+  },
+  {
+    "method": "mcpServer/startupStatus/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "name": "node_repl",
+      "status": "starting",
+      "error": null
+    }
+  },
+  {
+    "method": "mcpServer/startupStatus/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "name": "codex_apps",
+      "status": "starting",
+      "error": null
+    }
+  },
+  {
+    "method": "mcpServer/startupStatus/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "name": "openaiDeveloperDocs",
+      "status": "starting",
+      "error": null
+    }
+  },
+  {
+    "method": "thread/status/changed",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "status": {
+        "type": "active",
+        "activeFlags": []
+      }
+    }
+  },
+  {
+    "method": "turn/started",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turn": {
+        "id": "019f69da-3165-7741-adac-6419463911fc",
+        "items": [],
+        "itemsView": "notLoaded",
+        "status": "inProgress",
+        "error": null,
+        "startedAt": 1784187335,
+        "completedAt": null,
+        "durationMs": null
+      }
+    }
+  },
+  {
+    "method": "mcpServer/startupStatus/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "name": "sites-design-picker",
+      "status": "ready",
+      "error": null
+    }
+  },
+  {
+    "method": "mcpServer/startupStatus/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "name": "node_repl",
+      "status": "ready",
+      "error": null
+    }
+  },
+  {
+    "method": "mcpServer/startupStatus/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "name": "codex_apps",
+      "status": "ready",
+      "error": null
+    }
+  },
+  {
+    "method": "mcpServer/startupStatus/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "name": "openaiDeveloperDocs",
+      "status": "ready",
+      "error": null
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "item": {
+        "type": "userMessage",
+        "id": "3abdef2c-d146-4655-a5f2-1d6f577e6ee4",
+        "clientId": null,
+        "content": [
+          {
+            "type": "text",
+            "text": "Read hello.txt and reply with only the word DONE.",
+            "text_elements": []
+          }
+        ]
+      },
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turnId": "019f69da-3165-7741-adac-6419463911fc",
+      "startedAtMs": 1784187336798
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "type": "userMessage",
+        "id": "3abdef2c-d146-4655-a5f2-1d6f577e6ee4",
+        "clientId": null,
+        "content": [
+          {
+            "type": "text",
+            "text": "Read hello.txt and reply with only the word DONE.",
+            "text_elements": []
+          }
+        ]
+      },
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turnId": "019f69da-3165-7741-adac-6419463911fc",
+      "completedAtMs": 1784187336798
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "item": {
+        "type": "commandExecution",
+        "id": "call_oiUWAlzvaSaFdkY06zJwk4PJ",
+        "command": "/bin/zsh -lc \"pwd && rg --files -g 'hello.txt' && sed -n '1,120p' hello.txt\"",
+        "cwd": "/tmp/codex-phase3",
+        "processId": "49671",
+        "source": "unifiedExecStartup",
+        "status": "inProgress",
+        "commandActions": [
+          {
+            "type": "unknown",
+            "command": "pwd && rg --files -g 'hello.txt' && sed -n '1,120p' hello.txt"
+          }
+        ],
+        "aggregatedOutput": null,
+        "exitCode": null,
+        "durationMs": null
+      },
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turnId": "019f69da-3165-7741-adac-6419463911fc",
+      "startedAtMs": 1784187339150
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "type": "commandExecution",
+        "id": "call_oiUWAlzvaSaFdkY06zJwk4PJ",
+        "command": "/bin/zsh -lc \"pwd && rg --files -g 'hello.txt' && sed -n '1,120p' hello.txt\"",
+        "cwd": "/tmp/codex-phase3",
+        "processId": "49671",
+        "source": "unifiedExecStartup",
+        "status": "completed",
+        "commandActions": [
+          {
+            "type": "unknown",
+            "command": "pwd && rg --files -g 'hello.txt' && sed -n '1,120p' hello.txt"
+          }
+        ],
+        "aggregatedOutput": "/private/tmp/codex-phase3\nhello.txt\npanda-code phase3 probe\n",
+        "exitCode": 0,
+        "durationMs": 0
+      },
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turnId": "019f69da-3165-7741-adac-6419463911fc",
+      "completedAtMs": 1784187339153
+    }
+  },
+  {
+    "method": "thread/tokenUsage/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turnId": "019f69da-3165-7741-adac-6419463911fc",
+      "tokenUsage": {
+        "total": {
+          "totalTokens": 16761,
+          "inputTokens": 16690,
+          "cachedInputTokens": 10624,
+          "outputTokens": 71,
+          "reasoningOutputTokens": 0
+        },
+        "last": {
+          "totalTokens": 16761,
+          "inputTokens": 16690,
+          "cachedInputTokens": 10624,
+          "outputTokens": 71,
+          "reasoningOutputTokens": 0
+        },
+        "modelContextWindow": 258400
+      }
+    }
+  },
+  {
+    "method": "account/rateLimits/updated",
+    "params": {
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "primary": {
+          "usedPercent": 3,
+          "windowDurationMins": 10080,
+          "resetsAt": 1784783741
+        },
+        "secondary": null,
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "planType": "prolite",
+        "rateLimitReachedType": null
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "item": {
+        "type": "agentMessage",
+        "id": "msg_0fe64079c3898b5e016a5889ccecb88191b9985d530b8ad90b",
+        "text": "",
+        "phase": "final_answer",
+        "memoryCitation": null
+      },
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turnId": "019f69da-3165-7741-adac-6419463911fc",
+      "startedAtMs": 1784187340664
+    }
+  },
+  {
+    "method": "item/agentMessage/delta",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turnId": "019f69da-3165-7741-adac-6419463911fc",
+      "itemId": "msg_0fe64079c3898b5e016a5889ccecb88191b9985d530b8ad90b",
+      "delta": "DONE"
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "type": "agentMessage",
+        "id": "msg_0fe64079c3898b5e016a5889ccecb88191b9985d530b8ad90b",
+        "text": "DONE",
+        "phase": "final_answer",
+        "memoryCitation": null
+      },
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turnId": "019f69da-3165-7741-adac-6419463911fc",
+      "completedAtMs": 1784187340738
+    }
+  },
+  {
+    "method": "thread/tokenUsage/updated",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turnId": "019f69da-3165-7741-adac-6419463911fc",
+      "tokenUsage": {
+        "total": {
+          "totalTokens": 33584,
+          "inputTokens": 33508,
+          "cachedInputTokens": 16128,
+          "outputTokens": 76,
+          "reasoningOutputTokens": 0
+        },
+        "last": {
+          "totalTokens": 16823,
+          "inputTokens": 16818,
+          "cachedInputTokens": 5504,
+          "outputTokens": 5,
+          "reasoningOutputTokens": 0
+        },
+        "modelContextWindow": 258400
+      }
+    }
+  },
+  {
+    "method": "account/rateLimits/updated",
+    "params": {
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "primary": {
+          "usedPercent": 3,
+          "windowDurationMins": 10080,
+          "resetsAt": 1784783741
+        },
+        "secondary": null,
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "planType": "prolite",
+        "rateLimitReachedType": null
+      }
+    }
+  },
+  {
+    "method": "thread/status/changed",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "status": {
+        "type": "idle"
+      }
+    }
+  },
+  {
+    "method": "turn/completed",
+    "params": {
+      "threadId": "019f69da-2d82-7eb2-9a6e-bc5925d867c5",
+      "turn": {
+        "id": "019f69da-3165-7741-adac-6419463911fc",
+        "items": [],
+        "itemsView": "notLoaded",
+        "status": "completed",
+        "error": null,
+        "startedAt": 1784187335,
+        "completedAt": 1784187340,
+        "durationMs": 5742
+      }
+    }
+  }
+]

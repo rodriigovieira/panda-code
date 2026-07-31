@@ -1,0 +1,23 @@
+{
+  "name": "panda-code",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Panda Code — Electron desktop executor, Convex relay, Flutter mobile companion.",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.3.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "turbo run typecheck",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "mobile:testflight": "apps/mobile/scripts/testflight.sh",
+    "convex:dev": "pnpm --dir convex-relay exec convex dev",
+    "convex:deploy": "pnpm --dir convex-relay exec convex dev --once"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.0"
+  }
+}

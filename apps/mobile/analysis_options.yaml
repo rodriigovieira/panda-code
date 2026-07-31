@@ -1,0 +1,14 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  plugins:
+    - custom_lint
+  exclude:
+    - "**/*.g.dart"
+    - "lib/**/generated/**"
+
+custom_lint:
+  rules:
+    # Forbid Flutter's stock dropdown widgets — use a bottom-sheet picker
+    # (showOptionPicker) instead. See tools/panda_code_lints.
+    - avoid_raw_dropdown_widgets

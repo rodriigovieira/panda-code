@@ -1,0 +1,19 @@
+name: panda_code_mono
+
+# Flutter side of the monorepo. The TS side (desktop + convex-relay) is managed by
+# pnpm/Turbo and is invisible to Melos.
+packages:
+  - apps/mobile
+  - apps/mobile/packages/**
+
+command:
+  bootstrap:
+    runPubGetInParallel: true
+
+scripts:
+  analyze:
+    run: melos exec -c 1 -- "flutter analyze"
+    description: Run flutter analyze in the mobile app.
+  test:
+    run: melos exec -c 1 -- "flutter test"
+    description: Run flutter test in the mobile app.

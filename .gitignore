@@ -1,0 +1,34 @@
+# Node / pnpm
+node_modules/
+.turbo/
+out/
+dist/
+release/
+*.log
+
+# Desktop build artifacts
+apps/desktop/index.js
+
+# Convex
+convex-relay/.env.local
+convex-relay/convex/_generated/
+
+# Flutter / Dart
+apps/mobile/.dart_tool/
+apps/mobile/.flutter-plugins
+apps/mobile/.flutter-plugins-dependencies
+apps/mobile/build/
+apps/mobile/ios/Pods/
+apps/mobile/**/GeneratedPluginRegistrant.*
+apps/mobile/lib/**/generated/
+
+# Secrets / pairing material — never commit
+*.pairing.json
+.pairing/
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
