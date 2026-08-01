@@ -12,6 +12,16 @@ DEST="/Applications/Panda Code.app"
 
 [[ -d "$SRC" ]] || { echo "No build at $SRC — run pnpm --dir apps/desktop package:mac first." >&2; exit 1; }
 
+# A build that lost its relay URL still runs, still looks healthy on this Mac,
+# and silently drops phone pairing — the only symptom is "Mac offline" on iOS.
+# Refuse to replace a relay-enabled install with a relay-less build.
+baked_relay() { grep -ao 'relayUrl = "[^"]*"' "$1/Contents/Resources/app.asar" | head -1 | sed 's/.*= "//; s/"$//'; }
+if [[ -d "$DEST" ]] && [[ -n "$(baked_relay "$DEST")" ]] && [[ -z "$(baked_relay "$SRC")" ]]; then
+  echo "Refusing to install: the installed app has a relay URL baked in, the new build does not." >&2
+  echo "Rebuild with PANDA_CODE_RELAY_URL set (or with convex-relay/.env.local present)." >&2
+  exit 1
+fi
+
 echo "==> Quitting Panda Code"
 osascript -e 'quit app "Panda Code"' 2>/dev/null || true
 for _ in $(seq 1 20); do

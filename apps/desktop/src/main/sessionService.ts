@@ -25,6 +25,8 @@ export type ManagedStreamSession = {
   emittedTitle?: string;
   /** Set once the AI-generated title has been emitted; stops further re-reads. */
   titleLocked?: boolean;
+  /** Last observed background task output file signature, used to throttle live tail snapshots. */
+  taskOutputSignature?: string;
 };
 
 type SessionServiceDependencies = {
@@ -348,13 +350,14 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
           runtime: nextRuntime,
           command: nextRuntime === "codex" ? "codex" : "claude",
           // A provider switch is a fresh conversation — don't carry the previous
-          // runtime's model/effort, and clear both resume ids so a new thread is
-          // opened.
+          // runtime's model/effort. Keep the previous provider's transcript id
+          // as read-only history so the section can be restored after restart;
+          // clear only the target runtime's id so a new thread is opened.
           model: applyField(undefined, model),
           effort: applyField(undefined, effort),
           permissionMode: applyField(nextRuntime === "codex" ? "read-only" : undefined, permissionMode),
-          claudeSessionId: undefined,
-          codexThreadId: undefined,
+          claudeSessionId: nextRuntime === "claude" ? undefined : live?.state.claudeSessionId ?? base.claudeSessionId,
+          codexThreadId: nextRuntime === "codex" ? undefined : live?.state.codexThreadId ?? base.codexThreadId,
         }
       : {
           ...base,

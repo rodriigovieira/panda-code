@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ConversationItem } from "../../shared/ipc";
-import { mergeConversationItems } from "./conversation";
+import { groupQuietWork, mergeConversationItems } from "./conversation";
 
 const localPrompt: ConversationItem = {
   id: "local:thread-1:2026-07-04T20:46:00.000Z",
@@ -480,5 +480,98 @@ describe("mergeConversationItems", () => {
     };
 
     expect(mergeConversationItems([localPrompt, localThinking], [limit])).toEqual([localPrompt, limit]);
+  });
+
+  it("drops the Codex transcript copy of a message the live stream already delivered", () => {
+    const live: ConversationItem = {
+      id: "stream:um_1",
+      kind: "user",
+      body: "check the failed release",
+      timestamp: "2026-07-04T20:46:00.100Z",
+    };
+    const transcript: ConversationItem = {
+      id: "stream:codex:019fb648-bc99-7e02-855d-23678a7ebbda:user:100",
+      kind: "user",
+      body: "check the failed release",
+      timestamp: "2026-07-04T20:46:00.000Z",
+      sequence: 10_000,
+    };
+
+    expect(mergeConversationItems([live], [transcript])).toEqual([live]);
+  });
+
+  it("keeps every send when the same Codex prompt was submitted twice", () => {
+    const first: ConversationItem = {
+      id: "stream:um_1",
+      kind: "user",
+      body: "y",
+      timestamp: "2026-07-04T20:46:00.000Z",
+    };
+    const second: ConversationItem = { ...first, id: "stream:um_2", timestamp: "2026-07-04T20:47:00.000Z" };
+    const transcript: ConversationItem[] = [
+      {
+        id: "stream:codex:thread-1:user:10",
+        kind: "user",
+        body: "y",
+        timestamp: "2026-07-04T20:46:00.000Z",
+        sequence: 1_000,
+      },
+      {
+        id: "stream:codex:thread-1:user:20",
+        kind: "user",
+        body: "y",
+        timestamp: "2026-07-04T20:47:00.000Z",
+        sequence: 2_000,
+      },
+    ];
+
+    expect(mergeConversationItems([first, second], transcript)).toEqual([first, second]);
+  });
+
+  it("keeps a Codex transcript message the live stream never carried", () => {
+    const transcript: ConversationItem = {
+      id: "stream:codex:thread-1:assistant:30",
+      kind: "assistant",
+      title: "Codex",
+      body: "Done.",
+      timestamp: "2026-07-04T20:46:00.000Z",
+      sequence: 3_000,
+    };
+
+    expect(mergeConversationItems([], [transcript])).toEqual([transcript]);
+  });
+});
+
+describe("groupQuietWork", () => {
+  const item = (id: string, kind: ConversationItem["kind"]): ConversationItem => ({ id, kind, body: id });
+  const quiet = (candidate: ConversationItem): boolean => candidate.kind === "tool" || candidate.kind === "system";
+
+  it("folds each run of quiet items into one group", () => {
+    const entries = groupQuietWork(
+      [
+        item("u1", "user"),
+        item("t1", "tool"),
+        item("s1", "system"),
+        item("a1", "assistant"),
+        item("t2", "tool"),
+      ],
+      quiet,
+    );
+
+    expect(entries).toEqual([
+      { type: "item", item: item("u1", "user") },
+      { type: "work", id: "work:t1", items: [item("t1", "tool"), item("s1", "system")] },
+      { type: "item", item: item("a1", "assistant") },
+      { type: "work", id: "work:t2", items: [item("t2", "tool")] },
+    ]);
+  });
+
+  it("keeps messages ungrouped and preserves order", () => {
+    const items = [item("u1", "user"), item("a1", "assistant")];
+    expect(groupQuietWork(items, quiet)).toEqual(items.map((entry) => ({ type: "item", item: entry })));
+  });
+
+  it("returns nothing for an empty feed", () => {
+    expect(groupQuietWork([], quiet)).toEqual([]);
   });
 });

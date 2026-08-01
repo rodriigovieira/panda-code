@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>How Panda Code drives Claude and Codex</title>
+<style>
+  :root {
+    --brass: #d0a85d;
+    --brass-deep: #8f6b27;
+    --green: #66c98b;
+    --amber: #dfb45f;
+    --red: #ef6a7a;
+    --blue: #7ab7ff;
+    --violet: #b78bff;
+
+    --app-bg: #121315;
+    --sidebar: #17181b;
+    --panel-soft: #181a1e;
+    --panel: #1b1d21;
+    --panel-strong: #23262b;
+    --overlay: #1e2126;
+
+    --line-soft: #262a31;
+    --line: #30343b;
+    --line-hi: #3d434c;
+
+    --text: #f0f2f4;
+    --text-dim: #a8b0ba;
+    --text-faint: #7a828d;
+
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--app-bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Chrome ─────────────────────────────────────────────── */
+  header.bar {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 28px;
+    background: rgba(23, 24, 27, 0.92);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .bar .mark {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--brass);
+  }
+  .bar .spacer { flex: 1; }
+
+  button.action {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    color: #f5efe2;
+    background: var(--brass-deep);
+    border: 1px solid #a9812f;
+    border-radius: 8px;
+    padding: 8px 16px;
+    cursor: pointer;
+    transition: filter 120ms ease;
+  }
+  button.action:hover { filter: brightness(1.12); }
+  button.ghost {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+  }
+  button.ghost:hover { border-color: var(--line-hi); color: var(--text); }
+
+  /* ── Document view ──────────────────────────────────────── */
+  main {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 48px 28px 140px;
+  }
+
+  h1 {
+    font-size: 40px;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    margin: 0 0 12px;
+  }
+  .subtitle {
+    color: var(--text-dim);
+    font-size: 18px;
+    margin: 0 0 8px;
+  }
+  .meta {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-faint);
+    margin-bottom: 44px;
+  }
+
+  h2 {
+    font-size: 26px;
+    letter-spacing: -0.01em;
+    margin: 56px 0 4px;
+    padding-top: 20px;
+    border-top: 1px solid var(--line-soft);
+  }
+  h2 .num {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--brass);
+    display: block;
+    margin-bottom: 6px;
+    letter-spacing: 0.1em;
+  }
+  h3 {
+    font-size: 17px;
+    margin: 30px 0 6px;
+    color: var(--text);
+  }
+  p { margin: 12px 0; color: #dfe3e8; }
+  ul, ol { padding-left: 22px; color: #dfe3e8; }
+  li { margin: 7px 0; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.86em;
+    background: #11151d;
+    border: 1px solid var(--line-soft);
+    border-radius: 5px;
+    padding: 1px 5px;
+    color: #e5cf9f;
+  }
+  pre {
+    background: #11151d;
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: #cbd3dc;
+  }
+  pre code { background: none; border: none; padding: 0; color: inherit; }
+
+  a { color: var(--brass); }
+
+  /* callouts */
+  .note {
+    border-left: 3px solid var(--line-hi);
+    background: var(--panel-soft);
+    border-radius: 0 10px 10px 0;
+    padding: 14px 18px;
+    margin: 22px 0;
+    font-size: 15px;
+  }
+  .note.warn { border-left-color: var(--amber); }
+  .note.danger { border-left-color: var(--red); }
+  .note.good { border-left-color: var(--green); }
+  .note .label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 5px;
+    color: var(--text-faint);
+  }
+  .note.warn .label { color: var(--amber); }
+  .note.danger .label { color: var(--red); }
+  .note.good .label { color: var(--green); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 22px 0;
+    font-size: 14.5px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line-soft);
+    vertical-align: top;
+  }
+  th {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    border-bottom-color: var(--line);
+  }
+
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid;
+    white-space: nowrap;
+  }
+  .pill.go { color: var(--green); border-color: #2f6948; background: rgba(102,201,139,0.08); }
+  .pill.care { color: var(--amber); border-color: #6a5426; background: rgba(223,180,95,0.08); }
+  .pill.no { color: var(--red); border-color: #753641; background: rgba(239,106,122,0.08); }
+  .pill.info { color: var(--blue); border-color: #2a5480; background: rgba(122,183,255,0.08); }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 14px;
+    margin: 24px 0;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line-soft);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .card h4 {
+    margin: 0 0 4px;
+    font-size: 15px;
+  }
+  .card .k {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .card p { font-size: 14px; margin: 8px 0 0; color: var(--text-dim); }
+
+  .tocbox {
+    background: var(--panel-soft);
+    border: 1px solid var(--line-soft);
+    border-radius: 12px;
+    padding: 18px 22px;
+    margin-bottom: 20px;
+  }
+  .tocbox ol { margin: 6px 0 0; }
+  .tocbox li { margin: 4px 0; font-size: 14.5px; }
+
+  /* ── Deck view ──────────────────────────────────────────── */
+  #deck {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: var(--app-bg);
+  }
+  body.deck-on #deck { display: block; }
+  body.deck-on > header.bar,
+  body.deck-on > main { display: none; }
+
+  .slide {
+    display: none;
+    position: absolute;
+    inset: 0;
+    padding: 72px 84px 96px;
+    overflow-y: auto;
+    animation: fade 220ms ease;
+  }
+  .slide.active { display: block; }
+  @keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+  .slide .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--brass);
+    margin-bottom: 14px;
+  }
+  .slide h2 {
+    font-size: 44px;
+    line-height: 1.1;
+    letter-spacing: -0.025em;
+    margin: 0 0 22px;
+    border: none;
+    padding: 0;
+  }
+  .slide h3 { font-size: 20px; margin: 26px 0 6px; }
+  .slide p, .slide li { font-size: 19px; line-height: 1.55; }
+  .slide ul { padding-left: 26px; }
+  .slide li { margin: 11px 0; }
+  .slide code { font-size: 0.82em; }
+  .slide pre { font-size: 13.5px; }
+  .slide table { font-size: 16px; }
+  .slide .note { font-size: 17px; }
+  .slide.title-slide {
+    display: none;
+  }
+  .slide.title-slide.active {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .slide.title-slide h2 { font-size: 62px; }
+  .slide.title-slide p { font-size: 22px; color: var(--text-dim); max-width: 760px; }
+
+  .deckbar {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 28px;
+    background: rgba(23,24,27,0.94);
+    border-top: 1px solid var(--line-soft);
+    backdrop-filter: blur(12px);
+  }
+  .deckbar .count {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-faint);
+    min-width: 62px;
+  }
+  .deckbar .spacer { flex: 1; }
+  .progress {
+    position: fixed;
+    top: 0; left: 0;
+    height: 2px;
+    background: var(--brass);
+    transition: width 200ms ease;
+  }
+  .navbtn {
+    background: var(--panel-strong);
+    border: 1px solid var(--line);
+    color: var(--text);
+    border-radius: 8px;
+    width: 38px; height: 34px;
+    font-size: 15px;
+    cursor: pointer;
+  }
+  .navbtn:hover { border-color: var(--brass); }
+  .navbtn:disabled { opacity: 0.35; cursor: default; border-color: var(--line); }
+
+  .hint {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+  }
+  @media (max-width: 900px) {
+    .two-col { grid-template-columns: 1fr; }
+    .slide { padding: 40px 32px 96px; }
+    .slide h2 { font-size: 32px; }
+    .slide.title-slide h2 { font-size: 40px; }
+    .slide p, .slide li { font-size: 17px; }
+  }
+
+  .diagram {
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+    background: #11151d;
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    padding: 18px;
+    overflow-x: auto;
+    color: #cbd3dc;
+    white-space: pre;
+  }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <span class="mark">Panda Code · agent runtimes</span>
+  <span class="spacer"></span>
+  <button class="action" onclick="openDeck()">▶ View slideshow</button>
+</header>
+
+<main>
+
+<h1>How Panda Code drives Claude and Codex</h1>
+<p class="subtitle">Two vendor CLIs, two completely different transports, one internal event model. What we send, what we read back, and why each choice was made.</p>
+<p class="meta">Written 2026-07-31 · sources: <code>apps/desktop/src/main/index.ts</code>, <code>src/main/codex/</code>, <code>src/shared/stream-json.ts</code></p>
+
+<div class="tocbox">
+  <span class="k" style="font-family:var(--mono);font-size:11px;color:var(--text-faint);letter-spacing:.08em;text-transform:uppercase">Contents</span>
+  <ol>
+    <li>The short answers</li>
+    <li>Claude: <code>-p</code> plus stream-json in <em>both</em> directions</li>
+    <li>Every flag on the Claude command line, and why</li>
+    <li>Codex: app-server only — the exec path was deleted</li>
+    <li>The convergence point: one <code>StreamJsonState</code></li>
+    <li>Where the two runtimes are genuinely asymmetric</li>
+    <li>The <code>/btw</code> sidecar — the one place we still one-shot</li>
+    <li>Decision log</li>
+  </ol>
+</div>
+
+<h2><span class="num">01</span>The short answers</h2>
+
+<p>Three questions, up front:</p>
+
+<table>
+  <tr><th>Question</th><th>Answer</th></tr>
+  <tr>
+    <td>Do we use <code>-p</code> for Claude?</td>
+    <td><span class="pill go">yes</span> Every section is headless <code>claude -p</code>. There is no interactive TUI in a section.</td>
+  </tr>
+  <tr>
+    <td>Do we use stream-json output?</td>
+    <td><span class="pill go">yes</span> And stream-json <em>input</em> too — the process stays alive across turns and we write prompts as JSON to its stdin.</td>
+  </tr>
+  <tr>
+    <td>For Codex, is it just app-server?</td>
+    <td><span class="pill go">yes, exclusively</span> Since 2026-07-30. The old <code>codex exec --json</code> path and every flag builder behind it were deleted, not flagged off.</td>
+  </tr>
+</table>
+
+<p>The asymmetry is not an accident of history — it is the best transport each vendor exposes. Claude Code's richest programmatic surface is headless stream-json over stdio. Codex's is a persistent JSON-RPC server. We took the best one on each side rather than forcing a common shape, and paid for that with one mapping layer.</p>
+
+<div class="diagram">  renderer (React)                     main process (Electron)                    vendor CLI
+  ────────────────                     ───────────────────────                    ──────────
+  section "auth refactor"  ──IPC──▶    startStreamSession()
+   runtime: claude                       └─ spawnChild("claude", [-p …])  ──────▶ claude -p
+                                              stdin  ◀── {"type":"user", …}          (long-lived)
+                                              stdout ──▶ stream-json events  ◀────
+
+  section "flaky test"     ──IPC──▶    CodexAppServerSessionManager
+   runtime: codex                        └─ ONE shared client ───────────────────▶ codex app-server
+                                              thread/start · turn/start  ─────────▶  (long-lived,
+                                              notifications  ◀───────────────────    all threads)
+
+                                     both fold into ▶ StreamJsonState ▶ snapshot
+                                                                        ├─▶ renderer
+                                                                        └─▶ relay (encrypted) ─▶ phone</div>
+
+<h2><span class="num">02</span>Claude: <code>-p</code> plus stream-json in both directions</h2>
+
+<p>A Claude section is a plain <code>child_process.spawn</code> — not a PTY — built by <code>buildStreamClaudeCommand</code> (<code>apps/desktop/src/main/index.ts:572</code>):</p>
+
+<pre><code>claude -p \
+  --input-format stream-json \
+  --output-format stream-json \
+  --verbose \
+  --include-partial-messages \
+  --include-hook-events \
+  --replay-user-messages \
+  --append-system-prompt "&lt;TL;DR instruction&gt;" \
+  [--resume &lt;sessionId&gt;] [--model …] [--permission-mode … | --dangerously-skip-permissions] [--effort …]</code></pre>
+
+<p>The <strong>input</strong> side is the part people miss. Because we pass <code>--input-format stream-json</code>, the process does not exit after answering; it sits on stdin waiting for the next turn. A prompt is one line of JSON:</p>
+
+<pre><code>{"type":"user","message":{"role":"user","content":"run the tests"}}\n</code></pre>
+
+<p>Output is read from stdout, split on newlines, and each line handed to <code>parseStreamJsonLine</code>. There is no ANSI, no cursor addressing, no screen scraping. The renderer never sees a terminal — it sees a list of typed conversation items.</p>
+
+<div class="note good">
+  <span class="label">Why this over a PTY</span>
+  The <code>ExecutionMode</code> type still carries a legacy <code>"terminal"</code> value, but every code path that creates a section now hard-codes <code>"stream-json"</code>. A PTY would have meant parsing a UI built for humans, and — fatally for this product — it would have given the phone nothing to render. The relay ships <em>conversation items</em>, not bytes. Structured output is what makes the mobile companion possible at all.
+</div>
+
+<h2><span class="num">03</span>Every flag on the Claude command line, and why</h2>
+
+<table>
+  <tr><th>Flag</th><th>Reason it is there</th></tr>
+  <tr><td><code>-p</code></td><td>Headless. The section is driven by our UI, not by a human at a terminal.</td></tr>
+  <tr><td><code>--input-format stream-json</code></td><td>Keeps one process alive across many turns. Without it every prompt costs a fresh spawn and a <code>--resume</code>.</td></tr>
+  <tr><td><code>--output-format stream-json</code> + <code>--verbose</code></td><td>The event stream. <code>--verbose</code> is required to get the full per-event detail rather than a summary.</td></tr>
+  <tr><td><code>--include-partial-messages</code></td><td>Token-level deltas → text streams into the bubble instead of appearing in one block at the end.</td></tr>
+  <tr><td><code>--include-hook-events</code></td><td>Hook activity is real work the user is waiting on; hiding it makes the app look hung.</td></tr>
+  <tr><td><code>--replay-user-messages</code></td><td>The user's own prompt comes back through the same stream. That gives one authoritative ordering for the transcript, so the optimistic local bubble can be reconciled instead of guessed at.</td></tr>
+  <tr><td><code>--append-system-prompt</code></td><td>Carries the TL;DR instruction — the model writes the recap, we do not post-process for it.</td></tr>
+  <tr><td><code>--resume &lt;id&gt;</code></td><td>Re-attach to the same Claude session after the process exits (or after a model switch).</td></tr>
+  <tr><td><code>--dangerously-skip-permissions</code></td><td>Only substituted when the requested mode is <code>bypassPermissions</code>: headless Claude refuses <code>--permission-mode bypassPermissions</code> at runtime, so the launch flag is the sole path. The UI gates it behind Face ID.</td></tr>
+</table>
+
+<p>The user's own typed command is not discarded — <code>streamCompatibleCommandParts</code> tokenizes it and keeps an allow-list of flags that survive into the stream invocation (<code>--model</code>, <code>--resume</code>, <code>--allowedTools</code>, <code>--permission-mode</code>, …). Anything we add is skipped if the user already specified it, which is why <code>hasModelFlag</code>/<code>hasPermissionFlag</code> exist.</p>
+
+<div class="note warn">
+  <span class="label">The mid-session model switch</span>
+  Claude's model is fixed at spawn. Switching model mid-section therefore cannot be done in-band: we rewrite the stored resume request with the new model, tear the live process down, and let the <em>next</em> prompt respawn <code>claude --resume &lt;id&gt; --model &lt;new&gt;</code> and deliver itself. Codex, on the app-server, takes model and effort as turn parameters and needs none of this.
+</div>
+
+<h2><span class="num">04</span>Codex: app-server only</h2>
+
+<p>Codex used to run the obvious way: <code>codex exec --json</code>, one child process per turn, <code>codex exec resume &lt;threadId&gt;</code> to continue, idle inferred from process exit, and approvals hard-disabled with <code>--ask-for-approval never</code>. That path is gone. Today every Codex section runs on <code>codex app-server</code> — newline-delimited JSON-RPC over stdio.</p>
+
+<p>One socket carries three message kinds, and the routing rule is the whole framing layer:</p>
+
+<table>
+  <tr><th>Shape</th><th>Meaning</th></tr>
+  <tr><td><code>{id, method, params}</code></td><td>server→client <strong>request</strong> — we must answer it (approvals, user input)</td></tr>
+  <tr><td><code>{id, result|error}</code></td><td><strong>response</strong> to something we asked</td></tr>
+  <tr><td><code>{method, params}</code></td><td><strong>notification</strong> — the event stream</td></tr>
+</table>
+
+<p>Layered on that: <code>thread/start</code> or <code>thread/resume</code> opens a section, <code>turn/start</code> runs a prompt, <code>turn/steer</code> injects one into a turn already in flight, <code>turn/interrupt</code> stops it. Streaming arrives as <code>item/started</code>, <code>item/agentMessage/delta</code>, <code>item/completed</code>, <code>turn/completed</code>, <code>thread/tokenUsage/updated</code>.</p>
+
+<h3>One shared client, not one per section</h3>
+<p>Threads already multiplex on a single app-server, so <code>CodexAppServerSessionManager</code> holds exactly one <code>CodexAppServerClient</code> for the whole app and maps each Panda section to a thread. Ten open Codex sections cost one process, not ten. The client is disposed when the last section goes idle.</p>
+
+<h3>What app-server bought us that exec could not</h3>
+<div class="cards">
+  <div class="card"><span class="k">Approvals</span><h4>The real prize</h4><p>Server→client <code>requestApproval</code> requests are held open, surfaced as <code>needs_action</code>, and answered from the desktop panel — or from the phone, over the relay.</p></div>
+  <div class="card"><span class="k">Streaming</span><h4>Deltas, not blocks</h4><p><code>item/agentMessage/delta</code> gives the same live typing Claude's partial messages give.</p></div>
+  <div class="card"><span class="k">Control</span><h4>Steer and interrupt</h4><p>First-class RPCs replace stdin tricks and process signals.</p></div>
+  <div class="card"><span class="k">Truth</span><h4>Real idle</h4><p><code>turn/completed</code> carries a status. Exit-code inference used to render a <em>failed</em> turn as a clean one.</p></div>
+</div>
+
+<div class="note">
+  <span class="label">Hard-won details</span>
+  A section is registered in the manager map <strong>synchronously</strong>, before the ~1.6 s <code>thread/start</code> handshake, because the renderer's first prompt arrives ~3 ms after start and used to fall through to a no-op. Prompts that arrive early go into a <code>queue</code> (not a single slot — a second prompt used to overwrite the first) drained at exactly one point. And <code>turn/steer</code> carries <code>expectedTurnId</code>, so we track a real <code>turnActive</code> window: <code>turnId</code> lingers after a turn ends, and losing the race falls back to a fresh turn.
+</div>
+
+<h2><span class="num">05</span>The convergence point</h2>
+
+<p>Everything above collapses into one reducer file, <code>src/shared/stream-json.ts</code>, and one state object:</p>
+
+<ul>
+  <li><code>applyStreamJsonEvent</code> — folds a Claude stream-json event into <code>StreamJsonState</code>.</li>
+  <li><code>applyAppServerNotification</code> — folds a Codex JSON-RPC notification into the <em>same</em> <code>StreamJsonState</code>.</li>
+</ul>
+
+<p>Downstream of that line, nothing knows which vendor it is talking to. The renderer draws <code>ConversationItem[]</code>. The relay encrypts a snapshot. The phone renders the same items. Token accounting, turn duration footers, the section title, subagent nesting, pending approvals — all read from the one struct.</p>
+
+<p>That is why adding app-server was a transport project and not a product rewrite: Phase 3 of the migration was explicitly "map <code>ServerNotification</code> → existing <code>StreamJsonState</code> so renderer + relay are untouched," and they were.</p>
+
+<h2><span class="num">06</span>Where the two are genuinely asymmetric</h2>
+
+<table>
+  <tr><th></th><th>Claude</th><th>Codex</th></tr>
+  <tr><td>Transport</td><td><code>-p</code> stream-json over stdio</td><td>JSON-RPC app-server over stdio</td></tr>
+  <tr><td>Process model</td><td>one child per section</td><td>one child for the whole app</td></tr>
+  <tr><td>Prompt</td><td>JSON line on stdin</td><td><code>turn/start</code> / <code>turn/steer</code> RPC</td></tr>
+  <tr><td>Model / effort switch</td><td>respawn with <code>--resume</code></td><td>turn parameters, live</td></tr>
+  <tr><td>TL;DR instruction</td><td><code>--append-system-prompt</code></td><td>in-band <code>&lt;developer_instructions&gt;</code> wrapper, stripped from the echoed user message before it reaches the feed</td></tr>
+  <tr><td>Images</td><td>file paths in the prompt text</td><td><code>{type:"localImage", path}</code> inputs — the model actually sees them</td></tr>
+  <tr><td>Approvals</td><td><code>--permission-mode</code> set at launch</td><td>interactive, per action, answerable from the phone</td></tr>
+  <tr><td>Interrupt</td><td>kill the child</td><td><code>turn/interrupt</code></td></tr>
+</table>
+
+<h2><span class="num">07</span>The <code>/btw</code> sidecar</h2>
+
+<p>One place still spawns a one-shot: the <code>/btw</code> aside, a cheap side-question that must not disturb the running section. It is <code>claude -p --output-format stream-json --verbose --include-partial-messages</code> with the prompt as an argv, on a session id we control, usually on Haiku.</p>
+
+<p>Its seeding rule is the interesting decision. Rather than <code>--fork-session</code> off the live session, the first question seeds a brand-new side session with the <em>rendered transcript tail</em>. Forking inherits Claude-specific context that goes stale across a Claude→Codex handoff and can trip auto-compaction on a long run; a transcript seed is runtime-agnostic and always current. Forking survives only as the fallback for a phone-issued ask that carries no transcript.</p>
+
+<h2><span class="num">08</span>Decision log</h2>
+
+<ol>
+  <li><strong>Structured output over a PTY.</strong> The phone can only render what the desktop can describe. Chose stream-json before the mobile app existed, and it is the reason the mobile app was possible.</li>
+  <li><strong>Bidirectional stream-json for Claude.</strong> Keeping one process alive per section beats respawn-per-turn on latency and on session continuity; <code>--resume</code> becomes a recovery path, not the normal path.</li>
+  <li><strong>Best transport per vendor, one model internally.</strong> No lowest-common-denominator abstraction over the two CLIs. The abstraction lives at the <em>state</em> layer instead, where it costs one reducer and buys an untouched renderer and relay.</li>
+  <li><strong>App-server for Codex, and delete exec.</strong> Interactive approvals were unreachable from exec, and remote approval was already reserved in the protocol. Cutover completed 2026-07-30; the old builders were removed rather than left behind a flag, so there is exactly one Codex path to reason about.</li>
+  <li><strong>One shared app-server client.</strong> Threads multiplex; per-session processes would not have.</li>
+  <li><strong>Honest send results.</strong> A queued prompt reports success only if something will actually flush it — otherwise the renderer restarts the section instead of showing "Thinking…" forever.</li>
+  <li><strong>Let the model write the TL;DR.</strong> Both runtimes get the same instruction by whichever mechanism they support, rather than post-processing text in the app.</li>
+</ol>
+
+<div class="note good">
+  <span class="label">Net</span>
+  <code>claude -p</code> with stream-json on stdin and stdout; <code>codex app-server</code> for everything Codex. Two transports, one <code>StreamJsonState</code>, and a renderer and a relay that never learned the difference.
+</div>
+
+</main>
+
+<!-- ═══════════════ DECK ═══════════════ -->
+<div id="deck">
+  <div class="progress" id="progress"></div>
+
+  <section class="slide title-slide">
+    <div class="eyebrow">Panda Code</div>
+    <h2>Driving two agents</h2>
+    <p>Claude over headless stream-json, Codex over a JSON-RPC app-server, and the one state object that makes the rest of the app forget which is which.</p>
+    <p class="hint" style="margin-top:28px">← → or space to navigate · Esc to exit</p>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">01 · The short answers</div>
+    <h2>Yes, yes, and yes</h2>
+    <table>
+      <tr><th>Question</th><th>Answer</th></tr>
+      <tr><td>Do we use <code>-p</code>?</td><td><span class="pill go">yes</span> every Claude section is headless</td></tr>
+      <tr><td>Stream-json output?</td><td><span class="pill go">yes</span> and stream-json <em>input</em> too</td></tr>
+      <tr><td>Codex = just app-server?</td><td><span class="pill go">exclusively</span> since 2026-07-30</td></tr>
+    </table>
+    <p style="margin-top:26px">Two different transports on purpose: we took the best programmatic surface each vendor exposes instead of forcing one shape onto both.</p>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">02 · The shape</div>
+    <h2>Two transports, one state</h2>
+    <div class="diagram">  section (claude) ─▶ spawn("claude", ["-p", …])   ──▶ long-lived child
+                        stdin  ◀── {"type":"user", …}
+                        stdout ──▶ stream-json events
+
+  section (codex)  ─▶ ONE shared JSON-RPC client    ──▶ codex app-server
+                        thread/start · turn/start        (all threads)
+                        notifications ◀───────────
+
+                    both fold into ▶ StreamJsonState
+                                     ├─▶ renderer
+                                     └─▶ relay ─▶ phone</div>
+    <p style="margin-top:22px">Below the fold line, nothing knows which vendor it is talking to.</p>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">03 · Claude</div>
+    <h2>Headless, and it stays alive</h2>
+    <pre><code>claude -p \
+  --input-format stream-json \
+  --output-format stream-json \
+  --verbose --include-partial-messages \
+  --include-hook-events --replay-user-messages \
+  --append-system-prompt "&lt;TL;DR instruction&gt;" \
+  [--resume …] [--model …] [--permission-mode …]</code></pre>
+    <p>The <code>--input-format</code> half is the part people miss: the process does not exit after a turn. A prompt is one JSON line written to its stdin.</p>
+    <pre><code>{"type":"user","message":{"role":"user","content":"run the tests"}}</code></pre>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">04 · Claude flags</div>
+    <h2>Nothing on that line is decorative</h2>
+    <ul>
+      <li><code>--include-partial-messages</code> — text streams into the bubble instead of landing in one block.</li>
+      <li><code>--include-hook-events</code> — hook work is real waiting; hiding it looks like a hang.</li>
+      <li><code>--replay-user-messages</code> — one authoritative ordering for the transcript, so the optimistic bubble reconciles instead of guessing.</li>
+      <li><code>--dangerously-skip-permissions</code> — substituted for <code>bypassPermissions</code>, which headless Claude refuses at runtime. Gated behind Face ID in the UI.</li>
+    </ul>
+    <p class="note">The user's own typed flags survive through an allow-list; anything they set, we don't re-add.</p>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">05 · Codex, before</div>
+    <h2>What exec couldn't do</h2>
+    <div class="two-col">
+      <div>
+        <h3 style="color:var(--red)">codex exec --json</h3>
+        <ul>
+          <li>a child process per turn</li>
+          <li>idle inferred from process exit</li>
+          <li>a failed turn rendered as a clean one</li>
+          <li>approvals hard-disabled: <code>--ask-for-approval never</code></li>
+        </ul>
+      </div>
+      <div>
+        <h3 style="color:var(--green)">codex app-server</h3>
+        <ul>
+          <li>one long-lived process, threads multiplexed</li>
+          <li><code>turn/completed</code> carries real status</li>
+          <li><code>turn/steer</code> and <code>turn/interrupt</code></li>
+          <li><strong>interactive approvals</strong> — answerable from the phone</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">06 · Codex, now</div>
+    <h2>One socket, three message kinds</h2>
+    <table>
+      <tr><th>Shape</th><th>Meaning</th></tr>
+      <tr><td><code>{id, method, params}</code></td><td>server→client request — we must answer</td></tr>
+      <tr><td><code>{id, result|error}</code></td><td>response to something we asked</td></tr>
+      <tr><td><code>{method, params}</code></td><td>notification — the event stream</td></tr>
+    </table>
+    <p>Section → <em>thread</em>. Prompt → <em>turn</em> (or a <em>steer</em> if one is already in flight). One shared client for the whole app, disposed when the last section goes idle.</p>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">07 · Scar tissue</div>
+    <h2>Three bugs worth remembering</h2>
+    <ul>
+      <li><strong>Register before you await.</strong> The renderer's first prompt lands ~3 ms after start; <code>thread/start</code> takes ~1.6 s. Registering after the handshake dropped it silently — thread open, no error, "Thinking…" forever.</li>
+      <li><strong>A queue, not a slot.</strong> A second early prompt used to overwrite the first. One drain point now.</li>
+      <li><strong>Steering has a precondition.</strong> <code>expectedTurnId</code> is checked server-side, and <code>turnId</code> lingers past the end of a turn — so track the live window and fall back to a new turn when you lose the race.</li>
+    </ul>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">08 · Asymmetries</div>
+    <h2>Where they refuse to look alike</h2>
+    <table>
+      <tr><th></th><th>Claude</th><th>Codex</th></tr>
+      <tr><td>Process</td><td>one per section</td><td>one for the app</td></tr>
+      <tr><td>Model switch</td><td>respawn with <code>--resume</code></td><td>turn parameter, live</td></tr>
+      <tr><td>TL;DR</td><td><code>--append-system-prompt</code></td><td>in-band wrapper, stripped from the echo</td></tr>
+      <tr><td>Images</td><td>paths in the prompt text</td><td><code>localImage</code> inputs — actually seen</td></tr>
+      <tr><td>Approvals</td><td>mode fixed at launch</td><td>per action, remotely answerable</td></tr>
+      <tr><td>Interrupt</td><td>kill the child</td><td><code>turn/interrupt</code></td></tr>
+    </table>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">09 · The exception</div>
+    <h2><code>/btw</code> is still a one-shot</h2>
+    <p>A cheap aside that must not disturb the running section: <code>claude -p --output-format stream-json</code>, prompt as argv, usually Haiku, on a session id we own.</p>
+    <p>It seeds from the <strong>rendered transcript tail</strong>, not <code>--fork-session</code>. Forking inherits Claude-specific context that goes stale across a Claude→Codex handoff and can trip auto-compaction on a long run. A transcript seed is runtime-agnostic and always current.</p>
+    <p class="note">Forking survives only as the fallback when a phone-issued ask arrives with no transcript attached.</p>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">10 · Decisions</div>
+    <h2>The seven that mattered</h2>
+    <ul>
+      <li><strong>Structured output over a PTY</strong> — the phone can only render what the desktop can describe.</li>
+      <li><strong>Bidirectional stream-json</strong> — one live process per section; <code>--resume</code> becomes recovery, not routine.</li>
+      <li><strong>Best transport per vendor</strong> — abstract at the state layer, not the CLI layer.</li>
+      <li><strong>App-server, and delete exec</strong> — approvals were unreachable otherwise; removed rather than flagged off.</li>
+      <li><strong>One shared client</strong> — threads already multiplex.</li>
+      <li><strong>Honest send results</strong> — never report a prompt sent that nothing will flush.</li>
+      <li><strong>Let the model write the TL;DR</strong> — instruction, not post-processing.</li>
+    </ul>
+  </section>
+
+  <section class="slide">
+    <div class="eyebrow">11 · Net</div>
+    <h2>One reducer earns its keep</h2>
+    <p><code>claude -p</code> with stream-json on stdin and stdout. <code>codex app-server</code> for everything Codex.</p>
+    <p>Two transports, one <code>StreamJsonState</code>, and a renderer and a relay that never learned the difference.</p>
+    <p class="hint" style="margin-top:32px">apps/desktop/src/main/index.ts · src/main/codex/ · src/shared/stream-json.ts</p>
+  </section>
+
+  <div class="deckbar">
+    <span class="count" id="count">1 / 12</span>
+    <button class="navbtn" id="prev" onclick="go(-1)">←</button>
+    <button class="navbtn" id="next" onclick="go(1)">→</button>
+    <span class="hint">← → · space · Esc</span>
+    <span class="spacer"></span>
+    <button class="action ghost" onclick="closeDeck()">✕ Back to document</button>
+  </div>
+</div>
+
+<script>
+  const slides = Array.from(document.querySelectorAll('#deck .slide'));
+  let idx = 0;
+
+  function render() {
+    slides.forEach((s, i) => s.classList.toggle('active', i === idx));
+    document.getElementById('count').textContent = (idx + 1) + ' / ' + slides.length;
+    document.getElementById('prev').disabled = idx === 0;
+    document.getElementById('next').disabled = idx === slides.length - 1;
+    document.getElementById('progress').style.width =
+      ((idx + 1) / slides.length * 100) + '%';
+    const active = slides[idx];
+    if (active) active.scrollTop = 0;
+  }
+
+  function go(delta) {
+    const next = idx + delta;
+    if (next < 0 || next >= slides.length) return;
+    idx = next;
+    render();
+  }
+
+  function openDeck() {
+    document.body.classList.add('deck-on');
+    location.hash = 'slide-' + (idx + 1);
+    render();
+  }
+
+  function closeDeck() {
+    document.body.classList.remove('deck-on');
+    if (location.hash.startsWith('#slide-')) {
+      history.replaceState(null, '', location.pathname);
+    }
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (!document.body.classList.contains('deck-on')) {
+      if (e.key === 's' && !e.metaKey && !e.ctrlKey) openDeck();
+      return;
+    }
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); go(1); }
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); go(-1); }
+    else if (e.key === 'Escape') closeDeck();
+    else if (e.key === 'Home') { idx = 0; render(); }
+    else if (e.key === 'End') { idx = slides.length - 1; render(); }
+  });
+
+  if (location.hash.startsWith('#slide-')) {
+    const n = parseInt(location.hash.slice(7), 10);
+    if (n >= 1 && n <= slides.length) { idx = n - 1; openDeck(); }
+  }
+
+  render();
+</script>
+</body>
+</html>

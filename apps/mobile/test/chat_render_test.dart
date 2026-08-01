@@ -5,6 +5,7 @@ import 'package:panda_code_mobile/sessions/widgets/approval_bar.dart';
 import 'package:panda_code_mobile/sessions/widgets/conversation_item_view.dart';
 import 'package:panda_code_mobile/sessions/widgets/runtime_header.dart';
 import 'package:panda_code_mobile/sessions/widgets/tool_call_view.dart';
+import 'package:panda_code_mobile/sessions/widgets/work_group_view.dart';
 
 Widget _wrap(Widget child) =>
     MaterialApp(home: Scaffold(body: SingleChildScrollView(child: child)));
@@ -218,5 +219,65 @@ void main() {
     await tester.pump();
     expect(answeredOption, isNull);
     expect(answeredText, '15837069');
+  });
+
+  group('focus mode', () {
+    ConversationItem item(String id, String kind, {bool tool = false}) =>
+        ConversationItem.fromDecrypted({
+          'id': id,
+          'kind': tool ? 'tool' : kind,
+          'title': tool ? 'Read' : null,
+          'body': tool ? '/tmp/a.dart' : id,
+        }, 1);
+
+    test('groupQuietWork folds each run of work into one group', () {
+      final items = [
+        item('u1', 'user'),
+        item('t1', 'tool', tool: true),
+        item('s1', 'system'),
+        item('a1', 'assistant'),
+        item('t2', 'tool', tool: true),
+      ];
+
+      final entries = groupQuietWork(items);
+
+      expect(entries.length, 4);
+      expect((entries[0] as TranscriptMessage).item.id, 'u1');
+      expect((entries[1] as TranscriptWorkGroup).items.map((i) => i.id),
+          ['t1', 's1']);
+      expect((entries[2] as TranscriptMessage).item.id, 'a1');
+      expect((entries[3] as TranscriptWorkGroup).items.map((i) => i.id), ['t2']);
+    });
+
+    test('the end-of-turn summary is never folded away', () {
+      final summary = ConversationItem.fromDecrypted({
+        'id': 'stream:x:summary',
+        'kind': 'system',
+        'body': 'Worked for 15s',
+      }, 1);
+      expect(isQuietTranscriptItem(summary), isFalse);
+      expect(groupQuietWork([summary]).single, isA<TranscriptMessage>());
+    });
+
+    testWidgets('a collapsed group summarizes its steps and expands on tap',
+        (tester) async {
+      final items = [
+        item('t1', 'tool', tool: true),
+        item('t2', 'tool', tool: true),
+      ];
+      await tester.pumpWidget(_wrap(WorkGroupView(
+        items: items,
+        running: false,
+        buildItem: (i) => ConversationItemView(item: i),
+      )));
+
+      expect(find.text('Agent work'), findsOneWidget);
+      expect(find.textContaining('2 steps'), findsOneWidget);
+      expect(find.byType(ToolCallView), findsNothing);
+
+      await tester.tap(find.text('Details'));
+      await tester.pumpAndSettle();
+      expect(find.byType(ToolCallView), findsNWidgets(2));
+    });
   });
 }

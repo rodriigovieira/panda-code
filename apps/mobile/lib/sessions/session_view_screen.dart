@@ -29,7 +29,9 @@ import 'widgets/conversation_item_view.dart';
 import 'widgets/image_attachment_view.dart';
 import 'widgets/prompt_sheet.dart';
 import 'widgets/runtime_header.dart';
+import 'widgets/session_files_sheet.dart';
 import 'widgets/session_info_sheet.dart';
+import 'widgets/work_group_view.dart';
 import 'widgets/slash_command_palette.dart';
 
 /// Live session view: a real Claude Code transcript. Subscribes to the relay
@@ -113,6 +115,10 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
   bool _showThinking = false;
   bool _confirmStop = false;
   bool _reduceMotion = false;
+  bool _focusMode = false;
+
+  /// The agent is mid-turn, so the trailing work group reports its live step.
+  bool _agentWorking = false;
 
   // In-transcript search.
   bool _searching = false;
@@ -553,6 +559,70 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     });
   }
 
+  /// The transcript proper. Focus mode folds each run of tool calls, thinking,
+  /// and system activity into one [WorkGroupView]; search turns the folding off
+  /// so every match stays reachable.
+  Widget _buildTranscriptList(
+    List<ConversationItem> visible,
+    bool searching,
+    String? query,
+    int activeIndex, {
+    required bool showHeader,
+  }) {
+    Widget itemView(ConversationItem item, {bool active = false}) =>
+        ConversationItemView(
+          item: item,
+          toolExpand: _toolExpand,
+          thinkingExpanded: _showThinking,
+          highlightQuery: query,
+          activeMatch: active,
+          onRetrySend: _deliver,
+        );
+
+    final entries = _focusMode && !searching
+        ? groupQuietWork(visible)
+        : visible.map<TranscriptEntry>(TranscriptMessage.new).toList();
+
+    return ListView.builder(
+      controller: _scrollController,
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+      itemCount: entries.length + (showHeader ? 1 : 0),
+      itemBuilder: (context, i) {
+        if (showHeader && i == 0) return _buildHistoryHeader();
+        final index = i - (showHeader ? 1 : 0);
+        final entry = entries[index];
+        final previous = index > 0 ? entries[index - 1].lastItem : null;
+        final Widget content;
+        switch (entry) {
+          case TranscriptWorkGroup(:final items):
+            content = WorkGroupView(
+              items: items,
+              // Only the trailing group of a live turn is still in progress.
+              running: _agentWorking && index == entries.length - 1,
+              buildItem: itemView,
+            );
+          case TranscriptMessage(:final item):
+            content = itemView(item,
+                active: searching && index == activeIndex);
+        }
+        final first = entry is TranscriptMessage ? entry.item : null;
+        final row = Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (first != null && _needsRoleDivider(previous, first))
+              _RoleDivider(userSide: first.kind == 'user'),
+            content,
+          ],
+        );
+        // Attach a stable key per result so next/prev can scroll to it.
+        if (searching && index < _matchKeys.length) {
+          return KeyedSubtree(key: _matchKeys[index], child: row);
+        }
+        return row;
+      },
+    );
+  }
+
   Widget _buildTranscript(double chatTextScale) {
     if (_items.isNotEmpty) {
       final visible = _visibleItems;
@@ -575,39 +645,8 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
                 message: 'Nothing in this transcript matches '
                     '“${_transcriptQuery.trim()}”.',
               )
-            : ListView.builder(
-                controller: _scrollController,
-                padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
-                itemCount: visible.length + (showHeader ? 1 : 0),
-                itemBuilder: (context, i) {
-                  if (showHeader && i == 0) return _buildHistoryHeader();
-                  final visibleIndex = i - (showHeader ? 1 : 0);
-                  final item = visible[visibleIndex];
-                  final previous =
-                      visibleIndex > 0 ? visible[visibleIndex - 1] : null;
-                  final row = Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      if (_needsRoleDivider(previous, item))
-                        _RoleDivider(userSide: item.kind == 'user'),
-                      ConversationItemView(
-                        item: item,
-                        toolExpand: _toolExpand,
-                        thinkingExpanded: _showThinking,
-                        highlightQuery: query,
-                        activeMatch: searching && visibleIndex == activeIndex,
-                        onRetrySend: _deliver,
-                      ),
-                    ],
-                  );
-                  // Attach a stable key per result so next/prev can scroll to it.
-                  if (searching && visibleIndex < _matchKeys.length) {
-                    return KeyedSubtree(
-                        key: _matchKeys[visibleIndex], child: row);
-                  }
-                  return row;
-                },
-              ),
+            : _buildTranscriptList(visible, searching, query, activeIndex,
+                showHeader: showHeader),
       );
     }
     // A mobile-issued `start` the desktop rejected never produces a session, so
@@ -1396,6 +1435,13 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
                         run(() => showSessionInfoSheet(context, current)),
                   ),
                   ListTile(
+                    leading: const Icon(Icons.difference_outlined),
+                    title: const Text('Changed files'),
+                    subtitle: const Text('What this section wrote to disk'),
+                    onTap: () =>
+                        run(() => showSessionFilesSheet(context, current)),
+                  ),
+                  ListTile(
                     leading: const Icon(Icons.unfold_more),
                     title: const Text('Expand all tools'),
                     onTap: () => run(_expandAllTools),
@@ -1595,6 +1641,9 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     _showThinking = settings.showThinkingByDefault;
     _confirmStop = settings.confirmBeforeStop;
     _reduceMotion = settings.reduceMotion;
+    _focusMode = settings.focusMode;
+    _agentWorking =
+        (live.runtime?.agentState ?? live.agentState) == AgentState.working;
     final needsApproval =
         (live.runtime?.agentState ?? live.agentState) == AgentState.needsAction;
     final canInteract = online && live.status != SessionStatus.exited;

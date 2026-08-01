@@ -6,8 +6,10 @@ dist/
 release/
 *.log
 
-# Desktop build artifacts
+# Desktop build artifacts. A stray bundle also lands at the repo root when the
+# main-process build runs from here rather than apps/desktop.
 apps/desktop/index.js
+/index.js
 
 # Convex
 convex-relay/.env.local

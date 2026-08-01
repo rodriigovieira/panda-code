@@ -61,6 +61,7 @@ describe.skipIf(!runSmoke || !relayUrl)("relay bridge dev smoke", () => {
         sessionCount: 0,
         generatedAt: new Date(0).toISOString(),
       }),
+      loadSessionFiles: async () => ({ isRepo: false, files: [], added: 0, removed: 0 }),
     });
     await bridge.start();
     const pairing = bridge.getPairingInfo();

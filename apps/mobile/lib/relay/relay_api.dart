@@ -373,16 +373,63 @@ class RelayApi {
     throw Exception('The desktop didn\'t answer. Is Panda Code running?');
   }
 
-  String _usageCostError(String? cipher) {
-    if (cipher == null) return 'The desktop couldn\'t read its usage ledger.';
+  /// Ask the desktop what this section changed on disk. Same round-trip shape as
+  /// [fetchUsageCost] and for the same reason: attribution comes from the
+  /// section's transcript and the line counts from git, and only the desktop can
+  /// see either — the relay never learns a path.
+  Future<SessionFileChanges> fetchSessionFiles(
+    String sessionId, {
+    Duration timeout = const Duration(seconds: 25),
+  }) async {
+    final commandId = await client.mutation('commands:enqueue', {
+      ..._auth,
+      'sessionId': sessionId,
+      'type': 'session-files',
+    }) as String;
+
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 350));
+      final rows = (await client.query('commands:watchMine', _auth) as List?) ??
+          const [];
+      for (final raw in rows.whereType<Map>()) {
+        final m = Map<String, dynamic>.from(raw);
+        if (m['_id'] != commandId) continue;
+        final status = m['status'] as String?;
+        if (status != 'done' && status != 'error') break;
+        final cipher = m['resultCipher'] as String?;
+        if (status == 'error' || cipher == null) {
+          throw Exception(_commandError(
+              cipher, 'The desktop couldn\'t read this section\'s changes.'));
+        }
+        final decoded = codec.openMap(cipher);
+        final changes = decoded['changes'];
+        if (changes is! Map) {
+          throw Exception('The desktop sent an unreadable file list.');
+        }
+        return SessionFileChanges.fromDecrypted(
+            Map<String, dynamic>.from(changes));
+      }
+    }
+    throw Exception('The desktop didn\'t answer. Is Panda Code running?');
+  }
+
+  /// The desktop's own explanation for a failed command, when it sealed one.
+  /// A missing or undecryptable result falls back to [fallback] rather than
+  /// surfacing a decrypt error the operator can do nothing with.
+  String _commandError(String? cipher, String fallback) {
+    if (cipher == null) return fallback;
     try {
       final message = codec.openMap(cipher)['message'];
       if (message is String && message.trim().isNotEmpty) return message;
     } catch (_) {
       // Fall through to the generic message.
     }
-    return 'The desktop couldn\'t read its usage ledger.';
+    return fallback;
   }
+
+  String _usageCostError(String? cipher) =>
+      _commandError(cipher, 'The desktop couldn\'t read its usage ledger.');
 
   /// Decrypt one `commands:watchMine` row into a [CommandOutcome]. A decrypt
   /// failure still yields the status (which is plaintext on the relay), just

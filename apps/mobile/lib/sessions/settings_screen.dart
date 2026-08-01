@@ -395,6 +395,14 @@ class _ChatBehaviorCard extends StatelessWidget {
           ),
           const Divider(height: 1),
           SwitchListTile(
+            title: const Text('Focus mode'),
+            subtitle: const Text(
+                'Show only messages and the final answer; fold the work away'),
+            value: settings.focusMode,
+            onChanged: notifier.setFocusMode,
+          ),
+          const Divider(height: 1),
+          SwitchListTile(
             title: const Text('Confirm before stopping'),
             subtitle: const Text('Ask before interrupting a session'),
             value: settings.confirmBeforeStop,

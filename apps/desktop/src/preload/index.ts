@@ -18,6 +18,8 @@ import type {
   ConversationLoadRequest,
   ConversationEvent,
   DesktopApi,
+  EditorTarget,
+  OpenInEditorRequest,
   PersistedThread,
   PromptSubmittedEvent,
   RemotePairedDevice,
@@ -29,6 +31,8 @@ import type {
   SessionRuntimeEvent,
   SessionDataEvent,
   SessionExitEvent,
+  SessionFileChanges,
+  SessionFileChangesRequest,
   SessionInputRequest,
   SessionInputResult,
   SessionResizeRequest,
@@ -179,6 +183,10 @@ const api: DesktopApi = {
   revealPath: (targetPath: string) => ipcRenderer.invoke("path:reveal", targetPath) as Promise<boolean>,
   loadWorkspaceGit: (request: WorkspaceGitRequest) =>
     ipcRenderer.invoke("git:workspace-status", request) as Promise<WorkspaceGitStatus>,
+  loadSessionFileChanges: (request: SessionFileChangesRequest) =>
+    ipcRenderer.invoke("session:file-changes", request) as Promise<SessionFileChanges>,
+  listEditors: () => ipcRenderer.invoke("editor:list") as Promise<EditorTarget[]>,
+  openInEditor: (request: OpenInEditorRequest) => ipcRenderer.invoke("editor:open", request) as Promise<boolean>,
 };
 
 contextBridge.exposeInMainWorld("claudeSections", api);

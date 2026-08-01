@@ -245,6 +245,9 @@ export default defineSchema({
       // Token→dollar report from the desktop's usage ledger. Scoped to one
       // session or to a date range; the report rides back in resultCipher.
       v.literal("usage-cost"),
+      // "What did this section change?" — the desktop joins the section's own
+      // transcript to git and rides the file list back in resultCipher.
+      v.literal("session-files"),
     ),
     // DEPRECATED for new writes — the request payload now lives in
     // `commandPayloads`. Reads still fall back to it so commands enqueued by an

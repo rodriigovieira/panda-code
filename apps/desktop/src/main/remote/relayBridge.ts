@@ -13,6 +13,8 @@ import type {
   PendingApproval,
   RemotePairedDevice,
   RemotePairingInfo,
+  SessionFileChanges,
+  SessionFileChangesRequest,
   SessionRuntimeEvent,
   SessionStarredEvent,
   SessionStartRequest,
@@ -29,7 +31,16 @@ import { decryptJson, encryptJson, generateSecretboxKey, keyFromBase64, keyToBas
 import { readKeychainSecret, writeKeychainSecret } from "./keychain";
 
 type Logger = (event: string, details?: Record<string, unknown>) => void;
-type CommandType = "start" | "input" | "stop" | "switch" | "approve" | "deny" | "btw" | "usage-cost";
+type CommandType =
+  | "start"
+  | "input"
+  | "stop"
+  | "switch"
+  | "approve"
+  | "deny"
+  | "btw"
+  | "usage-cost"
+  | "session-files";
 
 export type RemoteBtwRequest = {
   threadId: string;
@@ -66,8 +77,12 @@ type PendingConversationItem = {
 type CommandDispatchResult = {
   succeeded: boolean;
   // Most commands answer with a human-readable message; a usage-cost request
-  // answers with the report itself.
-  payload: SessionStartResult | { message: string } | { report: UsageCostReport };
+  // answers with the report itself, and a changed-files request with the file list.
+  payload:
+    | SessionStartResult
+    | { message: string }
+    | { report: UsageCostReport }
+    | { changes: SessionFileChanges };
 };
 type MirrorState = {
   cwd?: string;
@@ -96,6 +111,16 @@ type MirrorState = {
    */
   metadataDirty: boolean;
   /**
+   * Bumped with every `metadataDirty` flag. A flush reads the low-churn fields
+   * before awaiting the upsert, so a state change that lands DURING that await
+   * (the common one: working → waiting, arriving while the "working" upsert is
+   * still in flight) is not in the payload — clearing the flag afterwards would
+   * drop it, stranding the relay's `sessions` row mid-turn while the badge on
+   * `sessionRuntime` moves on. Only clear the flag when the version still
+   * matches what was sent.
+   */
+  metadataVersion: number;
+  /**
    * The runtime badge changed. Serialized last-sent snapshot rather than a
    * boolean: a session replaying its transcript re-emits identical runtime
    * events, and an unchanged badge is a write nobody needs (see
@@ -109,6 +134,12 @@ type MirrorState = {
   timer?: NodeJS.Timeout;
   flushing: boolean;
 };
+
+/** Flag the low-churn state as needing a full `upsertSession`. See `metadataVersion`. */
+function markMetadataDirty(mirror: MirrorState): void {
+  mirror.metadataDirty = true;
+  mirror.metadataVersion += 1;
+}
 
 type RelayBridgeOptions = {
   url?: string;
@@ -126,6 +157,9 @@ type RelayBridgeOptions = {
   // Token→dollar report from the desktop's usage ledger (the phone has no ledger
   // of its own — the desktop is the only place spend is recorded).
   loadUsageCost: (query: UsageCostQuery) => UsageCostReport;
+  // "What did this section change?" — transcript-attributed paths joined to git.
+  // Only the desktop can see the working tree, so this is a round-trip too.
+  loadSessionFiles: (request: SessionFileChangesRequest) => Promise<SessionFileChanges>;
 };
 
 type RegisterArgs = { deviceId: string; name: string; platform: string; token: string };
@@ -748,7 +782,7 @@ export class RelayBridge {
       mirror.status = "running";
       mirror.agentState = "working";
       mirror.claudeSessionId = request.claudeSessionId;
-      mirror.metadataDirty = true;
+      markMetadataDirty(mirror);
       this.scheduleFlush(request.id, true);
       return;
     }
@@ -762,16 +796,21 @@ export class RelayBridge {
         // An auto-title read out of the transcript never overrides a rename —
         // the renderer applies the same rule to its own list.
         if (this.manualTitles.has(id)) break;
-        if (typeof payload.title === "string") {
+        // Both of these arrive RE-STATED on every stream tick (index.ts re-emits
+        // the resolved title/claudeSessionId alongside `session:runtime`), so
+        // flagging metadata dirty on arrival rather than on CHANGE put a full
+        // `upsertSession` back on the per-second path — exactly what splitting
+        // the badge onto `putRuntime` was meant to remove. Diff first.
+        if (typeof payload.title === "string" && payload.title !== mirror.title) {
           mirror.title = payload.title;
-          mirror.metadataDirty = true;
+          markMetadataDirty(mirror);
           this.scheduleFlush(id, true);
         }
         break;
       case "session:claude-session":
-        if (typeof payload.claudeSessionId === "string") {
+        if (typeof payload.claudeSessionId === "string" && payload.claudeSessionId !== mirror.claudeSessionId) {
           mirror.claudeSessionId = payload.claudeSessionId;
-          mirror.metadataDirty = true;
+          markMetadataDirty(mirror);
           this.scheduleFlush(id, true);
         }
         break;
@@ -787,7 +826,7 @@ export class RelayBridge {
       case "session:exit":
         mirror.status = "exited";
         mirror.agentState = "exited";
-        mirror.metadataDirty = true;
+        markMetadataDirty(mirror);
         this.scheduleFlush(id, true);
         break;
     }
@@ -951,6 +990,8 @@ export class RelayBridge {
         return this.dispatchBtw(command);
       case "usage-cost":
         return this.dispatchUsageCost(command);
+      case "session-files":
+        return this.dispatchSessionFiles(command);
       case "approve":
       case "deny":
         return this.dispatchApproval(command);
@@ -978,7 +1019,7 @@ export class RelayBridge {
     const mirror = this.mirror(request.id);
     mirror.startedByMobileId = command.mobileId;
     mirror.notifyOnExit = true;
-    mirror.metadataDirty = true;
+    markMetadataDirty(mirror);
     this.scheduleFlush(request.id, true);
 
     const prompt = payload.prompt ?? "";
@@ -1115,6 +1156,25 @@ export class RelayBridge {
     return { succeeded: true, payload: { report: this.options.loadUsageCost(query) } };
   }
 
+  /**
+   * Answer "what did this section change?" for the phone. The attribution needs
+   * the section's transcript and the counts need its working tree, and neither
+   * exists on the relay — so, like `usage-cost`, this is a request/response the
+   * desktop answers from local state and returns encrypted.
+   */
+  private async dispatchSessionFiles(command: PendingCommand): Promise<CommandDispatchResult> {
+    if (!command.sessionId) throw new Error("Changed-files command is missing sessionId.");
+    const mirror = this.mirror(command.sessionId);
+    if (!mirror.cwd) throw new Error("This session has no workspace yet.");
+    const changes = await this.options.loadSessionFiles({
+      sessionId: command.sessionId,
+      cwd: mirror.cwd,
+      claudeSessionId: mirror.claudeSessionId,
+      codexThreadId: mirror.runtime?.codexThreadId,
+    });
+    return { succeeded: true, payload: { changes } };
+  }
+
   private mirror(sessionId: string): MirrorState {
     let mirror = this.mirrors.get(sessionId);
     if (!mirror) {
@@ -1127,6 +1187,7 @@ export class RelayBridge {
         // instead of whatever the transcript reader last resolved.
         title: this.manualTitles.get(sessionId),
         metadataDirty: false,
+        metadataVersion: 0,
         registered: false,
         pendingItems: new Map(),
         sentItems: new Map(),
@@ -1192,7 +1253,7 @@ export class RelayBridge {
       (runtime.claudeSessionId !== undefined && mirror.claudeSessionId !== runtime.claudeSessionId) ||
       !mirror.registered
     ) {
-      mirror.metadataDirty = true;
+      markMetadataDirty(mirror);
     }
     mirror.runtime = runtime;
     mirror.executionMode = runtime.executionMode;
@@ -1256,6 +1317,9 @@ export class RelayBridge {
       mirror.flushing = false;
       return;
     }
+    // The low-churn state as it stands NOW — the upsert's args are read before it
+    // awaits, so anything that changes mid-flight is not in this call.
+    const metadataVersion = mirror.metadataVersion;
     try {
       if (needsUpsert) {
         await client.mutation(upsertRef, {
@@ -1276,7 +1340,13 @@ export class RelayBridge {
           ...(mirror.notifyOnExit !== undefined ? { notifyOnExit: mirror.notifyOnExit } : {}),
           ...(mirror.starred !== undefined ? { starred: mirror.starred } : {}),
         });
-        mirror.metadataDirty = false;
+        // Clear the flag only if nothing moved while the mutation was in flight.
+        // A turn ending mid-upsert (working -> waiting) used to be swallowed
+        // here: the row kept the "working" this call carried, and the follow-up
+        // state rode the `putRuntime` path, which never touches the `sessions`
+        // row the phone's list reads — a session that finished 13 minutes ago,
+        // still spinning in the list but "Ready" once opened.
+        if (mirror.metadataVersion === metadataVersion) mirror.metadataDirty = false;
         mirror.registered = true;
         if (runtimeChanged) mirror.runtimeSent = runtimeSnapshot;
       } else if (runtimeChanged && mirror.runtime) {
@@ -1308,12 +1378,20 @@ export class RelayBridge {
     } catch (error) {
       // A failed flush may have been the one that created the routing row, and
       // `appendEvents` fails outright without it — re-state everything next time.
-      mirror.metadataDirty = true;
+      markMetadataDirty(mirror);
       mirror.registered = false;
       this.options.log("remote:flush-error", { sessionId, message: commandErrorMessage(error) });
     } finally {
       mirror.flushing = false;
-      if (mirror.metadataDirty || mirror.pendingItems.size > 0) this.scheduleFlush(sessionId, false);
+      // A badge that moved mid-flight is left unsent too — `scheduleFlush` is a
+      // no-op while a flush is running, so this is the only place that catches
+      // it. Without it an idle session (no further ticks to nudge a flush) keeps
+      // the phone on a stale badge.
+      const badgeStale =
+        mirror.runtime !== undefined && JSON.stringify(mirror.runtime) !== mirror.runtimeSent;
+      if (mirror.metadataDirty || badgeStale || mirror.pendingItems.size > 0) {
+        this.scheduleFlush(sessionId, false);
+      }
     }
   }
 }

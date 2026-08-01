@@ -14,6 +14,17 @@ import type { SessionService } from "../sessionService";
 type Call = { name: string; args: Record<string, unknown> };
 const calls: Call[] = [];
 
+/**
+ * A mutation the fake client parks mid-flight, so a test can land a state change
+ * on the bridge while an earlier write is still awaiting the relay.
+ */
+let held: { name: string; wait: Promise<void> } | null = null;
+function holdMutation(name: string): { release: () => void } {
+  let release = (): void => undefined;
+  held = { name, wait: new Promise<void>((resolve) => (release = () => resolve())) };
+  return { release };
+}
+
 vi.mock("./keychain", () => ({
   readKeychainSecret: vi.fn(async () => null),
   writeKeychainSecret: vi.fn(async () => undefined),
@@ -22,7 +33,13 @@ vi.mock("./keychain", () => ({
 vi.mock("convex/browser", () => ({
   ConvexClient: class {
     async mutation(reference: unknown, args: Record<string, unknown>): Promise<unknown> {
-      calls.push({ name: getFunctionName(reference as never), args });
+      const name = getFunctionName(reference as never);
+      calls.push({ name, args });
+      if (held?.name === name) {
+        const wait = held.wait;
+        held = null;
+        await wait;
+      }
       return null;
     }
     async query(): Promise<unknown> {
@@ -82,6 +99,7 @@ describe("relay bridge write path", () => {
       loadUsageCost: () => {
         throw new Error("not used");
       },
+      loadSessionFiles: async () => ({ isRepo: false, files: [], added: 0, removed: 0 }),
     });
     await created.start();
     return created;
@@ -96,6 +114,7 @@ describe("relay bridge write path", () => {
   beforeEach(async () => {
     vi.useFakeTimers();
     usageUtilization = 0.5;
+    held = null;
     calls.length = 0;
     bridge = await makeBridge();
     calls.length = 0;
@@ -140,6 +159,29 @@ describe("relay bridge write path", () => {
     expect(names()).toContain("sessions:upsertSession");
   });
 
+  it("still upserts a transition that lands while an upsert is in flight", async () => {
+    // The turn ends mid-flight. Before the version check, clearing `metadataDirty`
+    // after the await swallowed it: the row kept "working" forever (nothing else
+    // ticks on an idle session) while the badge went on to say "waiting" — the
+    // phone's list spun on a session that opened as Ready.
+    const gate = holdMutation("sessions:upsertSession");
+    bridge.observeLocalEvent("session:runtime", runtimeEvent());
+    await flush();
+    expect(names()).toEqual(["sessions:upsertSession"]);
+
+    bridge.observeLocalEvent(
+      "session:runtime",
+      runtimeEvent({ agentState: "waiting", lastEventAt: new Date(2_000).toISOString() }),
+    );
+    gate.release();
+    await flush();
+    await flush();
+
+    const upserts = calls.filter((call) => call.name === "sessions:upsertSession");
+    expect(upserts).toHaveLength(2);
+    expect(upserts[1]?.args.agentState).toBe("waiting");
+  });
+
   it("writes nothing when a replayed runtime event repeats the last one", async () => {
     bridge.observeLocalEvent("session:runtime", runtimeEvent());
     await flush();
@@ -150,6 +192,25 @@ describe("relay bridge write path", () => {
     // An idle session re-emitting its state (transcript replay, resume) must not
     // turn into a write per tick.
     expect(calls).toEqual([]);
+  });
+
+  it("ignores the title and claude session id re-stated on every tick", async () => {
+    bridge.observeLocalEvent("session:runtime", runtimeEvent({ claudeSessionId: "claude-1" }));
+    bridge.observeLocalEvent("session:title", { id: "session-1", title: "Fix the flush" });
+    await flush();
+
+    calls.length = 0;
+    // The main process re-emits both of these alongside every `session:runtime`
+    // tick. Re-stating an unchanged value must not mark the session row dirty,
+    // or the per-second badge drags a full upsert back onto the hot path.
+    bridge.observeLocalEvent("session:claude-session", { id: "session-1", claudeSessionId: "claude-1" });
+    bridge.observeLocalEvent("session:title", { id: "session-1", title: "Fix the flush" });
+    await flush();
+    expect(calls).toEqual([]);
+
+    bridge.observeLocalEvent("session:title", { id: "session-1", title: "Renamed" });
+    await flush();
+    expect(names()).toEqual(["sessions:upsertSession"]);
   });
 
   it("sends the usage snapshot once per distinct value", async () => {

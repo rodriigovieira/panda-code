@@ -218,9 +218,10 @@ describe("switchSession", () => {
     service.switchSession({ id: "sess-1", runtime: "codex" });
 
     const resume = resumeRequests.get("sess-1");
-    // Fresh Codex thread: command flips, resume ids cleared, sandbox defaults.
+    // Fresh Codex thread: command flips, target resume id is cleared, sandbox defaults.
+    // The old Claude id remains as read-only transcript history for restore.
     expect(resume).toMatchObject({ runtime: "codex", command: "codex", permissionMode: "read-only" });
-    expect(resume?.claudeSessionId).toBeUndefined();
+    expect(resume?.claudeSessionId).toBe("claude-abc");
     expect(resume?.codexThreadId).toBeUndefined();
     // The old Claude model/effort are dropped, not carried into Codex.
     expect(resume?.model).toBeUndefined();
@@ -242,7 +243,8 @@ describe("switchSession", () => {
     expect(deps.startStreamSession).toHaveBeenCalledWith(
       expect.objectContaining({ runtime: "claude", command: "claude", model: "sonnet" }),
     );
-    expect(resumeRequests.get("sess-1")?.codexThreadId).toBeUndefined();
+    // The old Codex id remains as read-only transcript history for restore.
+    expect(resumeRequests.get("sess-1")?.codexThreadId).toBe("th-1");
     expect(streamSessions.get("sess-1")?.process.stdin.write).toHaveBeenCalledWith("hi\n");
   });
 

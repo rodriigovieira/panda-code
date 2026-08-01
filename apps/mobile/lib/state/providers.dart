@@ -78,6 +78,11 @@ class SettingsController extends AsyncNotifier<AppSettings> {
     await ref.read(settingsStoreProvider).saveShowThinking(v);
   }
 
+  Future<void> setFocusMode(bool v) async {
+    state = AsyncData(_current.copyWith(focusMode: v));
+    await ref.read(settingsStoreProvider).saveFocusMode(v);
+  }
+
   Future<void> setAutoScroll(bool v) async {
     state = AsyncData(_current.copyWith(autoScroll: v));
     await ref.read(settingsStoreProvider).saveAutoScroll(v);

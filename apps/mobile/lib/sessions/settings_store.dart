@@ -69,6 +69,10 @@ class AppSettings {
 
   // Chat behavior.
   final bool showThinkingByDefault;
+
+  /// Focus mode: show only prompts, replies, and the final answer; fold tool
+  /// calls, thinking, and system activity into one expandable "Agent work" row.
+  final bool focusMode;
   final bool autoScroll;
   final bool confirmBeforeStop;
   final String codeTheme; // flutter_highlight theme id, e.g. 'atom-one-dark'
@@ -93,6 +97,7 @@ class AppSettings {
     this.reduceMotion = false,
     this.compactDensity = false,
     this.showThinkingByDefault = false,
+    this.focusMode = false,
     this.autoScroll = true,
     this.confirmBeforeStop = false,
     this.codeTheme = 'atom-one-dark',
@@ -114,6 +119,7 @@ class AppSettings {
     bool? reduceMotion,
     bool? compactDensity,
     bool? showThinkingByDefault,
+    bool? focusMode,
     bool? autoScroll,
     bool? confirmBeforeStop,
     String? codeTheme,
@@ -135,6 +141,7 @@ class AppSettings {
         compactDensity: compactDensity ?? this.compactDensity,
         showThinkingByDefault:
             showThinkingByDefault ?? this.showThinkingByDefault,
+        focusMode: focusMode ?? this.focusMode,
         autoScroll: autoScroll ?? this.autoScroll,
         confirmBeforeStop: confirmBeforeStop ?? this.confirmBeforeStop,
         codeTheme: codeTheme ?? this.codeTheme,
@@ -162,6 +169,7 @@ class SettingsStore {
   static const _kReduceMotion = 'pc.reduceMotion';
   static const _kCompactDensity = 'pc.compactDensity';
   static const _kShowThinking = 'pc.showThinking';
+  static const _kFocusMode = 'pc.focusMode';
   static const _kAutoScroll = 'pc.autoScroll';
   static const _kConfirmStop = 'pc.confirmStop';
   static const _kCodeTheme = 'pc.codeTheme';
@@ -200,6 +208,7 @@ class SettingsStore {
       reduceMotion: flag(_kReduceMotion, false),
       compactDensity: flag(_kCompactDensity, false),
       showThinkingByDefault: flag(_kShowThinking, false),
+      focusMode: flag(_kFocusMode, false),
       autoScroll: flag(_kAutoScroll, true),
       confirmBeforeStop: flag(_kConfirmStop, false),
       codeTheme: all[_kCodeTheme] ?? 'atom-one-dark',
@@ -236,6 +245,9 @@ class SettingsStore {
 
   Future<void> saveShowThinking(bool v) =>
       _storage.write(key: _kShowThinking, value: v.toString());
+
+  Future<void> saveFocusMode(bool v) =>
+      _storage.write(key: _kFocusMode, value: v.toString());
 
   Future<void> saveAutoScroll(bool v) =>
       _storage.write(key: _kAutoScroll, value: v.toString());

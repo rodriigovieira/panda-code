@@ -25,6 +25,7 @@ export const enqueue = mutation({
       v.literal("deny"),
       v.literal("btw"),
       v.literal("usage-cost"),
+      v.literal("session-files"),
     ),
     payloadCipher: v.optional(v.string()),
   },

@@ -11,7 +11,10 @@ import {
   Copy,
   CornerUpLeft,
   Cpu,
+  ExternalLink,
+  FileDiff,
   Folder,
+  FolderOpen,
   FolderPlus,
   Gauge,
   GitBranch,
@@ -56,6 +59,10 @@ import type {
   PersistedThread,
   RemotePairedDevice,
   RemotePairingInfo,
+  EditorId,
+  EditorTarget,
+  SessionFileChange,
+  SessionFileChanges,
   SessionRuntimeEvent,
   SessionStatus,
   TokenUsageStats,
@@ -66,7 +73,7 @@ import type {
 } from "../../shared/ipc";
 import { formatTurnDuration, formatTurnTokens, isTurnSummaryItem } from "../../shared/stream-json";
 import { EMPTY_BTW, mergeBtwItems, serializeBtwContext, type BtwState } from "./btw";
-import { mergeConversationItems } from "./conversation";
+import { groupQuietWork, mergeConversationItems } from "./conversation";
 import { exportFilename, parseExportCommand, serializeConversation } from "./export";
 import { DRAFT_THREAD_ID, isDraftThread, isSectionWorthKeeping, persistableThreads } from "./draft";
 import { parseBodyBlocks } from "./formatting";
@@ -88,6 +95,31 @@ type ContextMenuState = {
   x: number;
   y: number;
 } | null;
+
+/** Right-click on a project header: the actions belong to the folder, not a section. */
+type WorkspaceMenuState = {
+  cwd: string;
+  x: number;
+  y: number;
+} | null;
+
+/** Roughly how tall a popover menu is, so it can be flipped away from an edge. */
+const MENU_ITEM_HEIGHT = 30;
+const MENU_PADDING = 12;
+
+/**
+ * Keep a right-click menu inside the window. The click point is a hint, not a
+ * contract: a menu opened near the bottom edge would otherwise render half
+ * off-screen with no way to scroll it.
+ */
+function menuPosition(x: number, y: number, itemCount: number): { left: number; top: number } {
+  const height = itemCount * MENU_ITEM_HEIGHT + MENU_PADDING;
+  const width = 200;
+  return {
+    left: Math.max(8, Math.min(x, window.innerWidth - width - 8)),
+    top: Math.max(8, Math.min(y, window.innerHeight - height - 8)),
+  };
+}
 
 type ImageAttachment = {
   id: string;
@@ -169,6 +201,9 @@ const USAGE_PROVIDER_KEY = "panda-code.usage-provider.v1";
 const EXPANDED_WORKSPACES_KEY = "panda-code.expanded-workspaces.v1";
 const WORKSPACE_ORDER_KEY = "panda-code.workspace-order.v1";
 const NOTIFICATIONS_KEY = "panda-code.notifications.v1";
+// Opt-in quiet transcript: only your prompts, the agent's replies, and the
+// final answer stay in the feed; everything else folds into one work group.
+const FOCUS_MODE_KEY = "panda-code.focus-mode.v1";
 const TERMINAL_TABS_KEY = "panda-code.terminal-tabs.v1";
 const SIDEBAR_WIDTH_KEY = "panda-code.sidebar-width.v1";
 // Cached so the sidebar can label the scratch group correctly on first paint,
@@ -183,6 +218,17 @@ const SIDEBAR_DEFAULT_WIDTH = 300;
 
 function clampSidebarWidth(value: number): number {
   return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(value)));
+}
+
+// The /btw side chat lives in its own column to the right of the conversation,
+// so it needs its own resizable width the way the section sidebar does.
+const BTW_WIDTH_KEY = "panda-code.btw-width.v1";
+const BTW_MIN_WIDTH = 280;
+const BTW_MAX_WIDTH = 720;
+const BTW_DEFAULT_WIDTH = 380;
+
+function clampBtwWidth(value: number): number {
+  return Math.min(BTW_MAX_WIDTH, Math.max(BTW_MIN_WIDTH, Math.round(value)));
 }
 
 function readStorageItem(key: string): string | null {
@@ -906,8 +952,8 @@ const fallbackApi: DesktopApi = {
   onTerminalData: () => () => undefined,
   onTerminalExit: () => () => undefined,
   searchConversations: () => Promise.resolve([]),
-  loadPreferences: () => Promise.resolve({ quickStartShortcut: "", hideDockIcon: false, notificationsPaused: false, remoteKeepAwake: "off" }),
-  savePreferences: () => Promise.resolve({ quickStartShortcut: "", hideDockIcon: false, notificationsPaused: false, remoteKeepAwake: "off" }),
+  loadPreferences: () => Promise.resolve({ quickStartShortcut: "", hideDockIcon: false, notificationsPaused: false, remoteKeepAwake: "off", preferredEditor: "cursor" }),
+  savePreferences: () => Promise.resolve({ quickStartShortcut: "", hideDockIcon: false, notificationsPaused: false, remoteKeepAwake: "off", preferredEditor: "cursor" }),
   getRemotePairing: () => Promise.resolve({ status: "disabled", message: "Remote relay is unavailable." }),
   refreshRemotePairing: () => Promise.resolve({ status: "disabled", message: "Remote relay is unavailable." }),
   listRemotePairedDevices: () => Promise.resolve([]),
@@ -931,6 +977,9 @@ const fallbackApi: DesktopApi = {
   revealPath: () => Promise.resolve(false),
   loadWorkspaceGit: () =>
     Promise.resolve({ isRepo: false, changes: [], stashes: [], worktrees: [], branches: [], folders: [] }),
+  loadSessionFileChanges: () => Promise.resolve({ isRepo: false, files: [], added: 0, removed: 0 }),
+  listEditors: () => Promise.resolve([]),
+  openInEditor: () => Promise.resolve(false),
 };
 
 // The /btw side-chat defaults to a fast model — it is a quick aside about the
@@ -1029,6 +1078,10 @@ function storedNotificationsEnabled(): boolean {
   return readStorageItem(NOTIFICATIONS_KEY) !== "off";
 }
 
+function storedFocusMode(): boolean {
+  return readStorageItem(FOCUS_MODE_KEY) === "on";
+}
+
 function storedScratchWorkspace(): string {
   return readStorageItem(SCRATCH_WORKSPACE_KEY)?.trim() ?? "";
 }
@@ -1036,6 +1089,11 @@ function storedScratchWorkspace(): string {
 function storedSidebarWidth(): number {
   const raw = Number(readStorageItem(SIDEBAR_WIDTH_KEY));
   return Number.isFinite(raw) && raw > 0 ? clampSidebarWidth(raw) : SIDEBAR_DEFAULT_WIDTH;
+}
+
+function storedBtwWidth(): number {
+  const raw = Number(readStorageItem(BTW_WIDTH_KEY));
+  return Number.isFinite(raw) && raw > 0 ? clampBtwWidth(raw) : BTW_DEFAULT_WIDTH;
 }
 
 function storedUsageProvider(): UsageProvider {
@@ -1647,6 +1705,27 @@ function isThinkingItem(item: ConversationItem): boolean {
   return item.kind === "assistant" && item.id.startsWith("local-thinking:");
 }
 
+/**
+ * Focus mode hides everything that is not the conversation: tool calls, system
+ * activity, thinking, and subagent cards fold into a work group. A runtime
+ * handoff is the exception — it carries the user's own prompt inside it.
+ */
+function isQuietFeedItem(item: ConversationItem): boolean {
+  if (item.kind === "user" || item.kind === "marker" || isTurnSummaryItem(item)) {
+    return false;
+  }
+
+  if (item.kind === "assistant") {
+    return isThinkingItem(item);
+  }
+
+  if (item.kind === "system") {
+    return !runtimeHandoffParts(item.body)?.userPrompt;
+  }
+
+  return true;
+}
+
 function isPrivateThinkingItem(item: ConversationItem): boolean {
   return item.kind === "system" && item.title === "Thinking" && item.body.startsWith("Private reasoning step.");
 }
@@ -1710,6 +1789,10 @@ function runtimeHandoffParts(value: string): RuntimeHandoffParts | null {
     context: (match[2] ?? "").trim(),
     userPrompt: (match[3] ?? "").trim(),
   };
+}
+
+function isCollapsedByDefaultConversationItem(item: ConversationItem): boolean {
+  return item.kind === "tool" || item.kind === "system" || isThinkingItem(item) || Boolean(runtimeHandoffParts(item.body));
 }
 
 function compactPreview(value: string, maxLength = 100): string {
@@ -1916,6 +1999,123 @@ function WorkingStatusBar({
   );
 }
 
+const FILE_STATUS_META: Record<SessionFileChange["status"], { code: string; label: string; tone: string }> = {
+  modified: { code: "M", label: "Modified", tone: "warn" },
+  added: { code: "A", label: "Added", tone: "run" },
+  untracked: { code: "U", label: "New file — not tracked by git", tone: "run" },
+  deleted: { code: "D", label: "Deleted", tone: "danger" },
+  clean: { code: "·", label: "Written to, but the working tree matches HEAD", tone: "muted" },
+  missing: { code: "?", label: "Not on disk and unknown to git", tone: "muted" },
+};
+
+function splitFilePath(path: string): { dir: string; name: string } {
+  const cut = path.lastIndexOf("/");
+  return cut === -1 ? { dir: "", name: path } : { dir: path.slice(0, cut + 1), name: path.slice(cut + 1) };
+}
+
+/**
+ * Five squares split green/red by the file's add:remove ratio — the shape of
+ * the change, next to the exact counts that give its size.
+ */
+function DiffBlips({ added, removed }: { added: number; removed: number }): ReactElement {
+  const total = added + removed;
+  let addCount = total === 0 ? 0 : Math.round((added / total) * 5);
+  if (added > 0 && addCount === 0) addCount = 1;
+  if (removed > 0 && addCount === 5) addCount = 4;
+
+  return (
+    <span className="files-blips" aria-hidden="true">
+      {Array.from({ length: 5 }, (_, index) => {
+        const tone = total === 0 ? "none" : index < addCount ? "add" : "del";
+        return <i key={index} className={`files-blip ${tone}`} />;
+      })}
+    </span>
+  );
+}
+
+function SessionFilesSummary({ changes }: { changes: SessionFileChanges }): ReactElement {
+  const total = changes.added + changes.removed;
+  // Nothing changed is not "all removals": leave the track empty rather than
+  // letting the deletion half default to the full width.
+  const addedShare = total === 0 ? 0 : (changes.added / total) * 100;
+  const removedShare = total === 0 ? 0 : 100 - addedShare;
+
+  return (
+    <div className={`files-summary${total === 0 ? " is-empty" : ""}`}>
+      <div className="files-summary-counts">
+        <strong>{changes.files.length}</strong>
+        <span>{changes.files.length === 1 ? "file" : "files"}</span>
+        <span className="files-add">+{changes.added.toLocaleString()}</span>
+        <span className="files-del">−{changes.removed.toLocaleString()}</span>
+      </div>
+      <div className="files-summary-bar" aria-hidden="true">
+        <i className="files-summary-add" style={{ width: `${addedShare}%` }} />
+        <i className="files-summary-del" style={{ width: `${removedShare}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function SessionFileRow({
+  file,
+  editorName,
+  onOpen,
+  onReveal,
+}: {
+  file: SessionFileChange;
+  editorName?: string;
+  onOpen: () => void;
+  onReveal: () => void;
+}): ReactElement {
+  const meta = FILE_STATUS_META[file.status];
+  const { dir, name } = splitFilePath(file.path);
+
+  return (
+    <li className={`git-row files-row ${file.exists ? "" : "gone"}`}>
+      <code className={`git-code tone-${meta.tone}`} title={meta.label}>
+        {meta.code}
+      </code>
+      <span className="files-name" title={file.absolutePath}>
+        <span className="files-name-inner">
+          {dir ? <span className="files-dir">{dir}</span> : null}
+          {name}
+        </span>
+      </span>
+      {file.binary ? (
+        <span className="files-binary">binary</span>
+      ) : (
+        <span className={`files-counts${file.added + file.removed === 0 ? " is-zero" : ""}`}>
+          <span className="files-add">+{file.added}</span>
+          <span className="files-del">−{file.removed}</span>
+        </span>
+      )}
+      <DiffBlips added={file.added} removed={file.removed} />
+      <span className="files-row-actions">
+        <button
+          className="ghost-icon-button"
+          type="button"
+          onClick={onOpen}
+          disabled={!file.exists}
+          aria-label={editorName ? `Open in ${editorName}` : "Open in editor"}
+          title={editorName ? `Open in ${editorName}` : "Open in editor"}
+        >
+          <ExternalLink size={13} aria-hidden="true" />
+        </button>
+        <button
+          className="ghost-icon-button"
+          type="button"
+          onClick={onReveal}
+          disabled={!file.exists}
+          aria-label="Reveal in file manager"
+          title="Reveal in file manager"
+        >
+          <Folder size={13} aria-hidden="true" />
+        </button>
+      </span>
+    </li>
+  );
+}
+
 /**
  * Codex is blocked on an approval or a question. Docked above the composer,
  * where the status bar and the prompt already are, because answering it IS the
@@ -2014,6 +2214,11 @@ const ConversationCard = memo(function ConversationCard({
   const thinking = isThinkingItem(item);
   const privateThinking = isPrivateThinkingItem(item);
   const runtimeHandoff = item.kind === "user" || item.kind === "system" ? runtimeHandoffParts(item.body) : null;
+  const [handoffExpanded, setHandoffExpanded] = useState(expanded);
+
+  useEffect(() => {
+    setHandoffExpanded(expanded);
+  }, [expanded, item.id]);
 
   // End-of-turn stats footer: a subtle line that reads as a caption on the
   // assistant reply it follows, not a collapsible activity row.
@@ -2041,7 +2246,7 @@ const ConversationCard = memo(function ConversationCard({
     return (
       <>
         <div className="conversation-line system system-notice runtime-handoff-line">
-          <button className="conversation-line-header" type="button" onClick={() => onToggle(item.id)} aria-expanded={expanded}>
+          <button className="conversation-line-header" type="button" onClick={() => setHandoffExpanded((open) => !open)} aria-expanded={handoffExpanded}>
             <span className="conversation-line-icon">
               <ShieldCheck size={15} aria-hidden="true" />
             </span>
@@ -2050,10 +2255,10 @@ const ConversationCard = memo(function ConversationCard({
             <span className="conversation-preview">{handoffSummary}</span>
             {item.timestamp ? <time>{formatTime(item.timestamp)}</time> : null}
             <span className="collapse-chevron" aria-hidden="true">
-              {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+              {handoffExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
             </span>
           </button>
-          <div className={`conversation-collapse-region ${expanded ? "expanded" : "collapsed"}`}>
+          <div className={`conversation-collapse-region ${handoffExpanded ? "expanded" : "collapsed"}`}>
             <div className="conversation-line-body runtime-handoff-body">
               <div className="runtime-handoff-summary">{handoffSummary}</div>
               <FormattedBody value={runtimeHandoff.context} />
@@ -2260,8 +2465,7 @@ const AgentCard = memo(function AgentCard({
             </div>
           ) : (
             childItems.map((child) => {
-              const thinking = isThinkingItem(child);
-              const collapsedByDefault = child.kind === "tool" || child.kind === "system" || thinking;
+              const collapsedByDefault = isCollapsedByDefaultConversationItem(child);
               return (
                 <ConversationCard
                   expanded={!collapsedByDefault || expandedChildIds.has(child.id)}
@@ -2278,6 +2482,72 @@ const AgentCard = memo(function AgentCard({
     </div>
   );
 });
+
+/**
+ * Focus mode: a run of tool calls, system activity, thinking, and subagents
+ * folded into one line. The conversation itself — your prompts, the agent's
+ * replies, the final answer — stays unbroken; click to unfold the work.
+ */
+function workGroupSummary(items: ConversationItem[]): string {
+  const agentCount = items.filter((item) => item.kind === "agent").length;
+  const labels: string[] = [];
+  for (const item of items) {
+    if (item.kind === "agent") {
+      continue;
+    }
+    const label = (item.title ?? (isThinkingItem(item) ? "Thinking" : "Activity")).trim();
+    if (label && !labels.includes(label)) {
+      labels.push(label);
+    }
+  }
+
+  const parts = [`${items.length} step${items.length === 1 ? "" : "s"}`];
+  if (agentCount > 0) {
+    parts.push(`${agentCount} agent${agentCount === 1 ? "" : "s"}`);
+  }
+  if (labels.length > 0) {
+    parts.push(labels.length > 4 ? `${labels.slice(0, 4).join(", ")}…` : labels.join(", "));
+  }
+  return parts.join(" · ");
+}
+
+function WorkGroup({
+  id,
+  items,
+  expanded,
+  running,
+  onToggle,
+  children,
+}: {
+  id: string;
+  items: ConversationItem[];
+  expanded: boolean;
+  running: boolean;
+  onToggle: (itemId: string) => void;
+  children: ReactNode;
+}): React.ReactElement {
+  const lastItem = items[items.length - 1];
+  const runningLabel = lastItem ? (lastItem.title ?? (isThinkingItem(lastItem) ? "Thinking" : "Working")) : "Working";
+
+  return (
+    <div className={`work-group ${running ? "running" : ""}`}>
+      <button className="work-group-header" type="button" onClick={() => onToggle(id)} aria-expanded={expanded}>
+        <span className="work-group-icon">
+          {running ? <span className="thinking-dot" aria-hidden="true" /> : <Wrench size={13} aria-hidden="true" />}
+        </span>
+        <strong>Agent work</strong>
+        <span className="conversation-preview">{running ? `${runningLabel}…` : workGroupSummary(items)}</span>
+        <span className="work-group-action">{expanded ? "Hide details" : "See details"}</span>
+        <span className="collapse-chevron" aria-hidden="true">
+          {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        </span>
+      </button>
+      <div className={`conversation-collapse-region ${expanded ? "expanded" : "collapsed"}`}>
+        <div className="work-group-body">{children}</div>
+      </div>
+    </div>
+  );
+}
 
 function MessageImageAttachments({
   paths,
@@ -2808,6 +3078,8 @@ export default function App(): React.ReactElement {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(storedSidebarWidth);
   const [resizingSidebar, setResizingSidebar] = useState(false);
+  const [btwWidth, setBtwWidth] = useState(storedBtwWidth);
+  const [resizingBtw, setResizingBtw] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"general" | "defaults" | "usage" | "notifications" | "phone">("general");
   const [showTokenInfo, setShowTokenInfo] = useState(false);
@@ -2818,6 +3090,14 @@ export default function App(): React.ReactElement {
   const [gitWorkspace, setGitWorkspace] = useState<string | null>(null);
   const [gitStatus, setGitStatus] = useState<WorkspaceGitStatus | null>(null);
   const [gitLoading, setGitLoading] = useState(false);
+  // Changed-files drawer: which section it is reporting on, and that section's
+  // file list. Held by thread id rather than by cwd because the whole point is
+  // per-section attribution inside a shared working tree.
+  const [filesThreadId, setFilesThreadId] = useState<string | null>(null);
+  const [fileChanges, setFileChanges] = useState<SessionFileChanges | null>(null);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [editors, setEditors] = useState<EditorTarget[]>([]);
+  const [editorPickerOpen, setEditorPickerOpen] = useState(false);
   const [showSelector, setShowSelector] = useState(false);
   const [usageProvider, setUsageProvider] = useState<UsageProvider>(storedUsageProvider);
   // Kept per provider so toggling Claude/Codex shows the other side's last numbers
@@ -2827,6 +3107,7 @@ export default function App(): React.ReactElement {
   const refreshUsageRef = useRef<() => void>(() => {});
   const usageRefreshTimerRef = useRef<number | undefined>(undefined);
   const [notificationsEnabled, setNotificationsEnabled] = useState(storedNotificationsEnabled);
+  const [focusMode, setFocusMode] = useState(storedFocusMode);
   const [attentionThreadIds, setAttentionThreadIds] = useState<Set<string>>(() => new Set());
   const [visibleSessionCounts, setVisibleSessionCounts] = useState<Record<string, number>>({});
   const [notice, setNotice] = useState<string | null>(null);
@@ -2862,6 +3143,7 @@ export default function App(): React.ReactElement {
   const [previewImage, setPreviewImage] = useState<ImagePreview | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
+  const [workspaceMenu, setWorkspaceMenu] = useState<WorkspaceMenuState>(null);
   const [pendingDeleteThreadId, setPendingDeleteThreadId] = useState<string | null>(null);
   const [terminalTabsByThread, setTerminalTabsByThread] = useState<Record<string, TerminalTab[]>>(loadStoredTerminalTabs);
   const [activeTerminalTabByThread, setActiveTerminalTabByThread] = useState<Record<string, string>>({});
@@ -2871,6 +3153,7 @@ export default function App(): React.ReactElement {
     hideDockIcon: false,
     notificationsPaused: false,
     remoteKeepAwake: "off",
+    preferredEditor: "cursor",
   });
   // Starts disabled, not "loading": a build with no relay configured would
   // otherwise flash "Connecting to the relay…" forever, since the main process
@@ -3058,6 +3341,10 @@ export default function App(): React.ReactElement {
     () => threads.find((thread) => thread.id === pendingDeleteThreadId),
     [pendingDeleteThreadId, threads],
   );
+  const filesThread = useMemo(
+    () => threads.find((thread) => thread.id === filesThreadId),
+    [filesThreadId, threads],
+  );
   const activeConversation = useMemo(
     () => (activeThread ? (conversationItems[activeThread.id] ?? []) : []),
     [activeThread, conversationItems],
@@ -3137,13 +3424,15 @@ export default function App(): React.ReactElement {
       showSelector ||
       showTokenInfo ||
       contextMenu ||
+      workspaceMenu ||
       pendingDeleteThreadId ||
       previewImage ||
       quickStartOpen ||
       newSectionChooserOpen ||
       promptHistoryOpen ||
       searchOpen ||
-      gitWorkspace
+      gitWorkspace ||
+      filesThreadId
     ) {
       return;
     }
@@ -3158,6 +3447,7 @@ export default function App(): React.ReactElement {
     showSelector,
     showTokenInfo,
     contextMenu,
+    workspaceMenu,
     pendingDeleteThreadId,
     previewImage,
     quickStartOpen,
@@ -3165,6 +3455,7 @@ export default function App(): React.ReactElement {
     promptHistoryOpen,
     searchOpen,
     gitWorkspace,
+    filesThreadId,
     focusComposerSoon,
   ]);
 
@@ -3410,9 +3701,22 @@ export default function App(): React.ReactElement {
   // Flat list of threads in the exact order they appear in the sidebar
   // (starred first, then each workspace group). Drives the Cmd+1-9 shortcuts
   // so pressing a number jumps to the Nth session as it reads top to bottom.
+  // Only rows actually on screen count: a collapsed workspace contributes
+  // nothing, and a group truncated by "Show more" contributes just its visible
+  // slice — otherwise the numbers drift off what the user is looking at.
   const sidebarOrderedThreads = useMemo<Thread[]>(
-    () => [...starredThreads, ...workspaceGroups.flatMap((group) => group.threads)],
-    [starredThreads, workspaceGroups],
+    () => [
+      ...starredThreads,
+      ...workspaceGroups.flatMap((group) => {
+        if (!expandedWorkspaces.has(group.cwd)) return [];
+        const visibleCount = Math.min(
+          visibleSessionCounts[group.cwd] ?? INITIAL_VISIBLE_SESSIONS,
+          group.threads.length,
+        );
+        return group.threads.slice(0, visibleCount);
+      }),
+    ],
+    [starredThreads, workspaceGroups, expandedWorkspaces, visibleSessionCounts],
   );
   const sidebarOrderedThreadsRef = useRef(sidebarOrderedThreads);
   sidebarOrderedThreadsRef.current = sidebarOrderedThreads;
@@ -3663,6 +3967,10 @@ export default function App(): React.ReactElement {
   }, [notificationsEnabled]);
 
   useEffect(() => {
+    localStorage.setItem(FOCUS_MODE_KEY, focusMode ? "on" : "off");
+  }, [focusMode]);
+
+  useEffect(() => {
     localStorage.setItem(TERMINAL_TABS_KEY, JSON.stringify(terminalTabsByThread));
   }, [terminalTabsByThread]);
 
@@ -3701,6 +4009,10 @@ export default function App(): React.ReactElement {
   useEffect(() => {
     localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
   }, [sidebarWidth]);
+
+  useEffect(() => {
+    localStorage.setItem(BTW_WIDTH_KEY, String(btwWidth));
+  }, [btwWidth]);
 
   // Resolve (and create) the scratch workspace once per launch. The path is
   // stable, so it is cached to keep the sidebar from flashing the raw folder
@@ -3743,6 +4055,27 @@ export default function App(): React.ReactElement {
       window.addEventListener("mouseup", onUp);
     },
     [sidebarWidth],
+  );
+
+  // The /btw grip lives on the panel's left edge, so dragging right shrinks it.
+  const startBtwResize = useCallback(
+    (event: React.MouseEvent) => {
+      event.preventDefault();
+      setResizingBtw(true);
+      const startX = event.clientX;
+      const startWidth = btwWidth;
+      const onMove = (moveEvent: MouseEvent) => {
+        setBtwWidth(clampBtwWidth(startWidth - (moveEvent.clientX - startX)));
+      };
+      const onUp = () => {
+        setResizingBtw(false);
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [btwWidth],
   );
 
   useEffect(() => {
@@ -3989,6 +4322,7 @@ export default function App(): React.ReactElement {
   useEffect(() => {
     const closeFloatingUi = () => {
       setContextMenu(null);
+      setWorkspaceMenu(null);
       setShowTokenInfo(false);
       setShowSelector(false);
     };
@@ -5031,8 +5365,10 @@ export default function App(): React.ReactElement {
         model: model.trim() || undefined,
         effort: effort.trim() || undefined,
         permissionMode: permissionMode.trim() || undefined,
-        claudeSessionId: runtime === "codex" ? undefined : activeThread?.claudeSessionId,
-        codexThreadId: runtime === "claude" ? undefined : activeThread?.codexThreadId,
+        // Keep the previous provider's transcript id for history restore. The
+        // main process still starts a fresh thread for the new runtime.
+        claudeSessionId: activeThread?.claudeSessionId,
+        codexThreadId: activeThread?.codexThreadId,
         handoffFromRuntime: activeRuntime,
         handoffCreatedAt: new Date().toISOString(),
         handoffContext: handoffContext ?? undefined,
@@ -5087,6 +5423,15 @@ export default function App(): React.ReactElement {
     logRenderer("session:stop-request", { id: activeThread.id });
     await desktopApi.stopSession({ id: activeThread.id });
     clearIdleTimer(activeThread.id);
+    // A stopped section gets no exit event (Codex app-server sections are simply
+    // dropped) and no further snapshots, so nothing else would ever retire the
+    // optimistic "Thinking..." card — it sat there under a stopped agent forever.
+    clearThinkingItems(activeThread.id);
+    if (pendingPromptRef.current?.threadId === activeThread.id) {
+      window.clearTimeout(pendingPromptRef.current.timeoutId);
+      pendingPromptRef.current = null;
+      finishSendingPrompt();
+    }
     updateThread(activeThread.id, { agentState: "exited", status: "exited" });
   };
 
@@ -5184,6 +5529,9 @@ export default function App(): React.ReactElement {
 
     setNotice(null);
     setImageAttachments((current) => mergeAttachments(current, attachments));
+    // Dropping a file (or pasting one while the sidebar has focus) leaves the
+    // caret nowhere, so put it back in the composer to keep typing.
+    focusComposerSoon();
   };
 
   const addImageFiles = (files: FileList | File[]): void => {
@@ -5896,7 +6244,7 @@ export default function App(): React.ReactElement {
       }
     }
 
-    return topLevel.map((item) => {
+    const renderItem = (item: ConversationItem): React.ReactElement => {
       if (item.kind === "agent" && item.agent) {
         // Agent cards default to expanded so the subagent's transcript stays
         // visible instead of collapsing to a one-line header once its card
@@ -5915,8 +6263,7 @@ export default function App(): React.ReactElement {
           />
         );
       }
-      const thinking = isThinkingItem(item);
-      const collapsedByDefault = item.kind === "tool" || item.kind === "system" || thinking;
+      const collapsedByDefault = isCollapsedByDefaultConversationItem(item);
       return (
         <ConversationCard
           expanded={!collapsedByDefault || expandedConversationItems.has(item.id)}
@@ -5927,8 +6274,34 @@ export default function App(): React.ReactElement {
           onToggle={toggleConversationItem}
         />
       );
+    };
+
+    if (!focusMode) {
+      return topLevel.map(renderItem);
+    }
+
+    // Focus mode: keep the conversation itself — prompts, replies, the final
+    // answer — and fold every run of work between them into one line.
+    const entries = groupQuietWork(topLevel, isQuietFeedItem);
+    return entries.map((entry, index) => {
+      if (entry.type === "item") {
+        return renderItem(entry.item);
+      }
+
+      return (
+        <WorkGroup
+          expanded={expandedConversationItems.has(entry.id)}
+          id={entry.id}
+          items={entry.items}
+          key={entry.id}
+          onToggle={toggleConversationItem}
+          running={threadWorking && index === entries.length - 1}
+        >
+          {entry.items.map(renderItem)}
+        </WorkGroup>
+      );
     });
-  }, [activeConversation, expandedConversationItems, threadWorking, handlePreviewImage, toggleConversationItem]);
+  }, [activeConversation, expandedConversationItems, focusMode, threadWorking, handlePreviewImage, toggleConversationItem]);
 
   const scrollConversationToBottom = (): void => {
     const feed = conversationFeedRef.current;
@@ -5998,6 +6371,113 @@ export default function App(): React.ReactElement {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [gitWorkspace, closeWorkspaceGit]);
+
+  const fetchSessionFiles = useCallback(
+    async (thread: Thread): Promise<void> => {
+      setFilesLoading(true);
+      try {
+        const changes = await desktopApi.loadSessionFileChanges({
+          sessionId: thread.id,
+          cwd: thread.cwd,
+          claudeSessionId: thread.claudeSessionId,
+          codexThreadId: thread.codexThreadId,
+        });
+        setFileChanges(changes);
+      } catch {
+        setFileChanges({ isRepo: false, files: [], added: 0, removed: 0, error: "Failed to read file changes" });
+      } finally {
+        setFilesLoading(false);
+      }
+    },
+    [desktopApi],
+  );
+
+  // Only probed while an editor menu is in use — a bundle can be installed or
+  // removed between openings, so a once-per-app-launch cache would go stale.
+  const refreshEditors = useCallback((): void => {
+    void desktopApi.listEditors().then(setEditors).catch(() => setEditors([]));
+  }, [desktopApi]);
+
+  const openSessionFiles = useCallback(
+    (threadId: string): void => {
+      const thread = threads.find((candidate) => candidate.id === threadId);
+      if (!thread) {
+        return;
+      }
+
+      setFilesThreadId(threadId);
+      setFileChanges(null);
+      setEditorPickerOpen(false);
+      void fetchSessionFiles(thread);
+      refreshEditors();
+    },
+    [fetchSessionFiles, refreshEditors, threads],
+  );
+
+  /**
+   * Right-click on a project header. The menu offers the folder-level actions —
+   * a new section, git status, and handing the repo to an external editor — so
+   * probe the installed editors first: a bundle can appear or vanish between
+   * openings, which is why this is never cached for the life of the app.
+   */
+  const openWorkspaceMenu = useCallback(
+    (cwd: string, x: number, y: number): void => {
+      refreshEditors();
+      setContextMenu(null);
+      setWorkspaceMenu({ cwd, x, y });
+    },
+    [refreshEditors],
+  );
+
+  const closeSessionFiles = useCallback((): void => {
+    setFilesThreadId(null);
+    setFileChanges(null);
+    setEditorPickerOpen(false);
+  }, []);
+
+  useEffect(() => {
+    if (!filesThreadId) return;
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape") return;
+      if (editorPickerOpen) {
+        setEditorPickerOpen(false);
+        return;
+      }
+      closeSessionFiles();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [filesThreadId, editorPickerOpen, closeSessionFiles]);
+
+  const preferredEditor = preferences.preferredEditor;
+  const activeEditor = useMemo(
+    () => editors.find((editor) => editor.id === preferredEditor && editor.available) ?? editors.find((editor) => editor.available),
+    [editors, preferredEditor],
+  );
+
+  const chooseEditor = useCallback(
+    (editor: EditorId): void => {
+      setEditorPickerOpen(false);
+      void desktopApi.savePreferences({ preferredEditor: editor }).then(setPreferences);
+    },
+    [desktopApi],
+  );
+
+  const openPathInEditor = useCallback(
+    (path: string, editor?: EditorId): void => {
+      const target = editor ?? activeEditor?.id;
+      if (!target) {
+        return;
+      }
+
+      void desktopApi.openInEditor({ editor: target, path }).then((ok) => {
+        if (!ok) {
+          setNotice(`Could not open ${path}`);
+        }
+      });
+    },
+    [activeEditor?.id, desktopApi],
+  );
 
   const draggingFiles = (event: React.DragEvent): boolean =>
     Array.from(event.dataTransfer.items).some((item) => item.kind === "file");
@@ -6234,7 +6714,14 @@ export default function App(): React.ReactElement {
                 }
               }}
             >
-              <div className="workspace-group-header">
+              <div
+                className="workspace-group-header"
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  openWorkspaceMenu(group.cwd, event.clientX, event.clientY);
+                }}
+              >
                 <span
                   className="workspace-drag-handle"
                   draggable
@@ -6408,7 +6895,10 @@ export default function App(): React.ReactElement {
         />
       ) : null}
 
-      <section className="workspace">
+      <section
+        className={`workspace ${activeBtw.open ? "with-btw" : ""} ${resizingBtw ? "resizing-btw" : ""}`}
+        style={activeBtw.open ? { gridTemplateColumns: `minmax(0, 1fr) ${btwWidth}px` } : undefined}
+      >
         <div className="workspace-top">
         <header className="topbar">
           <div className="title-row">
@@ -6535,6 +7025,18 @@ export default function App(): React.ReactElement {
                 </div>
               ) : null}
             </div>
+            {/* A draft has written nothing yet, so there is nothing to report. */}
+            {onDraftRoute ? null : (
+              <button
+                className={`icon-button ${filesThreadId === activeThread.id ? "active" : ""}`}
+                type="button"
+                onClick={() => openSessionFiles(activeThread.id)}
+                aria-label="Files changed by this section"
+                title="Files changed by this section"
+              >
+                <FileDiff size={17} aria-hidden="true" />
+              </button>
+            )}
           </div>
         </header>
 
@@ -6692,99 +7194,6 @@ export default function App(): React.ReactElement {
             </div>
           ) : null}
 
-          {activeBtw.open ? (
-            <div className="btw-panel" role="dialog" aria-label="By the way — session side chat">
-              <div className="btw-panel-header">
-                <span className="btw-panel-title">
-                  <Sparkles size={14} aria-hidden="true" />
-                  By the way
-                  {activeBtw.running ? <span className="btw-live-dot" aria-hidden="true" /> : null}
-                </span>
-                <span className="btw-panel-sub">Asks about this session — never interrupts it</span>
-                <div className="btw-panel-actions">
-                  <button
-                    type="button"
-                    className="btw-panel-action"
-                    onClick={() => clearBtwThread(activeThread.id)}
-                    disabled={activeBtw.items.length === 0 && !activeBtw.running}
-                    title="Clear this side-chat and start fresh"
-                  >
-                    <Trash2 size={13} aria-hidden="true" />
-                    Clear
-                  </button>
-                  <button
-                    type="button"
-                    className="btw-panel-action btw-panel-close"
-                    onClick={() => closeBtwPanel(activeThread.id)}
-                    aria-label="Close side chat"
-                    title="Close (reopen by typing /btw)"
-                  >
-                    <X size={14} aria-hidden="true" />
-                  </button>
-                </div>
-              </div>
-              <div
-                ref={btwFeedRef}
-                className="btw-panel-feed"
-                aria-label="Side-chat messages"
-                onScroll={(event) => {
-                  shouldFollowBtwRef.current = isNearScrollEnd(event.currentTarget);
-                }}
-              >
-                {activeBtw.items.length > 0 ? (
-                  activeBtw.items.map((item) => {
-                    const thinking = isThinkingItem(item);
-                    const collapsedByDefault = item.kind === "tool" || item.kind === "system" || thinking;
-                    return (
-                      <ConversationCard
-                        key={item.id}
-                        item={item}
-                        expanded={!collapsedByDefault || expandedConversationItems.has(item.id)}
-                        onToggle={toggleConversationItem}
-                        onPreviewImage={handlePreviewImage}
-                      />
-                    );
-                  })
-                ) : (
-                  <div className="btw-empty">
-                    <Sparkles size={18} aria-hidden="true" />
-                    <strong>Ask about this session</strong>
-                    <span>Questions run in a forked side-session, so the main agent keeps working untouched.</span>
-                  </div>
-                )}
-                {activeBtw.error ? <div className="btw-error">{activeBtw.error}</div> : null}
-              </div>
-              <div className="btw-composer">
-                <textarea
-                  value={btwDraft}
-                  onChange={(event) => setBtwDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault();
-                      submitBtw();
-                    } else if (event.key === "Escape") {
-                      event.preventDefault();
-                      closeBtwPanel(activeThread.id);
-                    }
-                  }}
-                  placeholder={activeBtw.running ? "Thinking… ask another when ready" : "Ask about this session…"}
-                  aria-label="Ask a side question about this session"
-                  rows={1}
-                  autoFocus
-                />
-                <button
-                  type="button"
-                  className="btw-send"
-                  onClick={submitBtw}
-                  disabled={activeBtw.running || !btwDraft.trim()}
-                >
-                  <Send size={14} aria-hidden="true" />
-                  Ask
-                </button>
-              </div>
-            </div>
-          ) : null}
-
           <WorkingStatusBar
             state={activeThread.agentState}
             detail={activeThread.agentState === "working" ? compactLine(activeRuntimeStatus?.latestCommand ?? activeRuntimeStatus?.latestTool ?? "") || undefined : undefined}
@@ -6925,12 +7334,116 @@ export default function App(): React.ReactElement {
             </div>
           </form>
         </div>
+
+        {activeBtw.open ? (
+          <aside className="btw-panel" role="complementary" aria-label="By the way — session side chat">
+            <div
+              className="btw-resizer"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize side chat"
+              onMouseDown={startBtwResize}
+              onDoubleClick={() => setBtwWidth(BTW_DEFAULT_WIDTH)}
+              title="Drag to resize · double-click to reset"
+            />
+            <div className="btw-panel-header">
+              <div className="btw-panel-heading">
+                <span className="btw-panel-title">
+                  <Sparkles size={14} aria-hidden="true" />
+                  By the way
+                  {activeBtw.running ? <span className="btw-live-dot" aria-hidden="true" /> : null}
+                </span>
+                <div className="btw-panel-actions">
+                  <button
+                    type="button"
+                    className="btw-panel-action"
+                    onClick={() => clearBtwThread(activeThread.id)}
+                    disabled={activeBtw.items.length === 0 && !activeBtw.running}
+                    aria-label="Clear side chat"
+                    title="Clear this side-chat and start fresh"
+                  >
+                    <Trash2 size={13} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="btw-panel-action btw-panel-close"
+                    onClick={() => closeBtwPanel(activeThread.id)}
+                    aria-label="Close side chat"
+                    title="Close (reopen by typing /btw)"
+                  >
+                    <X size={14} aria-hidden="true" />
+                  </button>
+                </div>
+              </div>
+              <span className="btw-panel-sub">Asks about this session — never interrupts it</span>
+            </div>
+            <div
+              ref={btwFeedRef}
+              className="btw-panel-feed"
+              aria-label="Side-chat messages"
+              onScroll={(event) => {
+                shouldFollowBtwRef.current = isNearScrollEnd(event.currentTarget);
+              }}
+            >
+              {activeBtw.items.length > 0 ? (
+                activeBtw.items.map((item) => {
+                  const collapsedByDefault = isCollapsedByDefaultConversationItem(item);
+                  return (
+                    <ConversationCard
+                      key={item.id}
+                      item={item}
+                      expanded={!collapsedByDefault || expandedConversationItems.has(item.id)}
+                      onToggle={toggleConversationItem}
+                      onPreviewImage={handlePreviewImage}
+                    />
+                  );
+                })
+              ) : (
+                <div className="btw-empty">
+                  <Sparkles size={18} aria-hidden="true" />
+                  <strong>Ask about this session</strong>
+                  <span>Questions run in a forked side-session, so the main agent keeps working untouched.</span>
+                </div>
+              )}
+              {activeBtw.error ? <div className="btw-error">{activeBtw.error}</div> : null}
+            </div>
+            <div className="btw-composer">
+              <textarea
+                value={btwDraft}
+                onChange={(event) => setBtwDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    submitBtw();
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    closeBtwPanel(activeThread.id);
+                  }
+                }}
+                placeholder={activeBtw.running ? "Thinking… ask another when ready" : "Ask about this session…"}
+                aria-label="Ask a side question about this session"
+                rows={1}
+                autoFocus
+              />
+              <button
+                type="button"
+                className="composer-fab composer-fab--send btw-send"
+                onClick={submitBtw}
+                disabled={activeBtw.running || !btwDraft.trim()}
+                aria-label="Ask"
+                title="Ask (Enter)"
+              >
+                <Send size={14} aria-hidden="true" />
+              </button>
+            </div>
+          </aside>
+        ) : null}
       </section>
 
       {contextMenu && contextThread ? (
         <div
           className="context-menu"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
+          style={menuPosition(contextMenu.x, contextMenu.y, 4)}
           onClick={(event) => event.stopPropagation()}
           role="menu"
         >
@@ -6945,6 +7458,18 @@ export default function App(): React.ReactElement {
           <button
             type="button"
             role="menuitem"
+            onClick={() => {
+              setContextMenu(null);
+              openSessionFiles(contextThread.id);
+            }}
+            disabled={contextThread.id === DRAFT_THREAD_ID}
+          >
+            <FileDiff size={14} aria-hidden="true" />
+            Changed files
+          </button>
+          <button
+            type="button"
+            role="menuitem"
             className="danger"
             onClick={() => requestDeleteThread(contextThread.id)}
             disabled={contextThread.id === DRAFT_THREAD_ID}
@@ -6952,6 +7477,80 @@ export default function App(): React.ReactElement {
             <Trash2 size={14} aria-hidden="true" />
             Delete
           </button>
+        </div>
+      ) : null}
+
+      {workspaceMenu ? (
+        <div
+          className="context-menu"
+          style={menuPosition(workspaceMenu.x, workspaceMenu.y, editors.length + 4)}
+          onClick={(event) => event.stopPropagation()}
+          role="menu"
+        >
+          <div className="context-menu-label">
+            {isScratchCwd(workspaceMenu.cwd) ? (
+              <Sparkles size={12} aria-hidden="true" />
+            ) : (
+              <Folder size={12} aria-hidden="true" />
+            )}
+            <span title={workspaceMenu.cwd}>{workspaceLabel(workspaceMenu.cwd)}</span>
+          </div>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              const { cwd } = workspaceMenu;
+              setWorkspaceMenu(null);
+              if (isScratchCwd(cwd)) {
+                void addScratchThread();
+              } else {
+                addThread(cwd);
+              }
+            }}
+          >
+            <Plus size={14} aria-hidden="true" />
+            New section
+          </button>
+          {isScratchCwd(workspaceMenu.cwd) ? null : (
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  const { cwd } = workspaceMenu;
+                  setWorkspaceMenu(null);
+                  openWorkspaceGit(cwd);
+                }}
+              >
+                <GitBranch size={14} aria-hidden="true" />
+                Git status
+              </button>
+              <div className="context-menu-separator" role="separator" />
+              {/* Same targets as the changed-files drawer offers, so "open this
+                  somewhere else" means the same thing everywhere in the app. */}
+              {editors.map((editor) => (
+                <button
+                  key={editor.id}
+                  type="button"
+                  role="menuitem"
+                  disabled={!editor.available}
+                  title={editor.available ? `Open the project in ${editor.name}` : `${editor.name} is not installed`}
+                  onClick={() => {
+                    const { cwd } = workspaceMenu;
+                    setWorkspaceMenu(null);
+                    openPathInEditor(cwd, editor.id);
+                  }}
+                >
+                  {editor.id === "finder" ? (
+                    <FolderOpen size={14} aria-hidden="true" />
+                  ) : (
+                    <ExternalLink size={14} aria-hidden="true" />
+                  )}
+                  Open in {editor.name}
+                </button>
+              ))}
+            </>
+          )}
         </div>
       ) : null}
 
@@ -7443,6 +8042,133 @@ export default function App(): React.ReactElement {
         </div>
       ) : null}
 
+      {filesThread ? (
+        <div className="git-drawer-backdrop from-right" role="presentation" onClick={closeSessionFiles}>
+          <aside
+            className="git-drawer from-right"
+            role="dialog"
+            aria-label={`Files changed by ${filesThread.title}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              setEditorPickerOpen(false);
+            }}
+          >
+            <header className="git-drawer-head">
+              <div className="git-drawer-title">
+                <FileDiff size={15} aria-hidden="true" />
+                <div className="git-drawer-title-copy">
+                  <strong>{filesThread.title}</strong>
+                  <span title={filesThread.cwd}>
+                    {workspaceName(filesThread.cwd)}
+                    {fileChanges?.branch ? ` · ${fileChanges.branch}` : ""}
+                  </span>
+                </div>
+              </div>
+              <div className="git-drawer-head-actions">
+                <button
+                  className={`ghost-icon-button ${filesLoading ? "spinning" : ""}`}
+                  type="button"
+                  onClick={() => void fetchSessionFiles(filesThread)}
+                  aria-label="Refresh changed files"
+                  title="Refresh"
+                  disabled={filesLoading}
+                >
+                  <RefreshCw size={15} aria-hidden="true" />
+                </button>
+                <button className="ghost-icon-button" type="button" onClick={closeSessionFiles} aria-label="Close">
+                  <X size={16} aria-hidden="true" />
+                </button>
+              </div>
+            </header>
+
+            <div className="files-toolbar">
+              <button
+                className="quiet-action"
+                type="button"
+                onClick={() => openPathInEditor(fileChanges?.root ?? filesThread.cwd)}
+                disabled={!activeEditor}
+                title={activeEditor ? `Open the project in ${activeEditor.name}` : "No editor found"}
+              >
+                <ExternalLink size={14} aria-hidden="true" />
+                <span>Open project{activeEditor ? ` in ${activeEditor.name}` : ""}</span>
+              </button>
+              <div className="files-editor-anchor">
+                <button
+                  className={`ghost-icon-button ${editorPickerOpen ? "active" : ""}`}
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setEditorPickerOpen((open) => !open);
+                  }}
+                  aria-label="Choose editor"
+                  title="Choose editor"
+                  aria-expanded={editorPickerOpen}
+                >
+                  <ChevronDown size={15} aria-hidden="true" />
+                </button>
+                {editorPickerOpen ? (
+                  <div className="files-editor-menu" role="menu" onClick={(event) => event.stopPropagation()}>
+                    {editors.map((editor) => (
+                      <button
+                        key={editor.id}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={editor.id === activeEditor?.id}
+                        className={editor.id === activeEditor?.id ? "selected" : ""}
+                        disabled={!editor.available}
+                        onClick={() => chooseEditor(editor.id)}
+                      >
+                        {editor.id === activeEditor?.id ? <Check size={13} aria-hidden="true" /> : <span className="files-editor-gap" />}
+                        <span>{editor.name}</span>
+                        {editor.available ? null : <em>not installed</em>}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="git-drawer-body">
+              {filesLoading && !fileChanges ? <div className="git-empty">Reading file changes…</div> : null}
+
+              {fileChanges ? (
+                <>
+                  <SessionFilesSummary changes={fileChanges} />
+
+                  {fileChanges.files.length === 0 ? (
+                    <div className="git-empty">
+                      {fileChanges.error ?? "This section has not written to any files yet."}
+                    </div>
+                  ) : (
+                    <section className="git-section">
+                      <div className="git-section-head">
+                        <span>Files</span>
+                        <em>{fileChanges.files.length}</em>
+                      </div>
+                      <ul className="git-list">
+                        {fileChanges.files.map((file) => (
+                          <SessionFileRow
+                            key={file.absolutePath}
+                            file={file}
+                            editorName={activeEditor?.name}
+                            onOpen={() => openPathInEditor(file.absolutePath)}
+                            onReveal={() => openPathInEditor(file.absolutePath, "finder")}
+                          />
+                        ))}
+                      </ul>
+                    </section>
+                  )}
+
+                  {fileChanges.error && fileChanges.files.length > 0 ? (
+                    <p className="git-note">{fileChanges.error} — line counts unavailable.</p>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+          </aside>
+        </div>
+      ) : null}
+
       {showSettings ? (
         <div className="dialog-backdrop" role="presentation" onClick={() => setShowSettings(false)}>
           <div
@@ -7689,6 +8415,18 @@ export default function App(): React.ReactElement {
                 ) : null}
               </div>
               <p>Press this from anywhere to open a prompt box and start a new section. Needs at least one modifier (⌘, ⌃, ⌥, or ⇧).</p>
+            </div>
+
+            <div className="settings-field">
+              <span className="settings-field-label">Conversation</span>
+              <label className="settings-toggle">
+                <input type="checkbox" checked={focusMode} onChange={(event) => setFocusMode(event.target.checked)} />
+                <span>Focus mode</span>
+              </label>
+              <p>
+                Shows only your messages, the agent&apos;s replies, and the final answer. Tool calls, thinking, and
+                subagents fold into a single &ldquo;Agent work&rdquo; line you can expand for the details.
+              </p>
             </div>
 
             <div className="settings-field">

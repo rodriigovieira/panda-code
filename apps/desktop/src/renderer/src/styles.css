@@ -1035,11 +1035,32 @@ button:disabled,
 
 .workspace {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   padding: 8px 16px 12px;
   gap: 10px;
+}
+
+/* /btw opens as a second column beside the conversation — the topbar keeps
+   spanning the full width, and the conversation shell simply gets narrower. */
+.workspace.with-btw > .workspace-top {
+  grid-column: 1 / -1;
+}
+
+.workspace.with-btw > .conversation-shell {
+  grid-column: 1;
+}
+
+.workspace.with-btw > .btw-panel {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.workspace.resizing-btw {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .workspace-top {
@@ -1772,6 +1793,106 @@ button.conversation-line-header:disabled {
   max-height: 2400px;
   opacity: 1;
   transform: translateY(0);
+}
+
+/* Focus mode: one run of tool calls, thinking, and subagents folded into a
+   single quiet line. Neutral by design — it must recede behind the messages,
+   so it uses the surface ladder and a hairline, never the accent. */
+.work-group {
+  align-self: stretch;
+  flex-shrink: 0;
+  width: min(820px, 100%);
+  max-width: 100%;
+  margin: 3px 0;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  background: var(--panel-soft);
+  overflow: hidden;
+}
+
+.work-group-header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--ctl-h-sm);
+  border: 0;
+  padding: 4px 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--motion-enter) var(--motion-ease);
+}
+
+.work-group-header:hover {
+  background: var(--hover-wash);
+}
+
+.work-group-header strong {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.work-group.running .work-group-header strong {
+  color: var(--run-text);
+}
+
+.work-group-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  border-radius: var(--r-sm);
+  background: var(--hover-wash);
+  color: var(--subtle);
+}
+
+.work-group.running .work-group-icon {
+  background: var(--run-wash);
+  color: var(--run-text);
+}
+
+.work-group-action {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--subtle);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.work-group-header:hover .work-group-action {
+  color: var(--accent-text);
+}
+
+.work-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-left: 10px;
+  padding: 4px 10px 8px 20px;
+  border-left: 2px solid var(--line-soft);
+}
+
+/* A folded run can be long; the shared 2400px cap would clip it. */
+.work-group > .conversation-collapse-region.expanded {
+  max-height: none;
+}
+
+/* Nested items already sit inside the group's own width. */
+.work-group-body .conversation-line,
+.work-group-body .agent-card,
+.work-group-body .conversation-passage {
+  width: 100%;
 }
 
 /* Subagent (Task/Agent tool) card: a delegated child turn, its transcript
@@ -2928,34 +3049,50 @@ button.conversation-line-header:disabled {
   color: var(--muted);
 }
 
-.context-menu {
-  position: fixed;
+/* One popover-menu surface for the whole app: the right-click menus and the
+   editor picker in the changed-files drawer are the same object, so they share
+   the same rules rather than drifting apart. Without the explicit font-size the
+   items inherit the 16px document size and read a step larger than every other
+   menu in the app. */
+.context-menu,
+.files-editor-menu {
   z-index: 40;
-  display: grid;
-  width: 168px;
-  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 190px;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   padding: 5px;
-  background: var(--panel-soft);
+  background: var(--overlay);
+  background-image: var(--overlay-sheen);
   box-shadow: var(--elev-popover);
 }
 
-.context-menu button {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  width: 100%;
-  height: var(--ctl-h);
-  border-radius: var(--r-sm);
-  padding: 0 9px;
-  background: transparent;
-  color: var(--text);
-  cursor: pointer;
-  text-align: left;
+.context-menu {
+  position: fixed;
 }
 
-.context-menu button:hover {
+.context-menu button,
+.files-editor-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: var(--ctl-h-sm);
+  border: 0;
+  border-radius: var(--r-sm);
+  padding: 0 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.2;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu button:hover:not(:disabled),
+.files-editor-menu button:hover:not(:disabled) {
   background: var(--hover-wash);
 }
 
@@ -2966,6 +3103,36 @@ button.conversation-line-header:disabled {
 .context-menu button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+.context-menu svg,
+.files-editor-menu svg {
+  flex-shrink: 0;
+}
+
+/* A menu heading: the project a right-clicked group belongs to, so "Open in
+   Cursor" cannot be read against the wrong repository. */
+.context-menu-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px 6px;
+  color: var(--subtle);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.context-menu-label span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line-soft);
 }
 
 .dialog-backdrop {
@@ -4296,17 +4463,88 @@ button.conversation-line-header:disabled {
   font-size: 11px;
 }
 
+/* Same borderless-input-in-a-shell idiom as the search dialog: only the bottom
+   hairline moves on focus, so the filter reads as part of the dialog chrome. */
+.prompt-history-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 14px;
+  border-bottom: var(--bw) solid var(--line-soft);
+  color: var(--subtle);
+  transition: border-color var(--motion-enter) var(--motion-ease),
+    color var(--motion-enter) var(--motion-ease);
+}
+
+.prompt-history-search:focus-within {
+  border-bottom-color: var(--accent-edge-strong);
+  color: var(--accent-text);
+}
+
+.prompt-history-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 13.5px;
+}
+
+.prompt-history-search input::placeholder {
+  color: var(--placeholder);
+}
+
+.prompt-history-search > button {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--r-pill);
+  padding: 3px;
+  background: var(--hover-wash);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--motion-enter) var(--motion-ease), color var(--motion-enter) var(--motion-ease);
+}
+
+.prompt-history-search > button:hover {
+  background: var(--hover-wash-strong);
+  color: var(--text);
+}
+
 .prompt-history-body {
   overflow-y: auto;
   padding: 8px 10px 12px;
 }
 
 .prompt-history-empty {
+  display: grid;
+  justify-items: center;
+  gap: 7px;
   margin: 0;
-  padding: 26px 12px;
+  padding: 34px 22px;
   color: var(--subtle);
-  font-size: 12.5px;
   text-align: center;
+}
+
+.prompt-history-empty > svg {
+  color: var(--line-hi);
+}
+
+.prompt-history-empty strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.prompt-history-empty p {
+  margin: 0;
+  max-width: 34ch;
+  color: var(--subtle);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .prompt-history-section {
@@ -4326,15 +4564,23 @@ button.conversation-line-header:disabled {
 
 .prompt-history-item {
   display: grid;
-  gap: 6px;
-  border: 1px solid var(--line-soft);
+  gap: 7px;
+  border: var(--bw) solid var(--line-soft);
   border-radius: var(--r-lg);
   padding: 9px 11px;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--panel);
+  box-shadow: var(--elev-card);
+}
+
+/* The newest prompt is the one you came here for — an accent edge, not a fill,
+   so a long body still reads as text rather than a highlighted block. */
+.prompt-history-item.latest {
+  border-color: var(--accent-edge);
 }
 
 .prompt-history-item.queued {
   border-style: dashed;
+  border-color: var(--warn-edge);
   background: var(--warn-wash);
 }
 
@@ -4353,19 +4599,65 @@ button.conversation-line-header:disabled {
   font-weight: 650;
 }
 
+/* Accent marks the current thing; warn marks the not-yet-sent thing. Blue is
+   informational only, so it has no business labelling either. */
 .prompt-history-badge.latest {
-  background: var(--info-wash);
-  color: var(--info-text);
+  background: var(--accent-wash);
+  color: var(--accent-text);
 }
 
 .prompt-history-badge.queued {
-  background: var(--accent-wash);
-  color: var(--accent-text);
+  background: var(--warn-wash);
+  color: var(--warn-text);
+}
+
+.prompt-history-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+  background: var(--agent-wash);
+  color: var(--agent-text);
+  font-size: 10px;
+  font-weight: 650;
 }
 
 .prompt-history-time {
   color: var(--subtle);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.prompt-history-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.prompt-history-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: var(--r-sm);
+  padding: 0;
+  background: transparent;
+  color: var(--subtle);
+  cursor: pointer;
+  transition: background var(--motion-enter) var(--motion-ease), color var(--motion-enter) var(--motion-ease);
+}
+
+.prompt-history-action:hover {
+  background: var(--hover-wash-strong);
+  color: var(--text);
+}
+
+.prompt-history-action.done {
+  color: var(--run-text);
 }
 
 .prompt-history-meta {
@@ -4403,6 +4695,49 @@ button.conversation-line-header:disabled {
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* A raw machine blob is evidence, not prose — set it in mono at one step down
+   so it doesn't compete with the prompts you actually typed. */
+.prompt-history-text.raw {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.prompt-history-summary {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.prompt-history-more {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 4px;
+  border: 0;
+  border-radius: var(--r-sm);
+  padding: 2px 6px 2px 4px;
+  background: transparent;
+  color: var(--subtle);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--motion-enter) var(--motion-ease), color var(--motion-enter) var(--motion-ease);
+}
+
+.prompt-history-more:hover {
+  background: var(--hover-wash);
+  color: var(--text);
+}
+
+.prompt-history-item mark {
+  border-radius: 3px;
+  padding: 0 1px;
+  background: var(--warn-edge);
+  color: var(--accent-text-hi);
 }
 
 .token-info-anchor {
@@ -4557,45 +4892,100 @@ button.conversation-line-header:disabled {
     width: 100%;
     max-width: none;
   }
+
+  /* Too narrow for two columns — /btw falls back to a pane under the
+     conversation. Overrides the inline column width set on .workspace. */
+  .workspace.with-btw {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-rows: auto minmax(0, 1fr) minmax(0, 0.85fr);
+  }
+
+  .workspace.with-btw > .btw-panel {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .btw-resizer {
+    display: none;
+  }
 }
 
-/* "By the way" side chat — a drawer that rises above the composer. */
+/* "By the way" side chat — a column beside the conversation, not below it. */
 .btw-panel {
+  position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 10px;
-  max-height: min(46vh, 460px);
-  border-top: 1px solid var(--info-edge);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--info-edge);
+  border-radius: var(--r-md);
   background:
-    linear-gradient(180deg, var(--info-wash), transparent 130px),
+    linear-gradient(180deg, var(--info-wash), transparent 160px),
     rgba(20, 24, 31, 0.97);
-  box-shadow: 0 -18px 44px rgba(0, 0, 0, 0.34);
+  box-shadow: -14px 0 34px rgba(0, 0, 0, 0.26);
   padding: 12px 12px 0;
-  animation: btw-rise 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  animation: btw-slide 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-@keyframes btw-rise {
+@keyframes btw-slide {
   from {
     opacity: 0;
-    transform: translateY(14px);
+    transform: translateX(16px);
   }
   to {
     opacity: 1;
-    transform: translateY(0);
+    transform: translateX(0);
   }
 }
 
+/* Grip on the panel's left edge — mirrors .sidebar-resizer on the other side. */
+.btw-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -5px;
+  z-index: 25;
+  width: 9px;
+  cursor: col-resize;
+}
+
+.btw-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 2px;
+  background: transparent;
+  transition: background var(--motion-enter) var(--motion-ease);
+}
+
+.btw-resizer:hover::after,
+.resizing-btw .btw-resizer::after {
+  background: var(--accent-text);
+}
+
 .btw-panel-header {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.btw-panel-heading {
   display: flex;
   align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
 }
 
 .btw-panel-title {
+  flex: 1 1 auto;
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
   color: var(--info-text);
   font-size: 13px;
   font-weight: 700;
@@ -4603,7 +4993,6 @@ button.conversation-line-header:disabled {
 }
 
 .btw-panel-sub {
-  flex: 1 1 auto;
   min-width: 0;
   color: var(--subtle);
   font-size: 11.5px;
@@ -4638,9 +5027,11 @@ button.conversation-line-header:disabled {
 .btw-panel-action {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 5px;
   height: var(--ctl-h-sm);
-  padding: 0 9px;
+  min-width: var(--ctl-h-sm);
+  padding: 0 7px;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--panel-strong);
@@ -4664,17 +5055,21 @@ button.conversation-line-header:disabled {
   opacity: 0.45;
 }
 
-.btw-panel-close {
-  padding: 0 7px;
-}
-
 .btw-panel-feed {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   padding: 2px 2px 0;
+}
+
+/* The column is narrow, so cards fill it rather than sizing to their content. */
+.btw-panel-feed > * {
+  max-width: 100%;
+  min-width: 0;
 }
 
 .btw-empty {
@@ -4711,29 +5106,35 @@ button.conversation-line-header:disabled {
   font-size: 12px;
 }
 
+/* Same shape as the session composer — a full-width field with the action as a
+   floating FAB in its bottom-right corner. The two composers sit side by side,
+   so anything else reads as two different controls. Bottom padding matches
+   `.prompt-composer` so both fields land on the same baseline. */
 .btw-composer {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 8px;
+  position: relative;
   padding: 8px 0 12px;
 }
 
 .btw-composer textarea {
+  display: block;
   width: 100%;
   min-width: 0;
-  height: 40px;
-  min-height: 40px;
-  max-height: 140px;
+  height: 62px;
+  min-height: 62px;
+  max-height: 200px;
   resize: vertical;
-  border: 1px solid var(--line);
+  border: var(--bw) solid var(--line);
   border-radius: var(--r-md);
   outline: 0;
-  padding: 10px 12px;
+  /* Right padding reserves room for the FAB — see `.prompt-composer textarea`. */
+  padding: 10px 46px 10px 12px;
   background: var(--input-bg);
   color: var(--text);
   font-size: 13px;
   line-height: 1.4;
+  transition:
+    border-color var(--motion-enter) var(--motion-ease),
+    box-shadow var(--motion-enter) var(--motion-ease);
 }
 
 .btw-composer textarea:focus {
@@ -4741,34 +5142,14 @@ button.conversation-line-header:disabled {
   box-shadow: var(--focus-ring);
 }
 
+/* Inherits every state from `.composer-fab--send`; only the smaller control
+   size differs, because the panel column is narrower than the main composer. */
 .btw-send {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  height: 40px;
-  min-width: 76px;
-  padding: 0 13px;
-  border: 0;
-  border-radius: var(--r-md);
-  background: var(--info-solid);
-  box-shadow: inset 0 0 0 1px var(--accent-edge);
-  color: var(--info-on);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition:
-    background var(--motion-enter) var(--motion-ease),
-    opacity var(--motion-enter) var(--motion-ease);
-}
-
-.btw-send:hover:not(:disabled) {
-  background: var(--info-solid);
-}
-
-.btw-send:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
+  right: 8px;
+  bottom: 20px;
+  width: var(--ctl-h-sm);
+  min-width: var(--ctl-h-sm);
+  height: var(--ctl-h-sm);
 }
 
 /* Workspace git status drawer */
@@ -4795,6 +5176,31 @@ button.conversation-line-header:disabled {
 @keyframes git-drawer-in {
   from {
     transform: translateX(-16px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+/* The changed-files drawer is the same surface anchored to the other edge: the
+   git drawer reports on a workspace, this one reports on a section, and the
+   section lives on the right side of the layout. */
+.git-drawer-backdrop.from-right {
+  justify-content: flex-end;
+}
+
+.git-drawer.from-right {
+  border-right: none;
+  border-left: 1px solid var(--line);
+  box-shadow: -24px 0 60px rgba(0, 0, 0, 0.4);
+  animation-name: git-drawer-in-right;
+}
+
+@keyframes git-drawer-in-right {
+  from {
+    transform: translateX(16px);
     opacity: 0;
   }
   to {
@@ -4991,6 +5397,218 @@ button.conversation-line-header:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 100%;
+}
+
+/* ---- Changed files drawer ---------------------------------------------- */
+
+.files-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.files-toolbar .quiet-action {
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-start;
+}
+
+.files-toolbar .quiet-action span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.files-editor-anchor {
+  position: relative;
+  flex-shrink: 0;
+}
+
+/* Anchored under the picker button; the surface itself comes from the shared
+   popover-menu block next to `.context-menu`. */
+.files-editor-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 5;
+}
+
+.files-editor-menu button:disabled {
+  color: var(--subtle);
+  cursor: default;
+}
+
+.files-editor-menu button.selected {
+  color: var(--accent-text);
+}
+
+.files-editor-menu button svg {
+  color: var(--accent-text);
+}
+
+.files-editor-menu button em {
+  margin-left: auto;
+  font-style: normal;
+  font-size: 11px;
+  color: var(--subtle);
+}
+
+.files-editor-gap {
+  width: 13px;
+  flex-shrink: 0;
+}
+
+.files-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.files-summary-counts {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.files-summary-counts strong {
+  font-size: 18px;
+  color: var(--text);
+}
+
+.files-summary-counts .files-add {
+  margin-left: auto;
+}
+
+.files-summary-bar {
+  display: flex;
+  height: 5px;
+  border-radius: var(--r-pill);
+  overflow: hidden;
+  background: var(--panel-strong);
+}
+
+/* Nothing pending: the bar reads as an empty track, and the zeroes stop
+   claiming to be additions and deletions. */
+.files-summary.is-empty .files-summary-counts .files-add,
+.files-summary.is-empty .files-summary-counts .files-del,
+.files-counts.is-zero .files-add,
+.files-counts.is-zero .files-del {
+  color: var(--muted);
+}
+
+.files-summary-add {
+  background: var(--run-text);
+}
+
+.files-summary-del {
+  background: var(--danger-text);
+}
+
+.files-add {
+  color: var(--run-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.files-del {
+  color: var(--danger-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.files-row {
+  gap: 8px;
+}
+
+.files-row.gone .files-name {
+  color: var(--subtle);
+  text-decoration: line-through;
+}
+
+.files-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+/* The path is what identifies a row, and its tail identifies it best, so long
+   paths truncate from the left: `direction: rtl` puts the ellipsis at the start,
+   and the inner span restores ltr so the path itself still reads normally. */
+.files-name-inner {
+  direction: ltr;
+  unicode-bidi: embed;
+}
+
+.files-dir {
+  color: var(--subtle);
+}
+
+.files-counts {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+.files-binary {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--subtle);
+}
+
+.files-blips {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.files-blip {
+  width: 6px;
+  height: 6px;
+  border-radius: 1px;
+  background: var(--panel-strong);
+}
+
+.files-blip.add {
+  background: var(--run-text);
+}
+
+.files-blip.del {
+  background: var(--danger-text);
+}
+
+.files-row-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0;
+}
+
+.files-row:hover .files-row-actions,
+.files-row:focus-within .files-row-actions {
+  opacity: 1;
+}
+
+.git-code.tone-run {
+  color: var(--run-text);
+}
+
+.git-code.tone-warn {
+  color: var(--warn-text);
+}
+
+.git-code.tone-danger {
+  color: var(--danger-text);
+}
+
+.git-code.tone-muted {
+  color: var(--subtle);
 }
 
 /* ---------------------------------------------------------------------------

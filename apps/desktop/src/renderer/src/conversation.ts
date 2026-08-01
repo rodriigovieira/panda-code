@@ -1,4 +1,5 @@
 import type { ConversationItem } from "../../shared/ipc";
+import { isCodexTranscriptMessageId } from "../../shared/stream-json";
 
 const MERGE_LIMIT = 500;
 
@@ -237,6 +238,97 @@ function dedupeConversationItems(items: ConversationItem[]): ConversationItem[] 
   return Array.from(byIdentity.values());
 }
 
+// Bodies are capped differently by the two sources (the live stream truncates
+// long messages, the transcript reader does not), so match on a generous prefix
+// rather than the whole text.
+function codexMessageKey(item: ConversationItem): string {
+  return `${item.kind}:${normalizedPromptBody(item.body).slice(0, 2_000)}`;
+}
+
+/**
+ * Codex rollout files record no app-server item ids, so the transcript reader
+ * keys messages by line number: a message loaded from disk and the same message
+ * received live are two ids with one text, i.e. two bubbles. Stopping a section
+ * reloads its transcript, which is where this surfaces — the prompt just sent
+ * comes back a second time. Match the pair by content and drop the transcript
+ * copy, consuming one live copy per match so a genuinely repeated prompt still
+ * shows once per send.
+ */
+function withoutDuplicatedCodexTranscriptMessages(items: ConversationItem[]): ConversationItem[] {
+  const liveCopies = new Map<string, number>();
+  for (const item of items) {
+    if (
+      (item.kind === "user" || item.kind === "assistant") &&
+      !item.id.startsWith("local") &&
+      !isCodexTranscriptMessageId(item.id)
+    ) {
+      const key = codexMessageKey(item);
+      liveCopies.set(key, (liveCopies.get(key) ?? 0) + 1);
+    }
+  }
+
+  if (liveCopies.size === 0) {
+    return items;
+  }
+
+  return items.filter((item) => {
+    if (!isCodexTranscriptMessageId(item.id)) {
+      return true;
+    }
+
+    const remaining = liveCopies.get(codexMessageKey(item)) ?? 0;
+    if (remaining <= 0) {
+      return true;
+    }
+
+    liveCopies.set(codexMessageKey(item), remaining - 1);
+    return false;
+  });
+}
+
+/**
+ * Focus mode feed entry: either an item that renders on its own, or a run of
+ * consecutive "quiet" items (tools, system activity, thinking, subagents)
+ * folded into one collapsed group.
+ */
+export type FocusedFeedEntry =
+  | { type: "item"; item: ConversationItem }
+  | { type: "work"; id: string; items: ConversationItem[] };
+
+/**
+ * Collapse every consecutive run of quiet items into a single group so the feed
+ * reads as the conversation alone: your prompts, the agent's replies, the final
+ * answer. What counts as quiet is the caller's call (the renderer knows which
+ * assistant items are really thinking placeholders).
+ */
+export function groupQuietWork(
+  items: ConversationItem[],
+  isQuiet: (item: ConversationItem) => boolean,
+): FocusedFeedEntry[] {
+  const entries: FocusedFeedEntry[] = [];
+  // Holds the run currently being filled. The same array is already inside the
+  // entry we pushed, so appending here grows that group.
+  let openGroup: ConversationItem[] | null = null;
+
+  for (const item of items) {
+    if (!isQuiet(item)) {
+      openGroup = null;
+      entries.push({ type: "item", item });
+      continue;
+    }
+
+    if (openGroup) {
+      openGroup.push(item);
+      continue;
+    }
+
+    openGroup = [item];
+    entries.push({ type: "work", id: `work:${item.id}`, items: openGroup });
+  }
+
+  return entries;
+}
+
 export function mergeConversationItems(existing: ConversationItem[], incoming: ConversationItem[]): ConversationItem[] {
   const pendingLocalItems = existing.flatMap((item) => {
     if (isOptimisticPrompt(item)) {
@@ -263,7 +355,9 @@ export function mergeConversationItems(existing: ConversationItem[], incoming: C
     (item) => !isOptimisticPrompt(item) && !isOptimisticThinking(item) && !isSteeringMarker(item),
   );
 
-  return dedupeConversationItems([...incoming, ...retainedExisting, ...pendingLocalItems]).sort((first, second) => {
+  return withoutDuplicatedCodexTranscriptMessages(
+    dedupeConversationItems([...incoming, ...retainedExisting, ...pendingLocalItems]),
+  ).sort((first, second) => {
     const firstTime = itemTime(first);
     const secondTime = itemTime(second);
     if (

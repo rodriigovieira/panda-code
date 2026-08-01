@@ -110,6 +110,51 @@ export function thinkingItemId(messageId: string, index: number): string {
   return `stream:${messageId}:thinking:${index}`;
 }
 
+// Codex is the exception to the shared-id rule above: its rollout file records
+// no app-server item ids for messages, so the transcript reader keys them by
+// line number. A transcript copy and a live copy of the same message therefore
+// never collide on id — mergeConversationItems matches them by content instead,
+// which is what this predicate is for.
+export function codexTranscriptMessageId(threadId: string, role: "user" | "assistant", lineIndex: number): string {
+  return messageItemId(`codex:${threadId}:${role}:${lineIndex}`);
+}
+
+export function isCodexTranscriptMessageId(id: string): boolean {
+  return /^stream:codex:.+:(?:user|assistant):\d+$/.test(id);
+}
+
+// Claude Code injects tooling text back into the conversation as "user" turns:
+// a skill body, a system reminder, a slash-command wrapper, hook output. None of
+// them were typed by the user, so they must not render as a prompt bubble. The
+// live stream tags them `isSynthetic`, the JSONL transcript tags them `isMeta`.
+export function isSyntheticUserEvent(event: StreamJsonEvent): boolean {
+  return event.isSynthetic === true || event.isMeta === true;
+}
+
+const SYNTHETIC_USER_TITLES: Array<{ match: RegExp; title: string }> = [
+  { match: /^Base directory for this skill:/i, title: "Skill" },
+  { match: /^<system-reminder>/i, title: "System reminder" },
+  { match: /^<task-notification>/i, title: "Task update" },
+  { match: /^<command-(?:name|message|args)>/i, title: "Command" },
+  { match: /^<local-command-(?:stdout|stderr)>/i, title: "Command output" },
+  { match: /^<user-prompt-submit-hook>/i, title: "Hook" },
+];
+
+export function syntheticUserTitle(text: string): string {
+  const trimmed = text.trimStart();
+  return SYNTHETIC_USER_TITLES.find((rule) => rule.match.test(trimmed))?.title ?? "System";
+}
+
+// Not every injected turn carries a flag: a background-task notification is
+// written into the transcript as a plain "user" entry with no `isMeta` and no
+// `isSynthetic`, so the flags alone would render it as a prompt bubble. Fall
+// back to the wrapper the text opens with — every one of these markers is
+// machine-authored, so no real prompt can be mistaken for one.
+export function looksLikeSyntheticUserText(text: string): boolean {
+  const trimmed = text.trimStart();
+  return SYNTHETIC_USER_TITLES.some((rule) => rule.match.test(trimmed));
+}
+
 export function toolUseItemId(toolUseId: string): string {
   return `stream:${toolUseId}:tool`;
 }
@@ -469,6 +514,8 @@ function applyContentParts(
   const model = asString(message?.model);
   const text = textFromContent(content);
 
+  const synthetic = role === "user" && (isSyntheticUserEvent(event) || looksLikeSyntheticUserText(text));
+
   if (text) {
     if (role === "assistant") {
       if (model) state.latestModel = model;
@@ -477,8 +524,8 @@ function applyContentParts(
     }
     pushItem(state, {
       id: messageItemId(messageId),
-      kind: role,
-      title: role === "assistant" ? "Claude" : undefined,
+      kind: synthetic ? "system" : role,
+      title: role === "assistant" ? "Claude" : synthetic ? syntheticUserTitle(text) : undefined,
       body: compactBody(text),
       timestamp,
       // Only set when known: addOrCoalesceAssistant spreads the incoming item

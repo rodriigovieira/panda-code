@@ -37,7 +37,7 @@ Environment:
   SIGN_IDENTITY             Codesigning identity for manual signing.
   PROVISIONING_PROFILE      Provisioning profile name for manual signing.
   App Store Connect API key (preferred for --upload):
-    APP_STORE_API_KEY_ID    Key ID, e.g. WGXQ6U853Z. The matching AuthKey_<ID>.p8 must live
+    APP_STORE_API_KEY_ID    Key ID, e.g. ABCD1234EF. The matching AuthKey_<ID>.p8 must live
                             in ~/.appstoreconnect/private_keys/ (or ./private_keys/).
     APP_STORE_API_ISSUER_ID Issuer ID (UUID) from the App Store Connect Keys page.
   App-specific password (fallback for --upload):

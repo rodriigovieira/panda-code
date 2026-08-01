@@ -183,6 +183,8 @@ export type AppPreferences = {
   hideDockIcon: boolean;
   notificationsPaused: boolean;
   remoteKeepAwake: "off" | "while-plugged-in" | "always";
+  /** Editor the changed-files drawer opens by default. */
+  preferredEditor: EditorId;
 };
 
 export type RemotePairingInfo =
@@ -609,6 +611,64 @@ export type WorkspaceGitStatus = {
   error?: string;
 };
 
+// "What did this section touch?" — the file list comes from the section's own
+// transcript (so a repo shared by several sections still attributes correctly)
+// and the line counts come from git.
+export type SessionFileChangesRequest = {
+  /** Panda section id. Used for the desktop's durable per-section file snapshot. */
+  sessionId?: string;
+  cwd: string;
+  claudeSessionId?: string;
+  codexThreadId?: string;
+};
+
+export type SessionFileChangeStatus =
+  | "modified"
+  | "added"
+  | "deleted"
+  | "untracked"
+  /** The section wrote here, but the working tree matches HEAD — committed, reverted, or rewritten back. */
+  | "clean"
+  /** Written during the run, gone now, and git has no record of it (a temp file, or a path outside the repo). */
+  | "missing";
+
+export type SessionFileChange = {
+  /** Repo-relative when the file lives under the git root, absolute otherwise. */
+  path: string;
+  absolutePath: string;
+  status: SessionFileChangeStatus;
+  added: number;
+  removed: number;
+  /** Git reports a binary diff, so the line counts are meaningless and left at 0. */
+  binary?: boolean;
+  /** Present on disk right now — an editor can open it. */
+  exists: boolean;
+};
+
+export type SessionFileChanges = {
+  isRepo: boolean;
+  /** Absolute path of the git root the counts are measured against. */
+  root?: string;
+  branch?: string;
+  files: SessionFileChange[];
+  added: number;
+  removed: number;
+  error?: string;
+};
+
+export type EditorId = "cursor" | "vscode" | "finder";
+
+export type EditorTarget = {
+  id: EditorId;
+  name: string;
+  available: boolean;
+};
+
+export type OpenInEditorRequest = {
+  editor: EditorId;
+  path: string;
+};
+
 export type DesktopApi = {
   getPathForFile: (file: File) => string;
   savePastedImage: (request: SavePastedImageRequest) => Promise<SavePastedImageResult>;
@@ -672,4 +732,9 @@ export type DesktopApi = {
   listArtifacts: (request: ArtifactsListRequest) => Promise<ArtifactRun[]>;
   revealPath: (targetPath: string) => Promise<boolean>;
   loadWorkspaceGit: (request: WorkspaceGitRequest) => Promise<WorkspaceGitStatus>;
+  /** Files this section wrote to, with git's line counts for each. */
+  loadSessionFileChanges: (request: SessionFileChangesRequest) => Promise<SessionFileChanges>;
+  /** Which external editors are installed, so the UI only offers real ones. */
+  listEditors: () => Promise<EditorTarget[]>;
+  openInEditor: (request: OpenInEditorRequest) => Promise<boolean>;
 };

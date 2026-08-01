@@ -11,6 +11,7 @@ import 'models.dart';
 import 'new_session_screen.dart';
 import 'session_view_screen.dart';
 import 'settings_screen.dart';
+import 'widgets/session_files_sheet.dart';
 import 'widgets/usage_sheet.dart';
 
 /// Paired home: desktop presence + the list of Claude Code sessions running on
@@ -527,6 +528,14 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
               onTap: () {
                 Navigator.of(ctx).pop();
                 _toggleSubscription(row);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.difference_outlined),
+              title: const Text('Changed files'),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                showSessionFilesSheet(context, row);
               },
             ),
             ListTile(
@@ -1176,47 +1185,56 @@ class _WorkspaceHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(6),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
-        child: Row(
-          children: [
-            Icon(
-              collapsed ? Icons.chevron_right : Icons.expand_more,
-              size: 18,
-              color: context.tokens.subtle,
-            ),
-            SizedBox(width: 4),
-            Icon(Icons.folder_outlined,
-                size: 15, color: theme.colorScheme.primary),
-            SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                name,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.labelMedium?.copyWith(
-                  color: context.tokens.muted,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0.4,
+    // Long-pressing anywhere on the header also starts the drag, so reordering
+    // doesn't depend on hitting the small handle.
+    return ReorderableDelayedDragStartListener(
+      index: dragIndex,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.only(left: 2, top: 2, bottom: 2),
+          child: Row(
+            children: [
+              Icon(
+                collapsed ? Icons.chevron_right : Icons.expand_more,
+                size: 18,
+                color: context.tokens.subtle,
+              ),
+              SizedBox(width: 4),
+              Icon(Icons.folder_outlined,
+                  size: 15, color: theme.colorScheme.primary),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: context.tokens.muted,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.4,
+                  ),
                 ),
               ),
-            ),
-            SizedBox(width: 8),
-            Text('$count',
-                style: theme.textTheme.labelSmall
-                    ?.copyWith(color: context.tokens.subtle)),
-            ReorderableDragStartListener(
-              index: dragIndex,
-              child: Padding(
-                padding: const EdgeInsets.only(left: 4),
-                child: Icon(Icons.drag_handle,
-                    size: 18, color: context.tokens.subtle),
+              SizedBox(width: 8),
+              Text('$count',
+                  style: theme.textTheme.labelSmall
+                      ?.copyWith(color: context.tokens.subtle)),
+              ReorderableDragStartListener(
+                index: dragIndex,
+                // Transparent fill makes the whole padded box hit-testable, so
+                // the handle is a ~44x36 target instead of an 18px icon.
+                child: Container(
+                  color: Colors.transparent,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                  child: Icon(Icons.drag_handle,
+                      size: 18, color: context.tokens.subtle),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -1451,7 +1469,10 @@ class _AgentBadgeState extends State<_AgentBadge>
       );
     }
     if (_stale) {
-      return (t.subtle, Icon(Icons.cloud_off_outlined, size: 16, color: t.subtle));
+      return (
+        t.subtle,
+        Icon(Icons.cloud_off_outlined, size: 16, color: t.subtle)
+      );
     }
     switch (widget.agentState) {
       case AgentState.working:
@@ -1489,6 +1510,7 @@ class _ConnectionPill extends StatelessWidget {
   });
 
   final AsyncValue<DeviceStatus?> statusAsync;
+
   /// Heartbeat-aged presence, not the raw `status.online` flag.
   final bool online;
   final VoidCallback onRetry;

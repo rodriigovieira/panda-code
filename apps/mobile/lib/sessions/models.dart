@@ -575,6 +575,69 @@ List<ConversationItem> mergeToolResults(List<ConversationItem> items) {
   return out;
 }
 
+/// Focus mode: true for anything that is not the conversation itself. Tool
+/// cards, thinking, and system activity fold away; your prompts, the agent's
+/// replies, steering markers, and the end-of-turn caption stay. Mirrors the
+/// desktop's `isQuietFeedItem`.
+bool isQuietTranscriptItem(ConversationItem item) {
+  if (isTurnSummaryItem(item)) return false;
+  if (item.tool != null || item.thinking) return true;
+  return item.kind == 'system';
+}
+
+/// One row of a focus-mode transcript: either a message, or a folded run of
+/// quiet work.
+sealed class TranscriptEntry {
+  const TranscriptEntry();
+
+  /// The item a role divider should compare against (the last one in the entry).
+  ConversationItem get lastItem;
+}
+
+class TranscriptMessage extends TranscriptEntry {
+  const TranscriptMessage(this.item);
+
+  final ConversationItem item;
+
+  @override
+  ConversationItem get lastItem => item;
+}
+
+class TranscriptWorkGroup extends TranscriptEntry {
+  const TranscriptWorkGroup(this.id, this.items);
+
+  final String id;
+  final List<ConversationItem> items;
+
+  @override
+  ConversationItem get lastItem => items.last;
+}
+
+/// Collapses every consecutive run of quiet items into one group so the feed
+/// reads as the conversation alone. Order is preserved; nothing is dropped.
+List<TranscriptEntry> groupQuietWork(List<ConversationItem> items) {
+  final entries = <TranscriptEntry>[];
+  // The run currently being filled. It is already inside the entry we appended,
+  // so growing it here grows that group.
+  List<ConversationItem>? openGroup;
+
+  for (final item in items) {
+    if (!isQuietTranscriptItem(item)) {
+      openGroup = null;
+      entries.add(TranscriptMessage(item));
+      continue;
+    }
+    if (openGroup != null) {
+      openGroup.add(item);
+      continue;
+    }
+    openGroup = [item];
+    entries.add(TranscriptWorkGroup('work:${item.id}', openGroup));
+  }
+
+  return entries;
+}
+
 /// One backward page of history from `sessions:history`. [items] are ascending
 /// by sequence; [nextBeforeSeq] is the cursor for the next-older page (null when
 /// [isDone]).
@@ -1146,6 +1209,103 @@ class UsageSnapshot {
       provider: (json['provider'] as String?) ?? 'claude',
       windows: windows,
       fetchedAt: DateTime.tryParse(json['fetchedAt'] as String? ?? ''),
+    );
+  }
+}
+
+/// What one file looked like after a section wrote to it. Mirrors
+/// `SessionFileChange` in the desktop's shared/ipc.ts — the desktop computes it
+/// (only it can see a working tree) and it arrives as the answer to a
+/// `session-files` command round-trip.
+class SessionFileChange {
+  /// Repo-relative when the file lives under the git root, absolute otherwise.
+  final String path;
+  final String absolutePath;
+
+  /// modified · added · deleted · untracked · clean · missing.
+  final String status;
+  final int added;
+  final int removed;
+
+  /// Git reported a binary diff, so the line counts mean nothing.
+  final bool binary;
+
+  /// Present on disk right now.
+  final bool exists;
+
+  const SessionFileChange({
+    required this.path,
+    required this.absolutePath,
+    required this.status,
+    this.added = 0,
+    this.removed = 0,
+    this.binary = false,
+    this.exists = true,
+  });
+
+  static SessionFileChange fromDecrypted(Map<String, dynamic> m) {
+    final absolute = (m['absolutePath'] as String?) ?? '';
+    return SessionFileChange(
+      path: (m['path'] as String?) ?? absolute,
+      absolutePath: absolute,
+      status: (m['status'] as String?) ?? 'modified',
+      added: (m['added'] as num?)?.toInt() ?? 0,
+      removed: (m['removed'] as num?)?.toInt() ?? 0,
+      binary: m['binary'] == true,
+      exists: m['exists'] != false,
+    );
+  }
+
+  /// Directory part of [path], for the dimmed prefix in the file list.
+  String get directory {
+    final cut = path.lastIndexOf('/');
+    return cut <= 0 ? '' : path.substring(0, cut + 1);
+  }
+
+  String get name {
+    final cut = path.lastIndexOf('/');
+    return cut < 0 ? path : path.substring(cut + 1);
+  }
+}
+
+/// "What did this section change?" — the file list attributed from the section's
+/// own transcript, with line counts from git. Mirrors `SessionFileChanges`.
+class SessionFileChanges {
+  final bool isRepo;
+  final String? root;
+  final String? branch;
+  final List<SessionFileChange> files;
+  final int added;
+  final int removed;
+
+  /// Set when the desktop could answer only partially (no repo, git failed).
+  final String? error;
+
+  const SessionFileChanges({
+    this.isRepo = false,
+    this.root,
+    this.branch,
+    this.files = const [],
+    this.added = 0,
+    this.removed = 0,
+    this.error,
+  });
+
+  bool get isEmpty => files.isEmpty;
+
+  static SessionFileChanges fromDecrypted(Map<String, dynamic> m) {
+    return SessionFileChanges(
+      isRepo: m['isRepo'] == true,
+      root: m['root'] as String?,
+      branch: m['branch'] as String?,
+      files: ((m['files'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((raw) =>
+              SessionFileChange.fromDecrypted(Map<String, dynamic>.from(raw)))
+          .toList(),
+      added: (m['added'] as num?)?.toInt() ?? 0,
+      removed: (m['removed'] as num?)?.toInt() ?? 0,
+      error: m['error'] as String?,
     );
   }
 }

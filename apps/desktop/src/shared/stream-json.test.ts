@@ -580,6 +580,62 @@ describe("toolInputBody", () => {
   });
 });
 
+describe("synthetic user turns", () => {
+  it("renders an injected skill body as a system row, not a prompt bubble", () => {
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      {
+        type: "user",
+        uuid: "uuid-skill",
+        isSynthetic: true,
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Base directory for this skill: /repo/.claude/skills/release\n\nRelease a project" }],
+        },
+      },
+      at,
+    );
+
+    expect(state.items).toHaveLength(1);
+    expect(state.items[0]).toMatchObject({ kind: "system", title: "Skill" });
+  });
+
+  it("renders an unflagged task notification as a system row", () => {
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      {
+        type: "user",
+        uuid: "uuid-task-note",
+        message: {
+          role: "user",
+          content:
+            '<task-notification>\n<task-id>bo6swulfe</task-id>\n<summary>Background command "Install deps" completed (exit code 0)</summary>\n</task-notification>',
+        },
+      },
+      at,
+    );
+
+    expect(state.items).toHaveLength(1);
+    expect(state.items[0]).toMatchObject({ kind: "system", title: "Task update" });
+  });
+
+  it("keeps a real prompt a user item", () => {
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      { type: "user", uuid: "uuid-prompt", message: { role: "user", content: "Ship it" } },
+      at,
+    );
+
+    expect(state.items[0]).toMatchObject({ kind: "user", body: "Ship it" });
+  });
+});
+
 describe("toolResultBody", () => {
   it("keeps plain-text results untouched", () => {
     expect(toolResultBody("Tests passed")).toBe("Tests passed");

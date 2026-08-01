@@ -18,8 +18,7 @@ void main() {
     });
 
     test('other workspaces use the folder name', () {
-      expect(workspaceDisplayName('/Users/someone/code/PandaPDV-mono'),
-          'PandaPDV-mono');
+      expect(workspaceDisplayName('/Users/someone/code/acme-mono'), 'acme-mono');
     });
 
     test('empty path falls back', () {

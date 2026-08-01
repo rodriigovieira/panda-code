@@ -163,6 +163,51 @@ describe("relay protocol", () => {
     });
   });
 
+  test("a session-files command carries its file list back in resultCipher", async () => {
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+
+    // Same shape as usage-cost: the desktop is the only side that can see a
+    // working tree, so the answer is sealed before it reaches the relay.
+    const commandId = await t.mutation(api.commands.enqueue, {
+      mobileId: relayFixture.mobileId,
+      token: relayFixture.mobileToken,
+      sessionId: relayFixture.sessionId,
+      type: "session-files",
+    });
+
+    const pending = await t.query(api.commands.pending, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+    });
+    expect(pending[0]).toMatchObject({ _id: commandId, type: "session-files" });
+
+    await t.mutation(api.commands.claim, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      commandId,
+    });
+    await t.mutation(api.commands.ack, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      commandId,
+      status: "done",
+      resultCipher: "cipher:changes",
+    });
+
+    const mine = await t.query(api.commands.watchMine, {
+      mobileId: relayFixture.mobileId,
+      token: relayFixture.mobileToken,
+    });
+    expect(mine[0]).toMatchObject({
+      _id: commandId,
+      type: "session-files",
+      status: "done",
+      resultCipher: "cipher:changes",
+    });
+  });
+
   test("command enqueue, claim, and ack closes the loop", async () => {
     const t = createRelayTest();
     await registerDevice(t);
