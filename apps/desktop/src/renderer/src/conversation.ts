@@ -1,7 +1,54 @@
 import type { ConversationItem } from "../../shared/ipc";
 import { isCodexTranscriptMessageId } from "../../shared/stream-json";
 
-const MERGE_LIMIT = 500;
+// History beyond the initial page only enters memory when the user explicitly
+// asks for it. Keep enough of those pages to make cursor navigation meaningful;
+// the render window and transcript LRU bound DOM and cross-section residency.
+const MERGE_LIMIT = 20_000;
+
+export const COLLAPSIBLE_PROMPT_LENGTH = 1_000;
+
+export function shouldCollapsePrompt(value: string): boolean {
+  return value.length > COLLAPSIBLE_PROMPT_LENGTH;
+}
+
+export type PeerPrompt = {
+  body: string;
+  relation: "parent" | "subthread" | "peer" | "delegated";
+  senderId: string;
+  senderTitle: string;
+};
+
+/**
+ * Panda Peers has to deliver agent-to-agent messages through the runtime's
+ * ordinary user-input channel. Its bracketed preamble is deliberately stable,
+ * which lets the transcript recover the real sender instead of presenting the
+ * message as if the operator typed it.
+ */
+export function parsePeerPrompt(value: string): PeerPrompt | null {
+  const boundary = value.indexOf("]\n\n");
+  if (boundary < 0) return null;
+
+  const preamble = value.slice(0, boundary + 1);
+  const body = value.slice(boundary + 3).trim();
+  const sender = preamble.match(/(?:Panda Code section )?"([^"]+)" \(id `([^`]+)`\)/);
+  if (!sender) return null;
+
+  let relation: PeerPrompt["relation"];
+  if (preamble.startsWith("[Message from")) {
+    relation = preamble.includes("a SUB-THREAD you opened")
+      ? "subthread"
+      : preamble.includes("the section this one is a SUB-THREAD of")
+        ? "parent"
+        : "peer";
+  } else if (preamble.startsWith("[This section is a SUB-THREAD of") || preamble.startsWith("[This section was opened by")) {
+    relation = "delegated";
+  } else {
+    return null;
+  }
+
+  return { body, relation, senderId: sender[2]!, senderTitle: sender[1]! };
+}
 
 function normalizedPromptBody(value: string): string {
   return value.replace(/\s+/g, " ").trim();
@@ -397,4 +444,81 @@ export function mergeConversationItems(existing: ConversationItem[], incoming: C
 
     return first.id.localeCompare(second.id);
   }).slice(-MERGE_LIMIT);
+}
+
+/**
+ * How many of a section's oldest transcript items to fold away.
+ *
+ * The feed's whole element tree is rebuilt whenever a turn starts or ends, so a
+ * section with thousands of items pays for all of them twice a turn. Windowing
+ * the render bounds that. Nothing is dropped from state — `revealed` grows as
+ * the user asks for more, and search, export and /btw keep reading the full
+ * conversation either way.
+ */
+export function hiddenTranscriptCount(total: number, windowSize: number, revealed: number): number {
+  // A window of 0 is "no limit", which is a real choice on a big machine.
+  if (windowSize <= 0) return 0;
+  return Math.max(0, total - windowSize - Math.max(0, revealed));
+}
+
+/**
+ * Whether opening a section should re-read its transcript from disk.
+ *
+ * A section with a live process normally has everything the window needs: the
+ * stream put it there. The exception is a section the reaper parked — its
+ * transcript was dropped on the way out, and a resume (your next prompt, or a
+ * sub-thread reporting back) makes it "running" again while the history is still
+ * missing. The stream from that point on cannot replace it, so the drop has to
+ * outrank the status: read from disk until the read has actually happened.
+ */
+export function shouldReloadTranscript(input: { status: string; transcriptDropped: boolean }): boolean {
+  return input.status !== "running" || input.transcriptDropped;
+}
+
+/** One section's transcript sitting in renderer state. */
+export type TranscriptResidency = {
+  id: string;
+  /** Epoch ms this section's transcript was last on screen. 0 = never. */
+  viewedAt: number;
+  /**
+   * Whether the section currently has a live turn. A running section holds
+   * streamed items the on-disk transcript does not have yet, so dropping it
+   * would lose the visible turn rather than park it.
+   */
+  running: boolean;
+};
+
+/**
+ * Which sections' transcripts to release from renderer state.
+ *
+ * The process reaper bounds how many sections hold a CLI process; this bounds
+ * how many hold their history in the window. They are separate problems: a
+ * section you only ever browsed never had a process to reap, but reading it
+ * loaded its whole transcript — 16 MB of JSONL for a long one — and nothing
+ * released it. Dropped items reload from disk when the section is next opened.
+ *
+ * Ineligible sections still count against the budget but are never dropped, so
+ * the limit is exceeded rather than the visible turn being destroyed.
+ */
+export function selectTranscriptsToDrop(input: {
+  loaded: TranscriptResidency[];
+  activeId: string | null;
+  /** Sections to keep loaded; 0 keeps everything. */
+  keep: number;
+}): string[] {
+  const { loaded, activeId, keep } = input;
+  if (keep <= 0 || loaded.length <= keep) return [];
+
+  const candidates = loaded
+    .filter((entry) => entry.id !== activeId && !entry.running)
+    .sort((a, b) => a.viewedAt - b.viewedAt);
+
+  const drop: string[] = [];
+  let remaining = loaded.length;
+  for (const candidate of candidates) {
+    if (remaining <= keep) break;
+    drop.push(candidate.id);
+    remaining -= 1;
+  }
+  return drop;
 }

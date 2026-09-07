@@ -2,12 +2,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../backlog/backlog_screen.dart';
+import '../diagnostics/perf_trace.dart';
+import '../git/git_status_screen.dart';
+import '../machine/device_sheet.dart';
 import '../relay/relay_api.dart';
+import '../schedule/schedule_screen.dart';
 import '../state/providers.dart';
 import '../theme/panda_tokens.dart';
 import '../widgets/panda_logo.dart';
 import '../widgets/toast/panda_toast.dart';
 import 'models.dart';
+import 'subthreads.dart';
 import 'new_session_screen.dart';
 import 'session_view_screen.dart';
 import 'settings_screen.dart';
@@ -40,15 +46,25 @@ class SessionListScreen extends ConsumerWidget {
     return Scaffold(
       appBar: AppBar(
         titleSpacing: 12,
-        title: PandaWordmark(
-          subtitle: status?.name,
-          subtitleTrailing: _ConnectionPill(
-            statusAsync: statusAsync,
-            online: online,
-            onRetry: () {
-              ref.invalidate(deviceStatusProvider);
-              ref.invalidate(sessionsStreamProvider);
-            },
+        // The lockup is the handle for the Mac itself: tapping it opens what that
+        // machine is doing right now. It was the one thing in this bar that
+        // named a device and did nothing when you touched it.
+        title: InkWell(
+          onTap: () => showDeviceSheet(context),
+          borderRadius: context.tokens.radius.mdR,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+            child: PandaWordmark(
+              subtitle: status?.name,
+              subtitleTrailing: _ConnectionPill(
+                statusAsync: statusAsync,
+                online: online,
+                onRetry: () {
+                  ref.invalidate(deviceStatusProvider);
+                  ref.invalidate(sessionsStreamProvider);
+                },
+              ),
+            ),
           ),
         ),
         // One treatment for every app-bar action: a 24pt glyph in a 44pt target,
@@ -129,11 +145,11 @@ class _SessionBody extends ConsumerStatefulWidget {
 }
 
 bool _isNeedsApproval(SessionRow r) =>
-    (r.runtime?.agentState ?? r.agentState) == AgentState.needsAction;
+    r.agentState == AgentState.needsAction;
 
 bool _isEnded(SessionRow r) =>
     r.status == SessionStatus.exited ||
-    (r.runtime?.agentState ?? r.agentState) == AgentState.exited;
+    r.agentState == AgentState.exited;
 
 bool _isActive(SessionRow r) => !_isEnded(r);
 
@@ -143,12 +159,27 @@ const int _initialVisibleSessions = 5;
 const int _visibleSessionsStep = 10;
 
 class _SessionBodyState extends ConsumerState<_SessionBody> {
-  /// Workspace names the user has collapsed. Default is expanded.
+  /// Workspace names currently collapsed. Every workspace starts collapsed
+  /// the first time it's seen (tracked via [_seenWorkspaces]); removing a
+  /// name from this set is how the user expands that group.
   final Set<String> _collapsed = <String>{};
+
+  /// Workspace names already defaulted into [_collapsed] once, so a group the
+  /// user expanded doesn't get re-collapsed on the next build.
+  final Set<String> _seenWorkspaces = <String>{};
 
   /// How many sessions are currently expanded per workspace name. Absent means
   /// the default [_initialVisibleSessions].
   final Map<String, int> _visibleCounts = <String, int>{};
+
+  /// Sessions whose sub-threads are folded away. Every session with children
+  /// starts collapsed the first time it's seen (tracked via [_seenParents]),
+  /// unlike the desktop sidebar, which defaults sub-threads to expanded.
+  final Set<String> _collapsedSubthreads = <String>{};
+
+  /// Parent session ids already defaulted into [_collapsedSubthreads] once, so
+  /// a thread the user expanded doesn't get re-collapsed on the next build.
+  final Set<String> _seenParents = <String>{};
   final _searchController = TextEditingController();
   String _query = '';
   _StatusFilter _filter = _StatusFilter.all;
@@ -187,7 +218,7 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
     final list = rows.toList();
     int rank(SessionRow r) {
       if (_isNeedsApproval(r)) return 0;
-      final s = r.runtime?.agentState ?? r.agentState;
+      final s = r.agentState;
       return switch (s) {
         AgentState.working => 1,
         AgentState.waiting => 2,
@@ -216,16 +247,35 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
 
   @override
   Widget build(BuildContext context) {
+    PerfRoute.mark('SessionList');
     final allRows = widget.rows;
+    // Seeded on every build, not just initState, because `widget.rows` is a
+    // live stream — a session can gain its first child well after the list
+    // first rendered, and that parent needs to start collapsed too. Gating on
+    // `_seenParents.add` (true only the first time an id is added) is what
+    // keeps this from re-collapsing a thread the user already opened; a plain
+    // "is this id absent from _collapsedSubthreads" check would re-fold it on
+    // every rebuild instead of just the first.
+    for (final row in allRows) {
+      final parent = row.parentSessionId;
+      if (parent != null && _seenParents.add(parent)) {
+        _collapsedSubthreads.add(parent);
+      }
+    }
     final online = widget.online;
+    final justFinished = ref.watch(attentionSessionIdsProvider);
     final localPinned =
         ref.watch(pinnedSessionsProvider).valueOrNull ?? const <String>{};
     final pinned = {
       ...localPinned,
       ...allRows.where((r) => r.starred).map((r) => r.sessionId),
     };
-    final archived =
-        ref.watch(archivedSessionsProvider).valueOrNull ?? const {};
+    final localArchived =
+        ref.watch(archivedSessionsProvider).valueOrNull ?? const <String>{};
+    final archived = {
+      ...localArchived,
+      ...allRows.where((r) => r.archived).map((r) => r.sessionId),
+    };
     final aliases = ref.watch(sessionAliasesProvider).valueOrNull ?? const {};
     final pinNotifier = ref.read(pinnedSessionsProvider.notifier);
     final archiveNotifier = ref.read(archivedSessionsProvider.notifier);
@@ -248,12 +298,28 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
     final needsIds = needsRows.map((r) => r.sessionId).toSet();
     final pinnedRows = _sorted(base.where((r) =>
         pinned.contains(r.sessionId) && !needsIds.contains(r.sessionId)));
-    final pinnedIds = pinnedRows.map((r) => r.sessionId).toSet();
+    // A featured (needs-approval/pinned) session is lifted out of its
+    // workspace group entirely — but its WHOLE subtree goes with it, not just
+    // its own row, so its children keep rendering nested under it (in the
+    // featured section below, via `flattenSubtree`) instead of losing their
+    // visible parent and appearing to hang off whatever unrelated session
+    // happens to render right before them in the workspace list.
+    final hiddenIds = <String>{
+      for (final r in [...needsRows, ...pinnedRows]) ...subtreeIds(base, r.sessionId),
+    };
     final grouped = _groupByWorkspace(
-        base.where((r) =>
-            !needsIds.contains(r.sessionId) &&
-            !pinnedIds.contains(r.sessionId)),
-        workspaceOrder);
+        base.where((r) => !hiddenIds.contains(r.sessionId)), workspaceOrder);
+
+    // "No project" is forced into the list even with zero live sessions in
+    // it, once its path has ever been seen — mirrors the desktop, which
+    // proactively resolves the scratch folder on launch and always keeps its
+    // group around (App.tsx's `groups.set(scratchCwd, [])`). Mobile only
+    // learns the path reactively (see scratchWorkspaceProvider), so until
+    // that happens the group still only appears the ordinary way.
+    final scratchPath = ref.watch(scratchWorkspaceProvider).valueOrNull;
+    if (scratchPath != null) {
+      grouped.putIfAbsent(workspaceDisplayName(scratchPath), () => <SessionRow>[]);
+    }
 
     // Commit newly discovered workspaces (to the front) and drop vanished ones
     // into the persisted order, after this frame settles. No-ops when unchanged,
@@ -264,29 +330,78 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
       ref.read(workspaceOrderProvider.notifier).reconcile(displayNames);
     });
 
-    Widget tile(SessionRow row, {bool highlight = false}) {
+    // Same reasoning as the sub-thread seeding above: `displayNames` is
+    // recomputed every build, so gating on `_seenWorkspaces.add` (rather than
+    // unconditionally adding to `_collapsed`) is what lets a section stay
+    // expanded once the user opens it instead of collapsing again next build.
+    for (final name in displayNames) {
+      if (_seenWorkspaces.add(name)) {
+        _collapsed.add(name);
+      }
+    }
+
+    Widget tile(SessionRow row, {bool highlight = false, SessionNode? node}) {
       final alias = aliases[row.sessionId];
       final display = (alias != null && alias.isNotEmpty)
           ? row.copyWith(title: alias)
           : row;
+      final depth = node?.depth ?? 0;
       return Padding(
-        padding: const EdgeInsets.only(bottom: 8),
+        // Indent per level, and a little less breathing room between a parent
+        // and the work hanging off it than between unrelated sessions.
+        padding: EdgeInsets.only(left: depth * 16.0, bottom: depth > 0 ? 6 : 8),
         child: _SwipeableTile(
           key: ValueKey(row.sessionId),
           pinned: pinned.contains(row.sessionId),
           archived: archived.contains(row.sessionId),
           onTogglePin: () => pinNotifier.setPinned(
               row.sessionId, !pinned.contains(row.sessionId)),
-          onToggleArchive: () => archiveNotifier.toggle(row.sessionId),
+          // Flip what the row SHOWS (local cache ∪ the relay's flag), not the
+          // local cache alone — see `ArchivedSessionsController.setArchived`.
+          onToggleArchive: () => archiveNotifier.setArchived(row.sessionId,
+              archived: !archived.contains(row.sessionId)),
           child: _SessionTile(
             row: display,
             enabled: online,
             pinned: pinned.contains(row.sessionId),
             highlight: highlight,
+            isSubthread: depth > 0,
+            subthreadCount: node?.childCount ?? 0,
+            runningSubthreads: node?.runningChildCount ?? 0,
+            subthreadsCollapsed: node?.collapsed ?? false,
+            onToggleSubthreads: (node?.hasChildren ?? false)
+                ? () => setState(() {
+                      if (!_collapsedSubthreads.remove(row.sessionId)) {
+                        _collapsedSubthreads.add(row.sessionId);
+                      }
+                    })
+                : null,
             onLongPress: () => _showSessionSheet(row),
+            justFinished: justFinished.contains(row.sessionId),
           ),
         ),
       );
+    }
+
+    // Shared across both featured sections below so a row that would
+    // otherwise appear in both (e.g. a needs-approval session nested under a
+    // pinned ancestor) renders exactly once, in whichever section reaches it
+    // first, instead of twice with two independent selection/collapse states.
+    final renderedFeatured = <String>{};
+    List<Widget> featuredSubtreeTiles(
+      List<SessionRow> roots, {
+      bool Function(SessionRow row)? highlightWhen,
+    }) {
+      final widgets = <Widget>[];
+      for (final root in roots) {
+        for (final node
+            in flattenSubtree(base, root, collapsed: _collapsedSubthreads)) {
+          if (!renderedFeatured.add(node.row.sessionId)) continue;
+          widgets.add(tile(node.row,
+              highlight: highlightWhen?.call(node.row) ?? false, node: node));
+        }
+      }
+      return widgets;
     }
 
     final anyResults =
@@ -336,14 +451,14 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
                   count: needsRows.length,
                   color: context.tokens.danger.text),
               const SizedBox(height: 8),
-              ...needsRows.map((r) => tile(r, highlight: true)),
+              ...featuredSubtreeTiles(needsRows, highlightWhen: _isNeedsApproval),
               const SizedBox(height: 6),
             ],
             if (pinnedRows.isNotEmpty) ...[
               const _SectionHeader(
                   icon: Icons.push_pin, label: 'Pinned', count: null),
               const SizedBox(height: 8),
-              ...pinnedRows.map((r) => tile(r)),
+              ...featuredSubtreeTiles(pinnedRows),
               const SizedBox(height: 6),
             ],
             if (grouped.isNotEmpty)
@@ -373,6 +488,47 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
                               _collapsed.add(entry.key);
                             }
                           }),
+                          onNewSession: () => showNewSessionSheet(
+                            context,
+                            ref,
+                            workspacePath: entry.value.isEmpty
+                                ? scratchPath
+                                : entry.value.first.cwd,
+                          ),
+                          // A board is keyed by the workspace PATH, and a row
+                          // whose cwd hasn't been decrypted yet has none — so
+                          // the button only appears once some row in the group
+                          // can say where the folder is.
+                          onOpenBacklog: _workspacePath(entry.value) == null
+                              ? null
+                              : () => Navigator.of(context).push(
+                                    MaterialPageRoute<void>(
+                                      builder: (_) => BacklogScreen(
+                                        cwd: _workspacePath(entry.value)!,
+                                        workspaceName: entry.key,
+                                      ),
+                                    ),
+                                  ),
+                          onOpenSchedule: _workspacePath(entry.value) == null
+                              ? null
+                              : () => Navigator.of(context).push(
+                                    MaterialPageRoute<void>(
+                                      builder: (_) => ScheduledTasksScreen(
+                                        cwd: _workspacePath(entry.value)!,
+                                        workspaceName: entry.key,
+                                      ),
+                                    ),
+                                  ),
+                          onOpenGitStatus: _workspacePath(entry.value) == null
+                              ? null
+                              : () => Navigator.of(context).push(
+                                    MaterialPageRoute<void>(
+                                      builder: (_) => GitStatusScreen(
+                                        cwd: _workspacePath(entry.value)!,
+                                        workspaceName: entry.key,
+                                      ),
+                                    ),
+                                  ),
                         ),
                         const SizedBox(height: 8),
                         // While searching/filtering, keep groups expanded so
@@ -405,14 +561,32 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
     );
   }
 
+  /// The folder a workspace group points at. Sessions in one group share it,
+  /// but an individual row may not have decrypted its cwd yet.
+  static String? _workspacePath(List<SessionRow> rows) {
+    for (final row in rows) {
+      final cwd = row.cwd?.trim();
+      if (cwd != null && cwd.isNotEmpty) return cwd;
+    }
+    return null;
+  }
+
   /// Renders a workspace's session tiles, capped at [_initialVisibleSessions]
   /// with a "Show more"/"Show less" toggle — same paging as the desktop.
+  ///
+  /// [rows] already excludes any session (and its whole subtree) featured in
+  /// the "Needs approval"/"Pinned" sections above — the caller filters those
+  /// out workspace-wide before grouping, so every row reaching this function
+  /// belongs in the tree here.
   List<Widget> _workspaceTiles(
     String workspace,
     List<SessionRow> rows,
-    Widget Function(SessionRow) tile,
+    Widget Function(SessionRow, {bool highlight, SessionNode? node}) tile,
   ) {
-    final total = rows.length;
+    // Paging counts top-level sessions: a parent brings its sub-threads with
+    // it, so "show 5 more" reveals five more pieces of work rather than five
+    // more rows that might all belong to one of them.
+    final total = subthreadRoots(rows).length;
     final stored = _visibleCounts[workspace] ?? _initialVisibleSessions;
     final visible = stored > total ? total : stored;
     final canShowMore = visible < total;
@@ -421,7 +595,8 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
         ? total - visible
         : _visibleSessionsStep;
     return [
-      ...rows.take(visible).map(tile),
+      ...layoutSubthreads(rows, collapsed: _collapsedSubthreads, maxRoots: visible)
+          .map((node) => tile(node.row, node: node)),
       if (total > _initialVisibleSessions)
         Padding(
           padding: const EdgeInsets.only(bottom: 8),
@@ -458,9 +633,9 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
     final localPinned =
         ref.read(pinnedSessionsProvider).valueOrNull ?? const <String>{};
     final pinned = row.starred || localPinned.contains(row.sessionId);
-    final archived =
-        (ref.read(archivedSessionsProvider).valueOrNull ?? const {})
-            .contains(row.sessionId);
+    final localArchived =
+        ref.read(archivedSessionsProvider).valueOrNull ?? const <String>{};
+    final archived = row.archived || localArchived.contains(row.sessionId);
     final alias = aliases[row.sessionId];
     final displayTitle = (alias != null && alias.isNotEmpty)
         ? alias
@@ -470,97 +645,116 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
+      isScrollControlled: true,
       builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 6),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  displayTitle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(ctx)
-                      .textTheme
-                      .titleSmall
-                      ?.copyWith(color: context.tokens.muted),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 6),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    displayTitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(ctx)
+                        .textTheme
+                        .titleSmall
+                        ?.copyWith(color: context.tokens.muted),
+                  ),
                 ),
               ),
-            ),
-            ListTile(
-              leading: const Icon(Icons.open_in_new),
-              title: const Text('Open'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _openSession(row);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.drive_file_rename_outline),
-              title: const Text('Rename'),
-              subtitle: alias != null && alias.isNotEmpty
-                  ? const Text('Reset to the original name')
-                  : null,
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _renameSession(row, alias);
-              },
-            ),
-            ListTile(
-              leading: Icon(pinned ? Icons.push_pin : Icons.push_pin_outlined),
-              title: Text(pinned ? 'Unpin' : 'Pin'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                ref
-                    .read(pinnedSessionsProvider.notifier)
-                    .setPinned(row.sessionId, !pinned);
-              },
-            ),
-            ListTile(
-              leading: Icon(row.subscribed
-                  ? Icons.notifications_off_outlined
-                  : Icons.notifications_active_outlined),
-              title: Text(row.subscribed
-                  ? 'Unsubscribe from notifications'
-                  : 'Subscribe to notifications'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _toggleSubscription(row);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.difference_outlined),
-              title: const Text('Changed files'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                showSessionFilesSheet(context, row);
-              },
-            ),
-            ListTile(
-              leading: Icon(
-                  archived ? Icons.unarchive_outlined : Icons.archive_outlined),
-              title: Text(archived ? 'Unarchive' : 'Archive'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                ref
-                    .read(archivedSessionsProvider.notifier)
-                    .toggle(row.sessionId);
-              },
-            ),
-            if (isActive)
               ListTile(
-                leading: Icon(Icons.stop_circle_outlined,
-                    color: context.tokens.danger.text),
-                title: Text('Stop session',
-                    style: TextStyle(color: context.tokens.danger.text)),
+                leading: const Icon(Icons.open_in_new),
+                title: const Text('Open'),
                 onTap: () {
                   Navigator.of(ctx).pop();
-                  _stopSession(row);
+                  _openSession(row);
                 },
               ),
-          ],
+              ListTile(
+                leading: const Icon(Icons.drive_file_rename_outline),
+                title: const Text('Rename'),
+                subtitle: alias != null && alias.isNotEmpty
+                    ? const Text('Reset to the original name')
+                    : null,
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  _renameSession(row, alias);
+                },
+              ),
+              ListTile(
+                leading:
+                    Icon(pinned ? Icons.push_pin : Icons.push_pin_outlined),
+                title: Text(pinned ? 'Unpin' : 'Pin'),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  ref
+                      .read(pinnedSessionsProvider.notifier)
+                      .setPinned(row.sessionId, !pinned);
+                },
+              ),
+              ListTile(
+                leading: Icon(row.subscribed
+                    ? Icons.notifications_off_outlined
+                    : Icons.notifications_active_outlined),
+                title: Text(row.subscribed
+                    ? 'Unsubscribe from notifications'
+                    : 'Subscribe to notifications'),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  _toggleSubscription(row);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.account_tree_outlined),
+                title: const Text('New sub-thread'),
+                subtitle: const Text('A session nested under this one'),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  showNewSessionSheet(
+                    context,
+                    ref,
+                    workspacePath: row.cwd,
+                    parentSessionId: row.sessionId,
+                  );
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.difference_outlined),
+                title: const Text('Changed files'),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  showSessionFilesSheet(context, row);
+                },
+              ),
+              ListTile(
+                leading: Icon(archived
+                    ? Icons.unarchive_outlined
+                    : Icons.archive_outlined),
+                title: Text(archived ? 'Unarchive' : 'Archive'),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  ref
+                      .read(archivedSessionsProvider.notifier)
+                      .setArchived(row.sessionId, archived: !archived);
+                },
+              ),
+              if (isActive)
+                ListTile(
+                  leading: Icon(Icons.stop_circle_outlined,
+                      color: context.tokens.danger.text),
+                  title: Text('Stop session',
+                      style: TextStyle(color: context.tokens.danger.text)),
+                  onTap: () {
+                    Navigator.of(ctx).pop();
+                    _stopSession(row);
+                  },
+                ),
+            ],
+          ),
         ),
       ),
     );
@@ -1171,6 +1365,10 @@ class _WorkspaceHeader extends StatelessWidget {
     required this.collapsed,
     required this.onTap,
     required this.dragIndex,
+    required this.onNewSession,
+    required this.onOpenBacklog,
+    required this.onOpenSchedule,
+    required this.onOpenGitStatus,
   });
 
   final String name;
@@ -1178,9 +1376,65 @@ class _WorkspaceHeader extends StatelessWidget {
   final bool collapsed;
   final VoidCallback onTap;
 
+  /// Starts a new session pre-scoped to this workspace, skipping the picker.
+  final VoidCallback onNewSession;
+
+  /// Opens this workspace's kanban board — the same board the desktop shows and
+  /// the agents in this folder write to. Offered from the actions sheet below.
+  final VoidCallback? onOpenBacklog;
+
+  /// Opens this workspace's scheduled tasks (view-only on the phone). Also
+  /// offered from the actions sheet.
+  final VoidCallback? onOpenSchedule;
+
+  /// Opens this workspace's git status (view-only on the phone). Also
+  /// offered from the actions sheet.
+  final VoidCallback? onOpenGitStatus;
+
   /// Index of this workspace within the reorderable list — drives the
   /// long-press drag handle so the order can be rearranged and persisted.
   final int dragIndex;
+
+  void _openActions(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (onOpenBacklog != null)
+              ListTile(
+                leading: const Icon(Icons.view_kanban_outlined),
+                title: const Text('Backlog'),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  onOpenBacklog!();
+                },
+              ),
+            if (onOpenSchedule != null)
+              ListTile(
+                leading: const Icon(Icons.schedule),
+                title: const Text('Scheduled tasks'),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  onOpenSchedule!();
+                },
+              ),
+            if (onOpenGitStatus != null)
+              ListTile(
+                leading: const Icon(Icons.call_split),
+                title: const Text('Git status'),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  onOpenGitStatus!();
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1221,16 +1475,35 @@ class _WorkspaceHeader extends StatelessWidget {
               Text('$count',
                   style: theme.textTheme.labelSmall
                       ?.copyWith(color: context.tokens.subtle)),
-              ReorderableDragStartListener(
+              IconButton(
+                onPressed: onNewSession,
+                tooltip: 'New session in $name',
+                icon: const Icon(Icons.add_circle_outline, size: 18),
+                color: context.tokens.subtle,
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              ),
+              // Delayed (not immediate) so a plain tap opens the actions sheet;
+              // holding it still starts the drag, same as the header itself.
+              ReorderableDelayedDragStartListener(
                 index: dragIndex,
-                // Transparent fill makes the whole padded box hit-testable, so
-                // the handle is a ~44x36 target instead of an 18px icon.
-                child: Container(
-                  color: Colors.transparent,
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-                  child: Icon(Icons.drag_handle,
-                      size: 18, color: context.tokens.subtle),
+                child: InkResponse(
+                  onTap: (onOpenBacklog == null &&
+                          onOpenSchedule == null &&
+                          onOpenGitStatus == null)
+                      ? null
+                      : () => _openActions(context),
+                  radius: 20,
+                  // Transparent fill makes the whole padded box hit-testable, so
+                  // the handle is a ~44x36 target instead of an 18px icon.
+                  child: Container(
+                    color: Colors.transparent,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 9),
+                    child: Icon(Icons.more_vert,
+                        size: 18, color: context.tokens.subtle),
+                  ),
                 ),
               ),
             ],
@@ -1251,6 +1524,12 @@ class _SessionTile extends StatelessWidget {
     required this.pinned,
     required this.onLongPress,
     this.highlight = false,
+    this.isSubthread = false,
+    this.subthreadCount = 0,
+    this.runningSubthreads = 0,
+    this.subthreadsCollapsed = false,
+    this.onToggleSubthreads,
+    this.justFinished = false,
   });
 
   final SessionRow row;
@@ -1259,12 +1538,28 @@ class _SessionTile extends StatelessWidget {
   final bool highlight;
   final VoidCallback onLongPress;
 
+  /// The agent's turn ended while this row was off screen — the desktop's
+  /// "just ended" sidebar dot, ported. Cleared the moment the session opens.
+  final bool justFinished;
+
+  /// Drawn as a nested row: it hangs under the session above it.
+  final bool isSubthread;
+
+  /// Direct sub-threads, and how many of those are mid-turn. Both are shown on
+  /// a COLLAPSED parent only — expanded, the rows themselves say it better.
+  final int subthreadCount;
+  final int runningSubthreads;
+  final bool subthreadsCollapsed;
+
+  /// Null when this session has no sub-threads, which is what hides the chevron.
+  final VoidCallback? onToggleSubthreads;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final state = row.runtime?.agentState ?? row.agentState;
+    final state = row.agentState;
 
-    return Card(
+    final card = Card(
       margin: EdgeInsets.zero,
       clipBehavior: Clip.antiAlias,
       shape: highlight
@@ -1285,6 +1580,30 @@ class _SessionTile extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
           child: Row(
             children: [
+              // The tap target for folding sub-threads away sits INSIDE the
+              // card, ahead of the badge: it has to be reachable without
+              // opening the session, and the card itself is the open gesture.
+              if (onToggleSubthreads != null)
+                GestureDetector(
+                  onTap: onToggleSubthreads,
+                  behavior: HitTestBehavior.opaque,
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: Icon(
+                      subthreadsCollapsed
+                          ? Icons.chevron_right
+                          : Icons.expand_more,
+                      size: 18,
+                      color: context.tokens.muted,
+                    ),
+                  ),
+                )
+              else if (isSubthread)
+                Padding(
+                  padding: const EdgeInsets.only(right: 4),
+                  child: Icon(Icons.subdirectory_arrow_right,
+                      size: 14, color: context.tokens.subtle),
+                ),
               // `enabled` is the desktop's reachability: a row still claiming
               // "working" while the Mac is gone is stale, not live.
               _AgentBadge(
@@ -1302,6 +1621,15 @@ class _SessionTile extends StatelessWidget {
                       ?.copyWith(fontWeight: FontWeight.w600),
                 ),
               ),
+              // Only while folded: expanded, the sub-thread rows say this
+              // themselves, and the badge would just be noise on every parent.
+              if (subthreadsCollapsed && subthreadCount > 0) ...[
+                const SizedBox(width: 6),
+                _SubthreadCount(
+                  count: subthreadCount,
+                  running: runningSubthreads,
+                ),
+              ],
               if (pinned) ...[
                 SizedBox(width: 6),
                 Icon(Icons.push_pin,
@@ -1316,6 +1644,68 @@ class _SessionTile extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+
+    if (!justFinished) return card;
+
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        card,
+        Positioned(
+          top: 6,
+          right: 6,
+          child: IgnorePointer(
+            child: Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: context.tokens.warn.text,
+                boxShadow: [
+                  BoxShadow(
+                    color: context.tokens.warn.wash,
+                    spreadRadius: 3,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// "3 sub-threads under here, 1 of them running" on a folded parent.
+class _SubthreadCount extends StatelessWidget {
+  const _SubthreadCount({required this.count, required this.running});
+
+  final int count;
+  final int running;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final busy = running > 0;
+    final color = busy ? theme.colorScheme.primary : context.tokens.muted;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withValues(alpha: busy ? 0.6 : 0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.account_tree_outlined, size: 11, color: color),
+          const SizedBox(width: 3),
+          Text(
+            busy ? '$count · $running running' : '$count',
+            style: theme.textTheme.labelSmall?.copyWith(color: color),
+          ),
+        ],
       ),
     );
   }

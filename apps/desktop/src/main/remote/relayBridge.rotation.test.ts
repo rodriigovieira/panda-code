@@ -1,0 +1,22 @@
+import { beforeEach, expect, it, vi } from "vitest";
+const secrets = vi.hoisted(() => new Map<string,string>());
+vi.mock("./keychain",()=>({readKeychainSecret:vi.fn(async (key:string)=>secrets.get(key)??null),writeKeychainSecret:vi.fn(async (key:string,value:string)=>{secrets.set(key,value);})}));
+import {createRelayBridge} from "./relayBridge";
+beforeEach(()=>secrets.clear());
+it("shares concurrent resets and keeps the same durable ID after a failed attempt",async()=>{
+ const bridge=createRelayBridge({url:"https://relay.test"} as Parameters<typeof createRelayBridge>[0]);
+ const state=bridge as unknown as {credentials:unknown;teardown:()=>void;start:()=>Promise<void>};
+ const credentials={deviceId:"device",token:"fixture",key:new Uint8Array(32)};
+ state.credentials=credentials;
+ state.teardown=vi.fn();
+ state.start=vi.fn(async()=>{throw new Error("offline");});
+ const first=bridge.revokePairedDevice("phone");
+ const second=bridge.revokePairedDevice("phone");
+ expect(second).toBe(first);
+ await expect(first).rejects.toThrow("offline");
+ const pending=[...secrets.entries()].find(([key])=>key.startsWith("rotation-pending."));
+ expect(pending).toBeDefined();
+ state.credentials=credentials;
+ await expect(bridge.revokePairedDevice("phone")).rejects.toThrow("offline");
+ expect([...secrets.entries()]).toEqual([pending]);
+});

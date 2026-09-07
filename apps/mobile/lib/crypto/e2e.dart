@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:crypto/crypto.dart' show Hmac, sha256;
 
 import 'package:pinenacl/x25519.dart' show SecretBox, EncryptedMessage;
 
@@ -15,8 +16,9 @@ import 'package:pinenacl/x25519.dart' show SecretBox, EncryptedMessage;
 /// reconciliation vector in docs/crypto-vectors.json.
 class E2ECodec {
   final SecretBox _box;
+  final Uint8List _key;
 
-  E2ECodec(Uint8List key) : _box = SecretBox(key);
+  E2ECodec(Uint8List key) : _box = SecretBox(key), _key = Uint8List.fromList(key);
 
   /// Build a codec from the base64 key carried in the pairing QR (`k`).
   factory E2ECodec.fromBase64Key(String base64Key) =>
@@ -29,6 +31,11 @@ class E2ECodec {
     final encrypted = _box.encrypt(plaintext, nonce: nonce);
     // `encrypted` is already nonce(24) || cipherText.
     return base64Encode(Uint8List.fromList(encrypted));
+  }
+
+  String sealCommand(Object? envelope, {Uint8List? nonce}) {
+    final key = Hmac(sha256, _key).convert(utf8.encode('panda-code/command/v2')).bytes;
+    return E2ECodec(Uint8List.fromList(key)).seal(envelope, nonce: nonce);
   }
 
   /// Decrypt a base64 envelope → decoded JSON value.

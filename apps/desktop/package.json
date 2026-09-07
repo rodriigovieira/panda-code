@@ -9,13 +9,17 @@
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "pnpm typecheck && electron-vite build",
-    "package:mac": "pnpm build && electron-builder --mac dir --arm64",
+    "build": "../../scripts/with-lock.sh sh -c \"pnpm typecheck && node scripts/build-dictation.mjs && electron-vite build\"",
+    "build:dictation": "node scripts/build-dictation.mjs",
+    "package:mac": "../../scripts/with-lock.sh sh -c \"pnpm build && electron-builder --mac dir --arm64\"",
+    "sync:mac": "scripts/install-local.sh",
     "postinstall": "node scripts/fix-node-pty.mjs",
     "preview": "electron-vite preview",
-    "test": "vitest run",
-    "probe:codex": "node --import ./scripts/ts-resolve.mjs scripts/codex-probe.ts",
-    "typecheck": "tsc --noEmit"
+    "test": "../../scripts/with-lock.sh vitest run",
+    "check:codex-protocol": "node scripts/check-codex-app-server.mjs",
+    "probe:codex": "node --experimental-strip-types --import ./scripts/ts-resolve.mjs scripts/codex-probe.ts",
+    "trace:dictation": "node scripts/dictation-trace.mjs",
+    "typecheck": "../../scripts/with-lock.sh tsc --noEmit"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",
@@ -36,7 +40,7 @@
     "@types/react": "^19.0.8",
     "@types/react-dom": "^19.0.3",
     "@vitejs/plugin-react": "^4.3.4",
-    "electron": "^34.0.2",
+    "electron": "^44.2.0",
     "electron-builder": "^25.1.8",
     "electron-vite": "^3.0.0",
     "typescript": "^5.7.3",
@@ -56,6 +60,23 @@
     "asarUnpack": [
       "**/node_modules/node-pty/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": ".",
+        "filter": [
+          "panda-dictation",
+          "dictation-vocabulary.json"
+        ]
+      },
+      {
+        "from": "resources/trim",
+        "to": "trim",
+        "filter": [
+          "*.mjs"
+        ]
+      }
+    ],
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon.icns",
@@ -63,7 +84,11 @@
         "dir"
       ],
       "artifactName": "${productName}-${version}-${arch}.${ext}",
-      "identity": null
+      "identity": null,
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Panda Code uses the microphone to dictate prompts into the composer.",
+        "NSSpeechRecognitionUsageDescription": "Panda Code transcribes your dictation on this Mac to type prompts for you."
+      }
     }
   }
 }

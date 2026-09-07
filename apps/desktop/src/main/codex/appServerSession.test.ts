@@ -34,7 +34,7 @@ class FakeProcess extends EventEmitter implements AppServerProcess {
   }
 }
 
-function makeManager() {
+function makeManager(overrides: { setTitle?: (id: string, title: string) => void } = {}) {
   const proc = new FakeProcess();
   const snapshots: Array<{ id: string; agentState: string; items: number }> = [];
   const manager = new CodexAppServerSessionManager({
@@ -50,6 +50,7 @@ function makeManager() {
     sendSnapshot: (id, session: CodexAppServerSession) => {
       snapshots.push({ id, agentState: session.state.agentState, items: session.state.items.length });
     },
+    ...overrides,
   });
   return { proc, manager, snapshots };
 }
@@ -65,7 +66,7 @@ const request: SessionStartRequest = {
 };
 
 function codexTextInput(text: string): Record<string, unknown> {
-  return { type: "text", text: codexPromptPayload(text), text_elements: [] };
+  return { type: "text", text: codexPromptPayload(text, request.id), text_elements: [] };
 }
 
 /** Drive the async start(): settle handshake, then thread/start, then turn/start. */
@@ -94,10 +95,31 @@ describe("CodexAppServerSessionManager", () => {
     const params = turnStart!.params as Record<string, unknown>;
     expect(params.threadId).toBe("th_1");
     expect(params.input).toEqual([codexTextInput("hello codex")]);
-    expect(JSON.stringify(params.input)).toContain("**TL;DR:**");
+    const promptText = ((params.input as Array<Record<string, unknown>>)[0]?.text as string) ?? "";
+    expect(promptText).toContain("**TL;DR:**");
+    expect(manager.get("sec_1")?.state.latestModel).toBe("gpt-5-codex");
+    // One app-server serves every Codex section, so the turn is the only place
+    // the section's own id can reach its shell. Without it `panda-peers` calls
+    // land anonymously: siblings instead of sub-threads, and no inherited
+    // permission mode.
+    expect(promptText).toContain("--self sec_1");
+    expect(promptText).toContain('title "<title>"');
+    expect(promptText).toContain("at most 80 characters");
 
     expect(manager.get("sec_1")?.threadId).toBe("th_1");
     expect(manager.get("sec_1")?.state.latestModel).toBe("gpt-5-codex");
+  });
+
+  // A launch carries a prompt, but the handshake and thread/start take seconds.
+  // A "waiting" registration snapshot reported the section idle before its first
+  // turn was even sent — spinner off, and a "ready" notification for nothing.
+  it("registers a launching section as working, not idle", async () => {
+    const { proc, manager, snapshots } = makeManager();
+    const startPromise = manager.start(request, "hello codex");
+
+    expect(snapshots[0]).toMatchObject({ id: "sec_1", agentState: "working" });
+
+    await settleStart(proc, startPromise);
   });
 
   it("folds streamed notifications into the section's state", async () => {
@@ -154,6 +176,7 @@ describe("CodexAppServerSessionManager", () => {
 
     const resume = proc.sent().find((m) => m.method === "thread/resume");
     expect((resume!.params as Record<string, unknown>).threadId).toBe("th_existing");
+    expect((resume!.params as Record<string, unknown>).excludeTurns).toBe(true);
     expect(proc.sent().some((m) => m.method === "turn/start")).toBe(false); // no prompt → no turn
     expect(manager.get("sec_1")?.threadId).toBe("th_existing");
   });
@@ -360,14 +383,51 @@ describe("CodexAppServerSessionManager", () => {
     expect(proc.killed).toBe(true); // last session gone → client disposed
   });
 
+  it("unsubscribes a stopped thread while the shared app-server remains alive", async () => {
+    const { proc, manager } = makeManager();
+    const first = manager.start(request, "hi");
+    await settleStart(proc, first, "th_1", "t1");
+    proc.push({ method: "turn/completed", params: { threadId: "th_1", turn: { id: "t1", status: "completed" } } });
+
+    const secondRequest = { ...request, id: "sec_2" };
+    const second = manager.start(secondRequest);
+    await vi.waitFor(() => expect(proc.sent().filter((message) => message.method === "thread/start")).toHaveLength(2));
+    proc.reply("thread/start", { thread: { id: "th_2" } });
+    await second;
+
+    manager.stop("sec_1");
+    const unsubscribe = proc.sent().find((message) => message.method === "thread/unsubscribe");
+    expect(unsubscribe?.params).toEqual({ threadId: "th_1" });
+    expect(proc.killed).toBe(false);
+    proc.reply("thread/unsubscribe", {});
+    manager.stop("sec_2");
+  });
+
+  it("locks semantic and native Codex titles against prompt fallback sync", async () => {
+    const setTitle = vi.fn();
+    const { proc, manager } = makeManager({ setTitle });
+    const startPromise = manager.start(request, "raw prompt");
+    await settleStart(proc, startPromise);
+
+    expect(manager.lockTitle("sec_1", "Semantic title")).toBe(true);
+    expect(manager.get("sec_1")).toMatchObject({ emittedTitle: "Semantic title", titleLocked: true });
+
+    proc.push({
+      method: "thread/name/updated",
+      params: { threadId: "th_1", threadName: "Native Codex title" },
+    });
+    expect(setTitle).toHaveBeenCalledWith("sec_1", "Native Codex title");
+    expect(manager.get("sec_1")).toMatchObject({ emittedTitle: "Native Codex title", titleLocked: true });
+  });
+
   it("declines server requests it cannot represent so a turn cannot hang", async () => {
     const { proc, manager } = makeManager();
     const startPromise = manager.start(request, "hi");
     await settleStart(proc, startPromise);
 
-    // Permission profiles / MCP elicitation have no UI yet. Refusing keeps the
-    // turn moving, and the transcript says why.
-    proc.push({ id: 99, method: "mcpServer/elicitation/request", params: { threadId: "th_1" } });
+    // Panda does not advertise client-owned dynamic tools. If a server sends
+    // one anyway, refusing keeps the turn moving instead of hanging forever.
+    proc.push({ id: 99, method: "item/tool/call", params: { threadId: "th_1" } });
     expect(proc.sent().find((m) => m.id === 99 && "error" in m)).toBeDefined();
     expect(manager.get("sec_1")!.state.items.some((item) => item.title?.includes("can't answer"))).toBe(true);
   });
@@ -411,6 +471,28 @@ describe("CodexAppServerSessionManager", () => {
       const session = manager.get("sec_1")!;
       expect(session.state.pendingApproval).toBeUndefined();
       expect(session.state.agentState).toBe("working");
+    });
+
+    it("renders managed-network command approvals with the destination", async () => {
+      const { proc, manager } = makeManager();
+      const startPromise = manager.start(request, "fetch it");
+      await settleStart(proc, startPromise);
+      proc.push({
+        id: 78,
+        method: "item/commandExecution/requestApproval",
+        params: {
+          threadId: "th_1",
+          turnId: "t1",
+          itemId: "i1",
+          reason: "download a dependency",
+          networkApprovalContext: { host: "registry.npmjs.org", protocol: "https" },
+        },
+      });
+
+      expect(manager.get("sec_1")!.state.pendingApproval).toMatchObject({
+        title: "Allow network access?",
+        body: "https registry.npmjs.org",
+      });
     });
 
     it("rejects an answer for a prompt that is no longer pending", async () => {
@@ -496,6 +578,95 @@ describe("CodexAppServerSessionManager", () => {
         result: { answers: { db: { answers: ["SQLite"] }, name: { answers: ["panda-api"] } } },
       });
       expect(manager.get("sec_1")!.state.pendingApproval).toBeUndefined();
+    });
+
+    it("grants only the requested permission subset with the selected scope", async () => {
+      const { proc, manager } = makeManager();
+      const startPromise = manager.start(request, "inspect outside the workspace");
+      await settleStart(proc, startPromise);
+      const requested = {
+        network: { enabled: true },
+        fileSystem: { read: ["/Users/example/shared"], write: null },
+      };
+      proc.push({
+        id: 90,
+        method: "item/permissions/requestApproval",
+        params: { threadId: "th_1", turnId: "t1", itemId: "i3", cwd: "/repo", reason: "inspect shared input", permissions: requested },
+      });
+
+      const prompt = manager.get("sec_1")!.state.pendingApproval!;
+      expect(prompt).toMatchObject({ kind: "permissions", title: "Grant additional permissions?", cwd: "/repo" });
+      expect(prompt.body).toContain("Network access");
+      expect(prompt.body).toContain("/Users/example/shared");
+      expect(manager.answerApproval({ id: "sec_1", promptId: prompt.promptId, optionId: "acceptForSession" })).toEqual({ ok: true });
+      expect(proc.sent().find((message) => message.id === 90)).toMatchObject({
+        result: { permissions: requested, scope: "session" },
+      });
+    });
+
+    it("collects and types MCP form elicitation fields before replying once", async () => {
+      const { proc, manager } = makeManager();
+      const startPromise = manager.start(request, "configure the connector");
+      await settleStart(proc, startPromise);
+      proc.push({
+        id: 91,
+        method: "mcpServer/elicitation/request",
+        params: {
+          threadId: "th_1",
+          turnId: "t1",
+          serverName: "Example MCP",
+          mode: "form",
+          message: "Connector settings",
+          requestedSchema: {
+            type: "object",
+            required: ["region", "retries"],
+            properties: {
+              region: { type: "string", title: "Region", enum: ["us-east", "eu-west"] },
+              retries: { type: "integer", title: "Retries", description: "How many retries?" },
+            },
+          },
+        },
+      });
+
+      const first = manager.get("sec_1")!.state.pendingApproval!;
+      expect(first).toMatchObject({ kind: "mcpElicitation", title: "Region", questionCount: 2, questionIndex: 0 });
+      expect(first.options.map((option) => option.label)).toEqual(["us-east", "eu-west", "Decline"]);
+      expect(manager.answerApproval({ id: "sec_1", promptId: first.promptId, optionId: "option:1" })).toEqual({ ok: true });
+      expect(proc.sent().some((message) => message.id === 91)).toBe(false);
+
+      const second = manager.get("sec_1")!.state.pendingApproval!;
+      expect(second).toMatchObject({ title: "Retries", allowsFreeText: true, questionIndex: 1 });
+      expect(manager.answerApproval({ id: "sec_1", promptId: second.promptId, text: "3" })).toEqual({ ok: true });
+      expect(proc.sent().find((message) => message.id === 91)).toMatchObject({
+        result: { action: "accept", content: { region: "eu-west", retries: 3 }, _meta: null },
+      });
+    });
+
+    it("lets the operator decline an MCP URL elicitation", async () => {
+      const { proc, manager } = makeManager();
+      const startPromise = manager.start(request, "connect my account");
+      await settleStart(proc, startPromise);
+      proc.push({
+        id: 92,
+        method: "mcpServer/elicitation/request",
+        params: {
+          threadId: "th_1",
+          turnId: "t1",
+          serverName: "Example MCP",
+          mode: "url",
+          message: "Authorize access, then continue.",
+          url: "https://example.com/authorize",
+          elicitationId: "el_1",
+        },
+      });
+
+      const prompt = manager.get("sec_1")!.state.pendingApproval!;
+      expect(prompt).toMatchObject({ kind: "mcpElicitation" });
+      expect(prompt.body).toContain("https://example.com/authorize");
+      expect(manager.answerApproval({ id: "sec_1", promptId: prompt.promptId, optionId: "decline" })).toEqual({ ok: true });
+      expect(proc.sent().find((message) => message.id === 92)).toMatchObject({
+        result: { action: "decline", content: null, _meta: null },
+      });
     });
   });
 });

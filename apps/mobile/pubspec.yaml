@@ -2,12 +2,13 @@ name: panda_code_mobile
 description: Panda Code mobile companion — pair, trigger, and watch Claude Code sessions on your Mac.
 publish_to: 'none'
 
-version: 1.5.0+202608010027
+version: 1.19.18+202609070506
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
 
 dependencies:
+  crypto: ^3.0.6
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.2
@@ -59,6 +60,10 @@ dependencies:
   # past that and the send fails. We downscale + JPEG-compress before sending
   # (see image_prep.dart). Pure Dart so no extra iOS/Android native config.
   image: ^4.3.0
+  # Playback for fetched `browser_record` captures (see remote_media_store.dart).
+  video_player: ^2.9.2
+  # Opens http(s) links tapped in rendered agent output in the system browser.
+  url_launcher: ^6.3.1
 
 dev_dependencies:
   flutter_test:
@@ -77,6 +82,10 @@ flutter:
   uses-material-design: true
   assets:
     - assets/app-icon.png
+    # Dictation bias vocabulary, mined locally from this machine's Claude Code
+    # transcripts by scripts/mine_dictation_vocabulary.py. Personal, so it is
+    # gitignored — the app degrades to plain dictation when it is absent.
+    - assets/
 
 # App launcher icon. Both PNGs come from `node scripts/icon/render.mjs` at the
 # repo root, which rasterises the one artwork source (scripts/icon/panda-mark.mjs).

@@ -69,7 +69,7 @@ class _SessionInfoSheetState extends ConsumerState<_SessionInfoSheet> {
     final row = widget.row;
     final theme = Theme.of(context);
     final runtime = row.runtime;
-    final state = runtime?.agentState ?? row.agentState;
+    final state = row.agentState;
     final usage = runtime?.tokenUsage;
 
     return SafeArea(
@@ -80,10 +80,24 @@ class _SessionInfoSheetState extends ConsumerState<_SessionInfoSheet> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                row.title ?? 'Session',
-                style: theme.textTheme.titleLarge
-                    ?.copyWith(fontWeight: FontWeight.w700),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Text(
+                      row.title ?? 'Session',
+                      style: theme.textTheme.titleLarge
+                          ?.copyWith(fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: Icon(Icons.close, color: context.tokens.subtle),
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                ],
               ),
               const SizedBox(height: 16),
               _Section(title: 'Status', children: [

@@ -1,7 +1,8 @@
-import { mutation, query } from "./_generated/server";
+import { internalMutation, mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { hashToken, requireDevice, verifyToken } from "./lib/auth";
 import { deletePayload } from "./lib/commandPayloads";
+import { deleteResult } from "./lib/commandResults";
 
 const PAIRING_TTL_MS = 5 * 60_000;
 
@@ -17,6 +18,24 @@ const PAIRING_TTL_MS = 5 * 60_000;
  * These handlers deliberately do NOT touch the E2E key. The relay stays blind.
  */
 
+/** Run only from the owner's Convex CLI/dashboard, using the fingerprint shown
+ * by THEIR desktop. Never approve an enrollment supplied by an unknown client. */
+export const authorizeDevice = internalMutation({
+  args: { deviceId: v.string(), tokenFingerprint: v.string() },
+  handler: async (ctx, { deviceId, tokenFingerprint }) => {
+    if (!/^[a-zA-Z0-9-]{1,128}$/.test(deviceId) || !/^[a-f0-9]{64}$/.test(tokenFingerprint)) throw new Error("INVALID_ENROLLMENT");
+    const old = await ctx.db.query("deviceEnrollments").withIndex("by_device", q => q.eq("deviceId", deviceId)).unique();
+    if (old) await ctx.db.delete(old._id);
+    await ctx.db.insert("deviceEnrollments", { deviceId, tokenFingerprint, expiresAt: Date.now() + 15 * 60_000 });
+    return { authorized: true, deviceId, expiresInMinutes: 15 };
+  },
+});
+
+async function tokenFingerprint(token: string): Promise<string> {
+  const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)));
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 /** Desktop self-registers. Returns the raw token ONCE (store it in Keychain). */
 export const registerDevice = mutation({
   args: { deviceId: v.string(), name: v.string(), platform: v.string(), token: v.string() },
@@ -29,6 +48,7 @@ export const registerDevice = mutation({
       if (!(await verifyToken(token, existing.tokenHash))) {
         throw new Error("DEVICE_AUTH_FAILED");
       }
+      if (existing.resettingPairing) throw new Error("PAIRING_RESET_IN_PROGRESS");
       await ctx.db.patch(existing._id, {
         name,
         platform,
@@ -36,6 +56,13 @@ export const registerDevice = mutation({
         tokenHash: await hashToken(token),
       });
     } else {
+      if (!/^[a-zA-Z0-9-]{1,128}$/.test(deviceId) || token.length < 32 || token.length > 256 || name.length > 200 || platform.length > 30) throw new Error("INVALID_DEVICE");
+      const fingerprint = await tokenFingerprint(token);
+      const enrollment = await ctx.db.query("deviceEnrollments").withIndex("by_device", q => q.eq("deviceId", deviceId)).unique();
+      if (!enrollment || enrollment.expiresAt < Date.now() || enrollment.tokenFingerprint !== fingerprint) {
+        throw new Error(`Owner enrollment required. On your relay, run: npx convex run pairing:authorizeDevice '${JSON.stringify({ deviceId, tokenFingerprint: fingerprint })}'`);
+      }
+      await ctx.db.delete(enrollment._id);
       const tokenHash = await hashToken(token);
       await ctx.db.insert("devices", {
         deviceId,
@@ -81,6 +108,13 @@ export const claimCode = mutation({
       await ctx.db.patch(pairing._id, { status: "expired" });
       throw new Error("PAIRING_EXPIRED");
     }
+    const device = await ctx.db.query("devices").withIndex("by_device", q => q.eq("deviceId", pairing.deviceId)).unique();
+    if (!device || device.resettingPairing) throw new Error("PAIRING_RESET_IN_PROGRESS");
+    const clients = await ctx.db.query("mobileClients").withIndex("by_device", q => q.eq("deviceId", pairing.deviceId)).take(100);
+    if (clients.length >= 100) throw new Error("PAIRED_DEVICE_LIMIT");
+    if (mobileId.length > 128 || token.length < 32 || token.length > 256 || (name?.length ?? 0) > 200) throw new Error("INVALID_MOBILE");
+    const existing = await ctx.db.query("mobileClients").withIndex("by_mobile", q => q.eq("mobileId", mobileId)).first();
+    if (existing) throw new Error("MOBILE_ALREADY_EXISTS");
     await ctx.db.patch(pairing._id, { status: "claimed", claimedByMobileId: mobileId });
     await ctx.db.insert("mobileClients", {
       mobileId,
@@ -107,57 +141,117 @@ export const listMobileClients = query({
         mobileId: client.mobileId,
         name: client.name,
         createdAt: client.createdAt,
+        notificationsEnabled: client.notifMuted !== true,
       }))
       .sort((a, b) => b.createdAt - a.createdAt);
   },
 });
 
-/** Desktop revokes one paired phone and removes its routing-only metadata. */
-export const revokeMobileClient = mutation({
-  args: { deviceId: v.string(), token: v.string(), mobileId: v.string() },
-  handler: async (ctx, { deviceId, token, mobileId }) => {
+/** Desktop: mute or unmute push delivery on every phone paired to this Mac. */
+export const setMobileNotifications = mutation({
+  args: { deviceId: v.string(), token: v.string(), enabled: v.boolean() },
+  handler: async (ctx, { deviceId, token, enabled }) => {
     await requireDevice(ctx, deviceId, token);
-    const mobile = await ctx.db
-      .query("mobileClients")
-      .withIndex("by_mobile", (q) => q.eq("mobileId", mobileId))
-      .unique();
-    if (!mobile || mobile.deviceId !== deviceId) throw new Error("MOBILE_NOT_FOUND");
-
-    const pushTokens = await ctx.db
-      .query("pushTokens")
-      .withIndex("by_mobile", (q) => q.eq("mobileId", mobileId))
-      .collect();
-    const subscriptions = await ctx.db
-      .query("sessionSubs")
-      .withIndex("by_mobile", (q) => q.eq("mobileId", mobileId))
-      .collect();
-    const commands = await ctx.db
-      .query("commands")
-      .withIndex("by_mobile", (q) => q.eq("mobileId", mobileId))
-      .collect();
-
-    for (const row of pushTokens) await ctx.db.delete(row._id);
-    for (const row of subscriptions) await ctx.db.delete(row._id);
-    for (const row of commands) {
-      if (row.status === "pending" || row.status === "claimed") {
-        await ctx.db.patch(row._id, { status: "error" });
-      }
-      // A revoked phone's requests will never be executed; drop the payloads with
-      // it rather than leaving orphans for the prune sweep to find.
-      await deletePayload(ctx, row._id);
-    }
-    await ctx.db.delete(mobile._id);
-
-    const remaining = await ctx.db
+    const clients = await ctx.db
       .query("mobileClients")
       .withIndex("by_device", (q) => q.eq("deviceId", deviceId))
       .collect();
-    return remaining
+    await Promise.all(clients.map((client) => ctx.db.patch(client._id, { notifMuted: !enabled })));
+    return clients
       .map((client) => ({
         mobileId: client.mobileId,
         name: client.name,
         createdAt: client.createdAt,
+        notificationsEnabled: enabled,
       }))
       .sort((a, b) => b.createdAt - a.createdAt);
+  },
+});
+
+/** Old desktops cannot revoke safely without rotating their shared key. */
+export const revokeMobileClient = mutation({
+  args: { deviceId: v.string(), token: v.string(), mobileId: v.string() },
+  handler: async (ctx, { deviceId, token }) => {
+    await requireDevice(ctx, deviceId, token);
+    throw new Error("Update Panda Code on your Mac to revoke phones and rotate the encryption key.");
+  },
+});
+
+/** Idempotent, bounded reset. Desktop persists a new key BEFORE starting this.
+ * All phone reads/writes fail closed until the old relay mirror is gone.
+ * Local desktop transcripts are never deleted. */
+export const resetPairing = mutation({
+  args: { deviceId: v.string(), token: v.string(), resetId: v.string() },
+  handler: async (ctx, { deviceId, token, resetId }) => {
+    const device = await requireDevice(ctx, deviceId, token, true);
+    if (!/^[a-f0-9-]{36}$/i.test(resetId)) throw new Error("INVALID_RESET_ID");
+    if (device.completedResetId === resetId) return { complete: true };
+    if (device.resettingPairing && device.pairingResetId !== resetId) throw new Error("PAIRING_RESET_IN_PROGRESS");
+    await ctx.db.patch(device._id, { resettingPairing: true, pairingResetId: resetId });
+    const phones = await ctx.db.query("mobileClients").withIndex("by_device", q => q.eq("deviceId", deviceId)).take(10);
+    for (const phone of phones) {
+      const tokens = await ctx.db.query("pushTokens").withIndex("by_mobile", q => q.eq("mobileId", phone.mobileId)).take(100);
+      for (const row of tokens) await ctx.db.delete(row._id);
+      if (tokens.length === 100) return { complete: false };
+      await ctx.db.delete(phone._id);
+    }
+    if (phones.length) return { complete: false };
+    const commands = await ctx.db.query("commands").withIndex("by_device_status", q => q.eq("deviceId", deviceId)).take(5);
+    for (const row of commands) {
+      await deletePayload(ctx, row._id);
+      await deleteResult(ctx, row._id);
+      await ctx.db.delete(row._id);
+    }
+    if (commands.length) return { complete: false };
+    const blobs = await ctx.db.query("mediaBlobs").withIndex("by_device", q => q.eq("deviceId", deviceId)).take(50);
+    for (const blob of blobs) { await ctx.storage.delete(blob.storageId); await ctx.db.delete(blob._id); }
+    if (blobs.length) return { complete: false };
+    {
+      const rows = await ctx.db.query("pairings").withIndex("by_device", q => q.eq("deviceId", deviceId)).take(50);
+      for (const row of rows) await ctx.db.delete(row._id);
+      if (rows.length) return { complete: false };
+    }
+    {
+      const rows = await ctx.db.query("events").withIndex("by_device_session_seq", q => q.eq("deviceId", deviceId)).take(50);
+      for (const row of rows) await ctx.db.delete(row._id);
+      if (rows.length) return { complete: false };
+    }
+    {
+      const rows = await ctx.db.query("sessions").withIndex("by_device", q => q.eq("deviceId", deviceId)).take(50);
+      for (const row of rows) await ctx.db.delete(row._id);
+      if (rows.length) return { complete: false };
+    }
+    {
+      const rows = await ctx.db.query("sessionRuntime").withIndex("by_device_session", q => q.eq("deviceId", deviceId)).take(50);
+      for (const row of rows) await ctx.db.delete(row._id);
+      if (rows.length) return { complete: false };
+    }
+    {
+      const rows = await ctx.db.query("deviceUsage").withIndex("by_device", q => q.eq("deviceId", deviceId)).take(50);
+      for (const row of rows) await ctx.db.delete(row._id);
+      if (rows.length) return { complete: false };
+    }
+    {
+      const rows = await ctx.db.query("sessionStars").withIndex("by_device", q => q.eq("deviceId", deviceId)).take(50);
+      for (const row of rows) await ctx.db.delete(row._id);
+      if (rows.length) return { complete: false };
+    }
+    {
+      const rows = await ctx.db.query("sessionArchive").withIndex("by_device", q => q.eq("deviceId", deviceId)).take(50);
+      for (const row of rows) await ctx.db.delete(row._id);
+      if (rows.length) return { complete: false };
+    }
+    {
+      const rows = await ctx.db.query("sessionSubs").withIndex("by_device_session", q => q.eq("deviceId", deviceId)).take(50);
+      for (const row of rows) await ctx.db.delete(row._id);
+      if (rows.length) return { complete: false };
+    }
+    {
+      const rows = await ctx.db.query("deviceWriteBudget").withIndex("by_device", q => q.eq("deviceId", deviceId)).take(50);
+      for (const row of rows) await ctx.db.delete(row._id);
+      if (rows.length) return { complete: false };
+    }
+    await ctx.db.patch(device._id, { resettingPairing: false, pairingResetId: undefined, completedResetId: resetId });
+    return { complete: true };
   },
 });

@@ -12,22 +12,14 @@ pnpm install
 pnpm --dir apps/desktop dev
 ```
 
-The relay is opt-in. Point `PANDA_CODE_RELAY_URL` at a Convex deployment you own
-(see [docs/self-hosting.md](../../docs/self-hosting.md)) to enable phone pairing:
+The relay is opt-in. To enable phone pairing, open Settings -> Phone and paste
+the Convex deployment URL for a relay you own (see
+[docs/self-hosting.md](../../docs/self-hosting.md)):
 
-```sh
-PANDA_CODE_RELAY_URL=https://your-deployment.convex.cloud pnpm --dir apps/desktop dev
-```
-
-The URL is baked in at build time — a Finder-launched app does not inherit your
-shell environment — so set it for `package:mac` too. With it unset, the relay
-bridge never starts and the pairing panel reports that pairing is off.
-
-```sh
-PANDA_CODE_RELAY_URL=https://your-deployment.convex.cloud pnpm --dir apps/desktop package:mac
-```
-
-Open Settings → Phone pairing to scan or refresh the five-minute pairing QR.
+You can still set `PANDA_CODE_RELAY_URL` before `dev` or `package:mac` to seed
+that field on first run. After launch, the saved Settings value wins, including
+when it is empty. Open Settings -> Phone to scan or refresh the five-minute
+pairing QR.
 Device credentials and the 32-byte E2E key are stored as generic passwords in
 macOS Keychain.
 

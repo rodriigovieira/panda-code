@@ -9,7 +9,15 @@ release/
 # Desktop build artifacts. A stray bundle also lands at the repo root when the
 # main-process build runs from here rather than apps/desktop.
 apps/desktop/index.js
+apps/desktop/peers-entry.js
 /index.js
+
+# Compiled dictation helper and the vocabulary staged next to it. Both are built
+# from tracked sources by scripts/build-dictation.mjs; the vocabulary in
+# particular is mined from this machine's own transcripts and must not be
+# committed.
+apps/desktop/resources/panda-dictation
+apps/desktop/resources/dictation-vocabulary.json
 
 # Convex
 convex-relay/.env.local

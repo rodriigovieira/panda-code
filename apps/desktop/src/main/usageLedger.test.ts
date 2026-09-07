@@ -81,6 +81,59 @@ describe("createUsageLedger", () => {
     expect(report.cost.totalUsd).toBeCloseTo(10 + 1);
   });
 
+  it("does not let independent runtime counters reset each other", () => {
+    const at = new Date("2026-07-20T10:15:00.000Z");
+    const ledger = createUsageLedger({ filePath: ledgerPath(), now: () => at });
+
+    ledger.record({
+      sessionId: "s1",
+      runtime: "claude",
+      counterId: "claude-thread",
+      model: "claude-opus-5",
+      cumulative: tokens({ inputTokens: 1_000_000 }),
+    });
+    ledger.record({
+      sessionId: "s1",
+      runtime: "codex",
+      counterId: "codex-thread",
+      model: "gpt-5-codex",
+      cumulative: tokens({ inputTokens: 100_000 }),
+    });
+    ledger.record({
+      sessionId: "s1",
+      runtime: "claude",
+      counterId: "claude-thread",
+      model: "claude-opus-5",
+      cumulative: tokens({ inputTokens: 1_200_000 }),
+    });
+
+    expect(ledger.query({ sessionId: "s1" }).tokens.inputTokens).toBe(1_300_000);
+  });
+
+  it("seeds resumed counters without charging historical usage", () => {
+    const at = new Date("2026-07-20T10:15:00.000Z");
+    const ledger = createUsageLedger({ filePath: ledgerPath(), now: () => at });
+
+    ledger.seed({
+      sessionId: "s1",
+      runtime: "codex",
+      counterId: "codex-thread",
+      cumulative: tokens({ inputTokens: 5_000_000, cacheReadInputTokens: 4_000_000 }),
+    });
+    ledger.record({
+      sessionId: "s1",
+      runtime: "codex",
+      counterId: "codex-thread",
+      model: "gpt-5-codex",
+      cumulative: tokens({ inputTokens: 5_250_000, cacheReadInputTokens: 4_100_000 }),
+    });
+
+    const report = ledger.query({ sessionId: "s1" });
+    expect(report.tokens.inputTokens).toBe(250_000);
+    expect(report.tokens.cacheReadInputTokens).toBe(100_000);
+    expect(report.tokens.totalTokens).toBe(350_000);
+  });
+
   it("filters by section and by date range", () => {
     const path = ledgerPath();
     let clock = new Date("2026-07-01T08:00:00.000Z");
@@ -134,6 +187,6 @@ describe("createUsageLedger", () => {
     };
     expect(stored.entries).toHaveLength(1);
     expect(stored.entries[0]?.at).toBe("2026-07-20T10:00:00.000Z");
-    expect(stored.watermarks.s1?.inputTokens).toBe(42);
+    expect(Object.values(stored.watermarks).at(0)?.inputTokens).toBe(42);
   });
 });

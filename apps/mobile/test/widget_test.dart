@@ -156,6 +156,39 @@ void main() {
     expect(workspaces.map((w) => w.name), ['a', 'b']);
   });
 
+  test('workspaceOptionsFromSessions always includes the no-project folder',
+      () {
+    final workspaces = workspaceOptionsFromSessions(
+      const <SessionRow>[],
+      scratchWorkspacePath: '/Users/me/.panda-code/scratch',
+    );
+
+    expect(workspaces.map((w) => w.path), ['/Users/me/.panda-code/scratch']);
+    expect(workspaces.single.name, 'No project');
+  });
+
+  test('workspaceOptionsFromSessions does not duplicate a live no-project row',
+      () {
+    final row = SessionRow(
+      sessionId: 'scratch-session',
+      title: null,
+      cwd: '/Users/me/.panda-code/scratch',
+      status: SessionStatus.running,
+      agentState: AgentState.waiting,
+      executionMode: 'stream-json',
+      headSeq: 0,
+      updatedAt: 10,
+      runtime: null,
+    );
+
+    final workspaces = workspaceOptionsFromSessions(
+      [row],
+      scratchWorkspacePath: '/Users/me/.panda-code/scratch',
+    );
+
+    expect(workspaces.map((w) => w.path), ['/Users/me/.panda-code/scratch']);
+  });
+
   group('session draft', () {
     test('carries its first prompt inside the start payload', () {
       final draft = const SessionDraft(
@@ -242,6 +275,44 @@ void main() {
 
       expect(draft.effectiveModel, 'claude-experimental');
       expect(draft.toConfig()!.model, 'claude-experimental');
+    });
+
+    test('Codex presets mirror the current CLI catalog', () {
+      final models = modelOptionsFor(AgentRuntime.codex);
+
+      expect(
+          models.map((option) => option.value),
+          containsAll([
+            '',
+            'gpt-6-astra',
+            'gpt-5.6-sol',
+            'gpt-5.6-terra',
+            'gpt-5.6-luna',
+            'gpt-5.5',
+            'gpt-5.4-mini',
+            'gpt-5.3-codex-spark',
+          ]));
+      expect(models.map((option) => option.value),
+          isNot(contains('codex-auto-review')));
+    });
+
+    test('Codex reasoning options respect each model ceiling', () {
+      expect(
+          effortOptionsFor(AgentRuntime.codex, 'gpt-6-astra')
+              .map((option) => option.value),
+          containsAll(['max', 'ultra']));
+      expect(
+          effortOptionsFor(AgentRuntime.codex, 'gpt-5.6-luna')
+              .map((option) => option.value),
+          contains('max'));
+      expect(
+          effortOptionsFor(AgentRuntime.codex, 'gpt-5.6-luna')
+              .map((option) => option.value),
+          isNot(contains('ultra')));
+      expect(
+          effortOptionsFor(AgentRuntime.codex, 'gpt-5.5')
+              .map((option) => option.value),
+          isNot(contains('max')));
     });
   });
 }

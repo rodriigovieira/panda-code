@@ -68,14 +68,50 @@ These mirror `apps/desktop/src/shared/ipc.ts`. Keep them aligned.
 
 | Cipher field | Plaintext JSON |
 |---|---|
-| `commandPayloads.payloadCipher` (`type: "start"`) | `SessionStartRequest` |
+| `commandPayloads.payloadCipher` (`type: "start"`) | `SessionStartRequest` (`parentSessionId?` opens it as a sub-thread) |
 | `commandPayloads.payloadCipher` (`type: "input"`) | `{ data: string }` |
 | `commandPayloads.payloadCipher` (`approve`/`deny`) | `{ promptId: string }` |
 | `sessions.titleCipher` / `cwdCipher` | `string` |
 | `sessionRuntime.runtimeCipher` | `SessionRuntimeEvent` (minus `id`) |
 | `deviceUsage.usageCipher` | `UsageBundle` |
 | `events.payloadCipher` | `ConversationItem` (see below) |
-| `commands.resultCipher` | `SessionStartResult` / `{ message }` |
+| `commandPayloads.payloadCipher` (`type: "backlog"`) | `{ cwd, op: "list"\|"add"\|"update"\|"move"\|"delete", id?, title?, description?, metadata?, column?, index? }` |
+| `commandPayloads.payloadCipher` (`type: "schedule"`) | `{ cwd }` — view-only in V1, no `op` |
+| `commands.resultCipher` | `SessionStartResult` / `{ message }` / `{ backlog: WorkspaceBacklog }` / `{ schedule: WorkspaceSchedule }` |
+
+**The workspace backlog is not relay state.** A workspace's kanban board is a
+file on the Mac (`userData/backlogs/<flattened-cwd>.json`), written by the
+desktop UI *and* by every agent working in that folder through its own process.
+The relay stores no copy: the phone asks with a `backlog` command and the desktop
+answers with the whole board in `resultCipher`, on every operation including a
+mutation. Returning the whole board rather than the edited card is deliberate —
+by the time the answer is written another writer may have changed something
+else, and a phone reconciling a diff against a file it does not own would be
+inventing state. The workspace path travels *inside* the sealed payload, so the
+relay never learns which folder is being read, and the desktop refuses any path
+it does not already know as a workspace (the same gate as a remote start).
+
+**`sessions.parentSessionId` is plaintext, deliberately.** A section can be a
+*sub-thread* of another one (the desktop's `PersistedThread.parentId`), and the
+phone nests its list the same way the sidebar does. The field carries an opaque
+local session id and nothing else — the same class of value as `sessionId`, which
+the relay already routes on in the clear — so encrypting it would hide nothing
+the relay cannot already see, while forcing the phone to decrypt every row before
+it could group them. No title, path or prompt travels with it. The link is
+written by `sessions:upsertSession` (on the section's first flush, from the
+`parentId` on its start request) and by `sessions:setParentByDevice` when the
+user re-arranges the tree; an absent value means top-level, which is why the
+latter is a patch rather than a sticky upsert argument.
+
+**Scheduled tasks follow the backlog's pattern, one-way.** A workspace's
+scheduled tasks live in `userData/schedules/<flattened-cwd>.json` on the Mac,
+written by the desktop UI, by every agent's `schedule_add`/`schedule_update`,
+and by the in-process ticker that fires a job and records its run. The relay
+stores no copy here either: the phone sends a `schedule` command with just the
+workspace path and the desktop answers with the whole schedule in
+`resultCipher`. Unlike `backlog`, there is no mutation `op` yet — mobile is
+view-only for V1, so creating or editing a job is desktop/agent-only until a
+write path is added.
 
 ### ConversationItem (events.payloadCipher)
 
@@ -186,3 +222,70 @@ not pop up on the phone as new) and does not restate status. The desktop
 remembers which sections were renamed by hand and stops auto-titles from
 overwriting them, mirroring the renderer's own `titleSource: "manual"` rule.
 Phone-side aliases stay device-local and win over both.
+
+### Large command results
+
+Successful encrypted answers are stored in ordered `commandResults` rows of at
+most 256 Ki UTF-16 code units each (below 1 MiB even with UTF-8 expansion).
+`commands:result` rejoins them into the original ciphertext, so existing clients
+and encryption envelopes remain compatible. The optional plaintext `chunkIndex`
+exposes only ordering and approximate response size; all user content stays
+encrypted. Legacy single rows and inline results remain readable. Consumption,
+replacement, and retention cleanup delete every piece. This removes the per-row
+limit, not Convex's overall function argument, return, or transaction limits.
+
+## Authenticated commands and revocation (command protocol v2)
+
+Every command, including Stop and empty requests, now requires a secretbox
+ciphertext under a separate command key:
+`HMAC-SHA256(pairingKey, UTF8("panda-code/command/v2"))`.
+The decrypted envelope is `{v:2, domain:"panda-code/command/v2", id, deviceId,
+mobileId, sessionId, type, issuedAt, expiresAt, payload}`. `id` is a fresh UUID;
+`sessionId` is explicitly null when absent. Times are epoch milliseconds. The
+maximum lifetime is five minutes and future clock skew is limited to 30 seconds.
+The desktop verifies all routing fields against the received command and records
+its UUID durably before dispatch. A crash can lose a command but cannot execute
+it twice. Corrupt replay storage disables remote execution. Legacy command
+ciphertexts and payload-free commands fail closed; update both clients together.
+Existing event/result encryption remains unchanged. Payload shapes above describe
+`payload` inside the command envelope, not the whole decrypted command.
+
+The relay URL is public configuration, not a credential. New desktop enrollment
+requires the owner's internal `pairing:authorizeDevice` operation with the
+fingerprint shown by their own desktop. Existing registered desktops authenticate
+as before. Public diagnostic reads and writes are removed; trace maintenance is
+internal. Authenticated media uploads use `/media/upload` on the Convex HTTP site,
+with device identity and bearer token in headers. Bodies are capped at 16 MiB,
+with 60 attempts per device per hour; source captures are capped at 8 MiB. The
+server registers ownership before replying. Old unregistered blobs are pruned.
+
+Revoking a phone now resets **all phones** on that desktop. A new shared key and
+reset ID are saved in OS-protected local storage first. The relay blocks mobile
+access while bounded, retryable batches erase the old relay mirror, pending
+pairing codes, commands and stored media. The desktop republishes from local data
+under the new key after completion. Every remaining phone must scan a fresh QR.
+Local transcripts are preserved. The reset resumes after restart; a completed
+reset ID is idempotent. The legacy single-phone revoke endpoint refuses the
+operation because it cannot rotate the client's encryption key.
+
+A revoked phone may retain content it already downloaded. Rotation protects new
+content; it cannot recall old plaintext or ciphertext copied with an old key.
+A paired phone still holds a key shared with other phones on the same Mac.
+A stolen bearer token can affect that phone's relay subscriptions and expose
+ciphertext/traffic metadata; it cannot produce a valid new desktop command without
+the pairing key. Notification subscriptions remain bearer-authenticated routing
+preferences, not authorization to execute code. A compromised relay can suppress
+traffic and replay content displays; command routing substitution and duplicate
+execution are rejected by the desktop. Protect the Convex owner account too.
+
+Remote session input/start/model changes respect a Mac-owned permission ceiling.
+Before every input, queued-prompt delivery, switch, aside, or approval response,
+the desktop resolves a conservative ceiling from both the saved selector and
+Claude command-line permission flags. If either could grant unrestricted access,
+the session is treated as unrestricted; this also covers sessions launched by
+older desktop versions whose flag parser could append both forms. A Codex session
+without an explicitly resolved sandbox, or any session whose effective authority
+is unknown, fails closed for phone control. Full-access sessions and approval
+responses require the Mac owner's explicit remote-full-access opt-in. This does
+not make a paired phone untrusted: it can request work and read files inside the
+permitted workspace. Denials remain available without the full-access opt-in.

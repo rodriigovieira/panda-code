@@ -59,6 +59,7 @@ const sessionService: SessionService = {
   sendInput: async () => ({ ok: true }),
   answerApproval: () => ({ ok: true }),
   switchSession: () => undefined,
+  hibernateSession: () => false,
   stopSession: () => undefined,
   listSessions: () => [],
 };
@@ -100,6 +101,34 @@ describe("relay bridge write path", () => {
         throw new Error("not used");
       },
       loadSessionFiles: async () => ({ isRepo: false, files: [], added: 0, removed: 0 }),
+      applyBacklog: () => ({ ok: true, backlog: { version: 1, cwd: "/tmp", items: [], nextNumber: 1, updatedAt: "" } }),
+      loadRemoteSchedule: () => ({ version: 1, cwd: "/tmp", items: [], updatedAt: "" }),
+      loadRemoteGitStatus: async () => ({ isRepo: false, remotes: [], changes: [], stashes: [], worktrees: [], branches: [], folders: [] }),
+      loadRemoteGitLog: async () => ({ isRepo: false, commits: [], skip: 0, hasMore: false }),
+      loadRemoteTree: async () => ({ path: "", entries: [] }),
+      loadRemoteFile: () => ({ path: "", name: "", content: "", size: 0, truncated: false }),
+      writeRemoteFile: () => ({ path: "", size: 0, savedAt: 0 }),
+      loadMachineStats: async () => ({
+        capturedAt: new Date(0).toISOString(),
+        hostname: "test",
+        platform: "darwin",
+        uptimeSec: 0,
+        cpuCount: 1,
+        loadAvg: [0, 0, 0] as [number, number, number],
+        cpuPct: 0,
+        memTotalBytes: 0,
+        memAvailableBytes: 0,
+        memUsedPct: 0,
+        swapUsedBytes: null,
+        swapTotalBytes: null,
+        diskUsedPct: null,
+        diskFreeBytes: null,
+        topByCpu: [],
+        topByMemory: [],
+        sectionCommands: [],
+      }),
+      ensureRemoteScratchWorkspace: () => "/tmp/scratch",
+      readBrowserMedia: () => Promise.reject(new Error("readBrowserMedia is not wired in this test.")),
     });
     await created.start();
     return created;
@@ -139,6 +168,13 @@ describe("relay bridge write path", () => {
       runtimeEvent({ lastEventAt: new Date(1_000).toISOString(), latestTool: "Read" }),
     );
     await flush();
+    // Same agentState, same queue: a cosmetic badge move (another tool) is held
+    // back by RUNTIME_PUSH_MS rather than writing a document per second per
+    // running section — which was the relay's second-largest line item.
+    expect(names()).toEqual([]);
+
+    // It is not dropped, though: the deferred flush lands once the throttle is up.
+    await vi.advanceTimersByTimeAsync(3_000);
     // Same status/agentState: the session row has nothing new to say, so the
     // badge must not drag a full upsert (and its reads) along with it.
     expect(names()).toEqual(["sessions:putRuntime"]);
@@ -225,10 +261,12 @@ describe("relay bridge write path", () => {
     expect(calls.filter((call) => call.name === "devices:heartbeat").length).toBeGreaterThan(1);
     expect(withUsage()).toEqual([]);
 
-    // A snapshot whose numbers moved does go up — exactly once.
+    // A snapshot whose numbers moved does go up — exactly once. The refetch
+    // timer is slow (5m) on purpose: Anthropic's usage endpoint rate-limits an
+    // account that is polled harder than the numbers actually change.
     calls.length = 0;
     usageUtilization = 0.9;
-    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(6 * 60_000);
     expect(withUsage()).toHaveLength(1);
   });
 });

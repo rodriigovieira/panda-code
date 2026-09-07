@@ -1,7 +1,7 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
-/// Persisted pairing credentials. The E2E key lives in the OS secure enclave
-/// (Keychain / Keystore) via flutter_secure_storage — never in plain prefs.
+/// Persisted pairing credentials use OS-backed Keychain / Keystore storage
+/// via flutter_secure_storage, not plain preferences or hardware-isolated memory.
 class PairingCredentials {
   final String url;
   final String deviceId;

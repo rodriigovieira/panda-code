@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Linked into the helper's __TEXT,__info_plist section rather than sitting next
+  to it as a file. TCC reads the usage description from the executable that asks
+  for the device, and a plain CLI tool has no bundle to read one from — without
+  this, the microphone request is denied outright instead of prompting.
+
+  The host app carries the same two keys (see `build.mac.extendInfo` in
+  package.json); both are needed, because the prompt is attributed to Panda Code
+  while the request originates here.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.pandapdv.pandacode.dictation</string>
+  <key>CFBundleName</key>
+  <string>Panda Code Dictation</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Panda Code uses the microphone to dictate prompts into the composer.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Panda Code transcribes your dictation on this Mac to type prompts for you.</string>
+</dict>
+</plist>

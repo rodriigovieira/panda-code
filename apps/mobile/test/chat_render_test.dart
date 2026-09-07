@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:panda_code_mobile/sessions/models.dart';
+import 'package:panda_code_mobile/sessions/session_view_screen.dart';
 import 'package:panda_code_mobile/sessions/widgets/approval_bar.dart';
 import 'package:panda_code_mobile/sessions/widgets/conversation_item_view.dart';
 import 'package:panda_code_mobile/sessions/widgets/runtime_header.dart';
@@ -23,6 +24,37 @@ SessionRow _row({required AgentState agent, String? latestCommand}) =>
     );
 
 void main() {
+  testWidgets('idle row overrides stale working badge in the open conversation',
+      (tester) async {
+    final row = _row(agent: AgentState.waiting).withRuntime(
+      const SessionRuntimeSnapshot(headSeq: 12, badge: RuntimeBadge(
+        agentState: AgentState.working, latestCommand: 'git push',
+      )),
+    );
+    await tester.pumpWidget(_wrap(RuntimeFooter(row: row)));
+    expect(find.text('Ready'), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    expect(find.text('git push'), findsNothing);
+  });
+
+  testWidgets('working row overrides stale waiting badge', (tester) async {
+    final row = _row(agent: AgentState.working).withRuntime(
+      const SessionRuntimeSnapshot(headSeq: 12, badge: RuntimeBadge(
+        agentState: AgentState.waiting,
+      )),
+    );
+    await tester.pumpWidget(_wrap(RuntimeFooter(row: row)));
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    expect(find.text('Ready'), findsNothing);
+  });
+
+  test('stale approval badge cannot replace an idle composer', () {
+    final row = _row(agent: AgentState.waiting).copyWith(runtime:
+      const RuntimeBadge(agentState: AgentState.needsAction, pendingPromptId: 'old'),
+    );
+    expect(sessionAwaitsApproval(row), isFalse);
+  });
+
   testWidgets('tool call renders a ToolCallView with its name', (tester) async {
     final item = ConversationItem.fromDecrypted({
       'kind': 'tool',
@@ -119,6 +151,80 @@ void main() {
     expect(retried, 'local:2');
   });
 
+  testWidgets('user and assistant bubbles show a clock timestamp',
+      (tester) async {
+    final when = DateTime(2026, 8, 7, 14, 16);
+    final ms = when.millisecondsSinceEpoch;
+    final expected =
+        '${when.hour.toString().padLeft(2, '0')}:${when.minute.toString().padLeft(2, '0')}';
+    final user = ConversationItem(
+      id: 'stream:u1',
+      kind: 'user',
+      title: null,
+      body: 'hi there',
+      sequence: null,
+      model: null,
+      thinking: false,
+      tool: null,
+      createdAt: ms,
+    );
+    final assistant = ConversationItem(
+      id: 'stream:a1',
+      kind: 'assistant',
+      title: null,
+      body: 'hello!',
+      sequence: null,
+      model: null,
+      thinking: false,
+      tool: null,
+      createdAt: ms,
+    );
+    await tester.pumpWidget(_wrap(Column(children: [
+      ConversationItemView(item: user),
+      ConversationItemView(item: assistant),
+    ])));
+    expect(find.text(expected), findsNWidgets(2));
+  });
+
+  testWidgets('a #12 in a message links to that card, not an unknown #999',
+      (tester) async {
+    const item = ConversationItem(
+      id: 'stream:1',
+      kind: 'assistant',
+      title: null,
+      body: 'Filed as #12, unrelated to #999.',
+      sequence: null,
+      model: null,
+      thinking: false,
+      tool: null,
+    );
+    int? tapped;
+    await tester.pumpWidget(_wrap(ConversationItemView(
+      item: item,
+      cardNumbers: {12},
+      onCardTap: (number) => tapped = number,
+    )));
+    expect(find.textContaining('#999', findRichText: true), findsOneWidget);
+    await tester.tapOnText(find.textRange.ofSubstring('#12'));
+    expect(tapped, 12);
+  });
+
+  testWidgets('no card index leaves every #12 as plain, untappable text',
+      (tester) async {
+    const item = ConversationItem(
+      id: 'stream:2',
+      kind: 'assistant',
+      title: null,
+      body: 'See #12 for details.',
+      sequence: null,
+      model: null,
+      thinking: false,
+      tool: null,
+    );
+    await tester.pumpWidget(_wrap(ConversationItemView(item: item)));
+    expect(find.textContaining('#12', findRichText: true), findsOneWidget);
+  });
+
   test('thinking is detected from the desktop system/"Thinking" shape', () {
     final item = ConversationItem.fromDecrypted({
       'kind': 'system',
@@ -148,6 +254,54 @@ void main() {
     // It collapses to nothing so the approval bar owns that moment.
     expect(find.byType(CircularProgressIndicator), findsNothing);
     expect(find.textContaining('…'), findsNothing);
+  });
+
+  group('sessionAwaitsApproval', () {
+    SessionRow rowWith(RuntimeBadge runtime) => SessionRow(
+          sessionId: 's1',
+          title: 'Session',
+          status: SessionStatus.running,
+          agentState: runtime.agentState,
+          executionMode: 'stream-json',
+          headSeq: 0,
+          updatedAt: 0,
+          runtime: runtime,
+        );
+
+    test('true when a real approval is pending', () {
+      expect(
+        sessionAwaitsApproval(rowWith(const RuntimeBadge(
+          agentState: AgentState.needsAction,
+          pendingApproval: PendingApproval(
+            promptId: 'approval:sec_1:1',
+            kind: 'command',
+            title: 'Run command',
+            body: 'ls',
+          ),
+        ))),
+        isTrue,
+      );
+    });
+
+    test('false when needs_action carries no prompt (Codex usage limit)', () {
+      // A rate-limited turn parks the section at needs_action with nothing to
+      // answer; the composer must stay so the session is recoverable.
+      expect(
+        sessionAwaitsApproval(rowWith(const RuntimeBadge(
+          agentState: AgentState.needsAction,
+          currentEventType: 'error',
+        ))),
+        isFalse,
+      );
+    });
+
+    test('false while the agent is working', () {
+      expect(
+        sessionAwaitsApproval(
+            rowWith(const RuntimeBadge(agentState: AgentState.working))),
+        isFalse,
+      );
+    });
   });
 
   testWidgets('runtime footer shows a ready line while waiting',
@@ -246,7 +400,8 @@ void main() {
       expect((entries[1] as TranscriptWorkGroup).items.map((i) => i.id),
           ['t1', 's1']);
       expect((entries[2] as TranscriptMessage).item.id, 'a1');
-      expect((entries[3] as TranscriptWorkGroup).items.map((i) => i.id), ['t2']);
+      expect(
+          (entries[3] as TranscriptWorkGroup).items.map((i) => i.id), ['t2']);
     });
 
     test('the end-of-turn summary is never folded away', () {

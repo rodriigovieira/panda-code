@@ -50,11 +50,28 @@ export type StreamJsonState = {
   // suppressed.
   activeParentAgentId?: string;
   agentToolUseIds?: string[];
+  // Shell commands seen on a `tool_use`, kept until the `task_started` that
+  // opens their card arrives (the two events race). See rememberShellCommand.
+  shellCommands?: Array<{ toolUseId: string; command: string }>;
   // Codex (app-server) is blocked on an approval or a question and the section
   // sits at `needs_action` until it is answered. Owned by
   // CodexAppServerSessionManager, mirrored here so it rides the normal snapshot
   // to the renderer and the relay.
   pendingApproval?: PendingApproval;
+  // The most recent turn-ending Claude `result` event, if it carried
+  // `is_error: true`. Cleared on the next (non-error) result. Read by the
+  // auto-retry scheduler in main/index.ts to tell a transient failure
+  // (`error_during_execution` — a dropped connection or a 5xx mid-response,
+  // worth retrying) from a terminal one (`error_max_turns`, `error_max_budget_usd`
+  // — retrying changes nothing, a human has to act).
+  lastResultError?: { subtype: string };
+  // A `<synthetic>` assistant message the CLI emits in place of the model's
+  // answer when the API call itself failed ("API Error: Connection closed
+  // mid-response…"). It does NOT make the turn's `result` an error — that still
+  // arrives as `subtype: "success"`, `is_error: false` — so the result handler
+  // has to carry this flag forward to tell a real answer from a dropped one.
+  // Set on the assistant event, consumed by the next `result`.
+  pendingApiError?: { text: string; retryable: boolean };
 };
 
 const emptyTokenUsage = (): TokenUsageStats => ({
@@ -451,7 +468,7 @@ function addOrCoalesceAssistant(state: StreamJsonState, item: ConversationItem, 
   };
 }
 
-function pushItem(state: StreamJsonState, item: Omit<ConversationItem, "sequence">, delta = false): void {
+export function pushItem(state: StreamJsonState, item: Omit<ConversationItem, "sequence">, delta = false): void {
   // Any item emitted while a subagent event is being applied inherits that
   // agent as its parent, unless the item already declares its own (the agent
   // card itself is top-level and passes parentAgentId: undefined explicitly).
@@ -502,6 +519,33 @@ function addUsage(total: TokenUsageStats, usage: unknown, replace = false): void
     total.inputTokens + total.outputTokens + total.cacheCreationInputTokens + total.cacheReadInputTokens;
 }
 
+// Transport-level failures the API is expected to recover from on a resend: a
+// dropped stream, a 5xx, an overloaded upstream. Anything else the CLI reports
+// as "API Error:" (a 400 from an oversized prompt, an auth failure, a credit
+// limit) comes back identically no matter how many times we retry, so it has to
+// reach a human instead.
+const RETRYABLE_API_ERROR_PATTERN =
+  /connection closed|connection error|network error|timed? ?out|overloaded|internal server error|\b(500|502|503|504|529)\b/i;
+
+/**
+ * Recognises the CLI's synthetic API-error message. The transcript marks it with
+ * `isApiErrorMessage`, but the stream-json envelope does not always carry that
+ * flag, so the message payload itself (`model: "<synthetic>"` plus the
+ * "API Error:" prefix) is the reliable signal.
+ */
+function apiErrorFromAssistantMessage(
+  event: StreamJsonEvent,
+  model: string | undefined,
+  text: string,
+): { text: string; retryable: boolean } | undefined {
+  const flagged = event.isApiErrorMessage === true || asString(event.error) === "server_error";
+  const looksSynthetic = model === "<synthetic>" && /^\s*API Error\b/i.test(text);
+  if (!flagged && !looksSynthetic) {
+    return undefined;
+  }
+  return { text, retryable: RETRYABLE_API_ERROR_PATTERN.test(text) };
+}
+
 function applyContentParts(
   state: StreamJsonState,
   event: StreamJsonEvent,
@@ -516,9 +560,23 @@ function applyContentParts(
 
   const synthetic = role === "user" && (isSyntheticUserEvent(event) || looksLikeSyntheticUserText(text));
 
+  if (role === "user" && text) {
+    applyAsyncAgentNotification(state, text);
+    if (INTERRUPT_MARKER.test(text.trim())) {
+      resolveInterruptedAgentCards(state);
+    }
+  }
+
   if (text) {
     if (role === "assistant") {
-      if (model) state.latestModel = model;
+      const apiError = apiErrorFromAssistantMessage(event, model, text);
+      if (apiError) {
+        state.pendingApiError = apiError;
+      }
+      // `<synthetic>` is the CLI's placeholder for "no model answered this", not
+      // a model the section is running on — recording it would relabel the
+      // section's model in the UI off the back of a failure.
+      if (model && model !== "<synthetic>") state.latestModel = model;
       // Short snippet for the mobile session-list preview.
       state.latestAssistantText = compactBody(text).slice(0, 160);
     }
@@ -555,16 +613,53 @@ function applyContentParts(
 
     if (record.type === "tool_use") {
       const name = asString(record.name) ?? "Tool call";
-      // The Task/Agent tool spawns a subagent that gets its own `agent` card
-      // (from task_started) plus its nested transcript, so the raw tool_use row
-      // would just duplicate it. Skip it.
+      // The Task/Agent tool spawns a subagent that gets its own `agent` card,
+      // so the raw tool_use row would just duplicate it. Some runs report the
+      // subagent's lifecycle via `task_started`/`task_updated` system events
+      // (applyClaudeTask opens the card itself, below); others — the async
+      // "launched in the background, notified later" style — never emit those
+      // events at all, so the card has to be opened right here or it never
+      // appears. `pushItem` no-ops if `task_started` already created the same
+      // id, so doing both is safe.
       if (name === "Agent" || name === "Task") {
+        const toolUseId = asString(record.id);
+        if (toolUseId) {
+          if (!state.agentToolUseIds) {
+            state.agentToolUseIds = [];
+          }
+          if (!state.agentToolUseIds.includes(toolUseId)) {
+            state.agentToolUseIds.push(toolUseId);
+          }
+          const input = asRecord(record.input);
+          const agent: AgentActivity = {
+            toolUseId,
+            subagentType: asString(input?.subagent_type),
+            status: "running",
+          };
+          pushItem(state, {
+            id: agentCardItemId(toolUseId),
+            kind: "agent",
+            title: asString(input?.description) ?? "Agent",
+            body: agentCardBody(agent),
+            timestamp,
+            parentAgentId: undefined,
+            agent,
+          });
+        }
         continue;
       }
       const command = commandFromToolInput(record.input);
       state.latestTool = name;
       state.latestCommand = command ?? state.latestCommand;
       const toolUseId = asString(record.id);
+      // Where this shell sends its output decides what its card can show.
+      const shellCommand = asString(asRecord(record.input)?.command);
+      if (toolUseId && shellCommand) {
+        rememberShellCommand(state, toolUseId, shellCommand);
+        // No-ops when task_started has not opened the card yet; that path reads
+        // the command back out of `state.shellCommands`.
+        applyShellCommandToCard(state, toolUseId, shellCommand);
+      }
       pushItem(state, {
         id: toolUseId ? toolUseItemId(toolUseId) : `stream:${messageId}:tool:${index}`,
         kind: "tool",
@@ -583,7 +678,15 @@ function applyContentParts(
         // acknowledgement — it names the file Claude streams the real output
         // to, and that file is the sole source of the task's output. Keep the
         // path so the main process can tail it into the card.
-        captureTaskOutputFile(state, toolUseId, toolResultBody(record.content));
+        const resultBody = toolResultBody(record.content);
+        captureTaskOutputFile(state, toolUseId, resultBody);
+        // An async Agent/Task launch acknowledgement instead of shell output:
+        // "agentId: <id>" is the same id its later <task-notification> reports
+        // itself by, and "output_file: <path>" is its full nested transcript.
+        captureAsyncAgentLaunch(state, toolUseId, resultBody);
+        // And except for a *foreground* shell task, which has neither: this
+        // result is the only copy of the command's output.
+        captureShellTaskOutput(state, toolUseId, resultBody);
         continue;
       }
       pushItem(state, {
@@ -632,7 +735,30 @@ function updateStateFromEventType(state: StreamJsonState, event: StreamJsonEvent
   }
 
   if (type === "result") {
-    state.agentState = "waiting";
+    const isError = event.is_error === true;
+    const apiError = state.pendingApiError;
+    state.pendingApiError = undefined;
+
+    // The turn produced a synthetic "API Error:" message instead of an answer.
+    // The CLI still closes it as `success`, so without this the section reads
+    // as cleanly finished and nothing retries it — the case that left a turn
+    // parked for an hour until a human typed "Continue". Map a transport
+    // failure onto the same transient bucket the auto-retry scheduler already
+    // watches; anything else is terminal and needs a human.
+    if (!isError && apiError) {
+      state.lastResultError = { subtype: apiError.retryable ? "error_during_execution" : "error_api" };
+      state.agentState = apiError.retryable ? "waiting" : "needs_action";
+      return;
+    }
+
+    // `error_during_execution` is the CLI's own transient bucket — a dropped
+    // connection or a server error mid-stream — so it stays "waiting" and lets
+    // the auto-retry scheduler (main/index.ts, keyed off `lastResultError`)
+    // quietly resend the turn instead of parking on a spinner nothing clears.
+    // Anything else `is_error` (max turns, max budget, …) is terminal: surface
+    // it as `needs_action` instead of masking it as a clean finish.
+    state.lastResultError = isError ? { subtype } : undefined;
+    state.agentState = isError && subtype !== "error_during_execution" ? "needs_action" : "waiting";
     return;
   }
 
@@ -649,15 +775,39 @@ function updateStateFromEventType(state: StreamJsonState, event: StreamJsonEvent
     return;
   }
 
-  if (type === "system" && subtype === "init") {
-    state.agentState = "waiting";
+  if (type === "command_lifecycle") {
+    // The CLI's background-shell notice, emitted when a `run_in_background`
+    // command is launched, adopted, or exits. It is not a turn boundary and it
+    // routinely arrives on an idle section: the launch acknowledgement lands
+    // *2ms after* the turn's own `result`, and the exit notice can land hours
+    // later. Falling through to "working" therefore pinned a finished section
+    // to a spinner nothing would clear — no further `result` is coming.
+    return;
+  }
+
+  if (type === "system") {
+    // `init` is the CLI announcing it booted, not a turn boundary. A section
+    // started *by* a prompt sends the prompt first and gets the boot echo a
+    // beat later, so reporting "waiting" here dropped the spinner (sidebar and
+    // status bar both) for the whole cold start — 5s on a warm machine, far
+    // longer with MCP servers to load — while the transcript already showed
+    // "Thinking…". A section that really is idle is already "waiting" from the
+    // initial state, so leaving it untouched still reads "Ready".
+    //
+    // System notices never *start* a turn. Some of them (`commands_changed`,
+    // fired whenever the CLI rescans skills/commands on disk) arrive on idle
+    // sessions long after their `result`, and falling through to "working"
+    // pinned every finished section to a spinner that nothing would clear —
+    // no further `result` is coming. In-turn notices (`status`,
+    // `thinking_tokens`, `task_*`) land while the state is already "working",
+    // so leaving it untouched loses nothing.
     return;
   }
 
   state.agentState = "working";
 }
 
-function agentCardBody(agent: AgentActivity): string {
+export function agentCardBody(agent: AgentActivity): string {
   const parts: string[] = [];
   if (agent.subagentType) parts.push(agent.subagentType);
   parts.push(agent.status);
@@ -680,6 +830,158 @@ function agentCardBody(agent: AgentActivity): string {
 // reaches the event stream — so record it on the card.
 const TASK_OUTPUT_FILE_PATTERN = /Output is being written to:\s*(\S+?)\.?(?:\s|$)/;
 
+// `outputFile` only receives what the command actually wrote to the CLI's
+// stdout/stderr, and two shell habits leave it empty for a whole run: sending
+// the output to a log of the agent's own choosing (`> build.log`), and ending
+// the pipeline in a stage that holds everything until stdin closes
+// (`… | tee log | tail -20` — the case that made a 20-minute push render as
+// "No output yet…" while tee's log grew to 71KB). Both are recoverable from the
+// command text, which beats asking agents not to do it: the instruction already
+// exists and this pipeline still shipped.
+
+/**
+ * Stages that cannot emit their first byte until stdin closes, because their
+ * output is a function of the whole input: `tail` must know where the end is,
+ * `sort` and `tac` must see every line before the first one is placed, `wc`
+ * counts to the end, `sponge` soaks by definition. That property — not
+ * "filters output" — is the membership rule, which is why the streaming
+ * filters an agent reaches for just as often (`grep`, `sed`, `awk`, `head`,
+ * `cut`) are deliberately absent: they print as they go and a card behind one
+ * of them fills normally.
+ */
+const BUFFERING_PIPELINE_STAGES = new Set(["tail", "sort", "wc", "tac", "sponge"]);
+
+/**
+ * `| tee [-a] <path>`. Only after a pipe: bare `tee` is not a thing an agent
+ * writes, and anchoring on the pipe keeps the word "tee" inside some other
+ * argument from matching. Group 1 soaks up flags (`-a`, `--append`) so group 2
+ * is the path. tee's target is the interesting one precisely because it holds
+ * the full output even when the stage after it swallows everything.
+ */
+const TEE_TARGET_PATTERN = /\|\s*tee\s+((?:-\S+\s+)*)("[^"]*"|'[^']*'|[^\s|;&<>]+)/g;
+
+/**
+ * `> <path>`, `>> <path>`, `2> <path>`, `&> <path>`, `&>> <path>`.
+ * The leading boundary stops a `>` that is part of a longer token from
+ * matching; the unquoted path class excludes the metacharacters that would end
+ * the word (`|;&<>`) so `cmd > log | tail` yields `log`, not `log | tail`.
+ */
+const REDIRECT_TARGET_PATTERN = /(?:^|[\s;&|])(?:\d?>>?|&>>?)\s*("[^"]*"|'[^']*'|[^\s|;&<>]+)/g;
+
+/**
+ * Targets that discard the stream or re-point it at an existing one rather than
+ * naming a file worth tailing. `/dev/null` is the common half of
+ * `| tee log > /dev/null`, where tee's target is the readable copy and this one
+ * would be an empty tail forever.
+ */
+const NON_FILE_REDIRECT_TARGETS = new Set(["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"]);
+
+function unquoteShellWord(word: string): string {
+  const quoted = /^(["'])(.*)\1$/.exec(word);
+  return quoted?.[2] ?? word;
+}
+
+/**
+ * The *last* usable target, not the first: when a command redirects the same
+ * stream twice the shell applies them in order and only the final one still has
+ * the output, so scanning to the end matches what actually happens on disk.
+ * Skipped targets do not end the scan — `> log 2>&1` has to keep `log` after
+ * rejecting `&1`, which a first-match-wins loop would get backwards.
+ */
+function lastMatch(pattern: RegExp, command: string, group: number): string | undefined {
+  pattern.lastIndex = 0;
+  let found: string | undefined;
+  for (let match = pattern.exec(command); match !== null; match = pattern.exec(command)) {
+    const captured = match[group];
+    if (captured === undefined) {
+      continue;
+    }
+    const target = unquoteShellWord(captured);
+    // `2>&1` reaches here as the target "&1": a stream dup, not a file.
+    if (target.startsWith("&") || NON_FILE_REDIRECT_TARGETS.has(target)) {
+      continue;
+    }
+    found = target;
+  }
+  return found;
+}
+
+/**
+ * Split into pipeline stages. `||` is a boolean operator rather than a pipe,
+ * but splitting on it too is harmless here: it still lands on a real command
+ * boundary, and the only question asked of each stage is what its first word
+ * is. Deliberately naive about quoting — a `|` inside a quoted string yields
+ * one bogus stage, which at worst costs an unrecognised stage name.
+ */
+function pipelineStages(command: string): string[] {
+  return command.split(/\|\|?/).map((stage) => stage.trim());
+}
+
+/**
+ * What a shell command does with its own output. Returns the file it writes to
+ * (so the card can tail that instead of the CLI's empty one) and the pipeline
+ * stage that withholds it (so an empty card can say why it is empty).
+ *
+ * Both results are a best-effort read of shell syntax, never a guarantee: this
+ * is a regex over a string, not a parser, and it can be defeated by quoting,
+ * `$VARS`, or a heredoc. That is affordable because of how the results are
+ * used — a `file` that does not exist just fails the tail and the card falls
+ * back to what it showed before, and a missed `bufferedBy` costs one sentence
+ * of explanation. Nothing downstream depends on either being right, so the bias
+ * is toward recognising the plain forms agents actually write rather than
+ * covering the whole grammar.
+ */
+export function parseCommandOutputPlan(command: string): { file?: string; bufferedBy?: string } {
+  // A redirect wins over tee: `cmd | tee log > out` puts everything in `out`,
+  // and tee's copy is the lesser of the two. The order only matters when a
+  // command uses both, which is rare enough that either answer would do.
+  const file = lastMatch(REDIRECT_TARGET_PATTERN, command, 1) ?? lastMatch(TEE_TARGET_PATTERN, command, 2);
+
+  // Stage 0 is the command itself — it is the stages *downstream* of it that
+  // can withhold its output, so start at 1. The first one found wins: once
+  // anything in the pipeline waits for EOF, everything after it is waiting too,
+  // and the earliest waiting stage is the one that explains the silence.
+  let bufferedBy: string | undefined;
+  for (const stage of pipelineStages(command).slice(1)) {
+    const [name = "", ...args] = stage.split(/\s+/);
+    // `tail -f`/`-F` is the one form that streams rather than waits.
+    if (BUFFERING_PIPELINE_STAGES.has(name) && !args.some((arg) => /^-[fF]$|^--follow/.test(arg))) {
+      bufferedBy = name;
+      break;
+    }
+  }
+
+  return { file, bufferedBy };
+}
+
+/** Cap on remembered commands: enough to cover a turn's shells, bounded so a
+ *  long session's state stays small. */
+const SHELL_COMMAND_MEMORY = 40;
+
+/**
+ * The command arrives on the Bash `tool_use`, but the card that needs it is
+ * opened by `task_started` — and either can land first. Remember the command by
+ * tool_use id and apply it from both sides.
+ */
+function rememberShellCommand(state: StreamJsonState, toolUseId: string, command: string): void {
+  const remembered = (state.shellCommands ?? []).filter((entry) => entry.toolUseId !== toolUseId);
+  remembered.push({ toolUseId, command });
+  state.shellCommands = remembered.slice(-SHELL_COMMAND_MEMORY);
+}
+
+function applyShellCommandToCard(state: StreamJsonState, toolUseId: string, command: string): void {
+  updateAgentCard(state, { toolUseId }, (agent) => {
+    // A real subagent's card shows its nested transcript; it runs no shell.
+    if (agent.subagentType !== undefined) {
+      return;
+    }
+    const plan = parseCommandOutputPlan(command);
+    agent.command = command;
+    if (plan.file) agent.commandOutputFile = plan.file;
+    if (plan.bufferedBy) agent.outputBufferedBy = plan.bufferedBy;
+  });
+}
+
 function captureTaskOutputFile(state: StreamJsonState, toolUseId: string, body: string): void {
   const path = TASK_OUTPUT_FILE_PATTERN.exec(body)?.[1];
   if (!path) {
@@ -687,6 +989,59 @@ function captureTaskOutputFile(state: StreamJsonState, toolUseId: string, body: 
   }
   updateAgentCard(state, { toolUseId }, (agent) => {
     agent.outputFile = path;
+  });
+}
+
+// Claude Code reuses the task_* lifecycle for plain Bash calls, so a foreground
+// shell gets an agent card carrying the Bash `description` ("Push to origin
+// main"). Unlike a subagent it renders no nested children, and unlike a
+// background shell it names no output file — so once its tool_result was
+// suppressed as a "redundant echo" the card had nothing left to show and read
+// "No output yet…" forever, swallowing the output of commit and push gates.
+// Put the result on the card instead of dropping it.
+function captureShellTaskOutput(state: StreamJsonState, toolUseId: string, body: string): void {
+  // A subagent names its type and/or has already streamed children by now; a
+  // background shell has an output file the main process tails in. Anything
+  // still empty at this point is a foreground shell.
+  if (state.items.some((item) => item.parentAgentId === toolUseId)) {
+    return;
+  }
+  updateAgentCard(state, { toolUseId }, (agent) => {
+    if (agent.subagentType !== undefined || agent.outputFile !== undefined) {
+      return;
+    }
+    agent.outputTail = compactBody(body);
+  });
+}
+
+// An async Agent/Task launch acknowledgement reads:
+//   "Async agent launched successfully. ... agentId: <id> ...
+//    output_file: <path> ... "
+// `agentId` is the id its later <task-notification> reports itself by (see
+// applyAsyncAgentNotification); `output_file` is its full nested transcript,
+// same role as a background shell's output file above.
+const ASYNC_AGENT_ID_PATTERN = /agentId:\s*(\S+)/;
+const ASYNC_AGENT_OUTPUT_FILE_PATTERN = /output_file:\s*(\S+)/;
+
+// Exported so the transcript reader (which rebuilds a reloaded session from the
+// JSONL, not from live events) resolves async agents exactly the same way.
+export function parseAsyncAgentLaunch(body: string): { agentId?: string; outputFile?: string } | null {
+  const agentId = ASYNC_AGENT_ID_PATTERN.exec(body)?.[1];
+  const outputFile = ASYNC_AGENT_OUTPUT_FILE_PATTERN.exec(body)?.[1];
+  if (!agentId && !outputFile) {
+    return null;
+  }
+  return { agentId, outputFile };
+}
+
+function captureAsyncAgentLaunch(state: StreamJsonState, toolUseId: string, body: string): void {
+  const launch = parseAsyncAgentLaunch(body);
+  if (!launch) {
+    return;
+  }
+  updateAgentCard(state, { toolUseId }, (agent) => {
+    if (launch.agentId) agent.taskId = launch.agentId;
+    if (launch.outputFile) agent.outputFile = launch.outputFile;
   });
 }
 
@@ -712,6 +1067,58 @@ function updateAgentCard(
   card.body = agentCardBody(card.agent);
 }
 
+// The async Agent/Task lifecycle has no `task_updated`/`task_notification`
+// system events — its only terminal signal is a `<task-notification>` block
+// injected into the transcript as a plain user turn (already recognized by
+// looksLikeSyntheticUserText and rendered as a "Task update" system row). It
+// carries the same ids the launch ack and card were keyed by, so the matching
+// card can be resolved out of "running" the same way applyClaudeTask does for
+// the native lifecycle.
+const TASK_NOTIFICATION_FIELD = (tag: string): RegExp => new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "i");
+
+export type TaskNotification = {
+  toolUseId?: string;
+  taskId?: string;
+  status?: string;
+  summary?: string;
+};
+
+// Exported for the transcript reader, same reason as parseAsyncAgentLaunch.
+export function parseTaskNotification(text: string): TaskNotification | null {
+  if (!/^<task-notification>/i.test(text.trimStart())) {
+    return null;
+  }
+  const toolUseId = TASK_NOTIFICATION_FIELD("tool-use-id").exec(text)?.[1]?.trim();
+  const taskId = TASK_NOTIFICATION_FIELD("task-id").exec(text)?.[1]?.trim();
+  if (!toolUseId && !taskId) {
+    return null;
+  }
+  return {
+    toolUseId,
+    taskId,
+    status: TASK_NOTIFICATION_FIELD("status").exec(text)?.[1]?.trim(),
+    summary: TASK_NOTIFICATION_FIELD("summary").exec(text)?.[1]?.trim(),
+  };
+}
+
+// Resolve a card out of "running" from a notification's status/summary. Shared
+// by the live stream and the transcript reader.
+export function applyTaskNotificationToAgent(agent: AgentActivity, notification: TaskNotification): void {
+  if (notification.status === "completed") agent.status = "completed";
+  else if (notification.status === "failed" || notification.status === "error") agent.status = "failed";
+  if (notification.summary) agent.summary = notification.summary;
+}
+
+function applyAsyncAgentNotification(state: StreamJsonState, text: string): void {
+  const notification = parseTaskNotification(text);
+  if (!notification) {
+    return;
+  }
+  updateAgentCard(state, { toolUseId: notification.toolUseId, taskId: notification.taskId }, (agent) => {
+    applyTaskNotificationToAgent(agent, notification);
+  });
+}
+
 // Claude reuses the `task_*` lifecycle for two different things: real Task/Agent
 // subagents (which carry a `subagent_type` and run their own nested turns) and
 // fire-and-forget background Bash shells (which don't). Only a genuine subagent
@@ -728,6 +1135,26 @@ function hasRunningAgent(state: StreamJsonState): boolean {
   );
 }
 
+/**
+ * Whether anything this section spawned is still running — a subagent mid-turn,
+ * a `run_in_background` agent, or a background shell.
+ *
+ * The complement of `hasRunningAgent`, and deliberately so: that one answers
+ * "should the spinner stay open", where a background card must NOT count, and
+ * this one answers "would killing this process destroy work", where it is the
+ * only thing that does. A section whose turn ended while `git push` runs is
+ * `waiting` with a running background card, and the reaper reads this to leave
+ * it alone.
+ *
+ * A card only leaves "running" on its terminal `task_updated`/`task_notification`,
+ * so a child that dies without one keeps its section unhibernatable until the
+ * next turn rebuilds the transcript. That is the safe direction to be wrong in:
+ * the cost is one process held, not a lost push.
+ */
+export function hasBackgroundWork(state: StreamJsonState): boolean {
+  return state.items.some((item) => item.kind === "agent" && item.agent?.status === "running");
+}
+
 // A card still "running" when the main agent's turn ends belongs to work that
 // outlives the turn: a `run_in_background` agent or a background Bash shell.
 // Flag it rather than force it to "completed" — the card keeps telling the
@@ -738,6 +1165,22 @@ function markBackgroundAgents(state: StreamJsonState): void {
   for (const item of state.items) {
     if (item.kind === "agent" && item.agent?.status === "running" && item.agent.background !== true) {
       item.agent.background = true;
+      item.body = agentCardBody(item.agent);
+    }
+  }
+}
+
+// The CLI injects this synthetic user message when a turn is killed mid-tool-use.
+// Nothing else resolves a card at that point — no task_updated/task_notification
+// is coming for a process the interrupt just tore down — so any card still
+// "running" at this instant is stuck there forever unless we resolve it here.
+const INTERRUPT_MARKER = /^\[Request interrupted by user/;
+
+function resolveInterruptedAgentCards(state: StreamJsonState): void {
+  for (const item of state.items) {
+    if (item.kind === "agent" && item.agent?.status === "running") {
+      item.agent.status = "failed";
+      if (!item.agent.summary) item.agent.summary = "Interrupted";
       item.body = agentCardBody(item.agent);
     }
   }
@@ -785,6 +1228,12 @@ function applyClaudeTask(state: StreamJsonState, event: StreamJsonEvent, timesta
       parentAgentId: undefined,
       agent,
     });
+    // The Bash tool_use usually lands first and carries the command this card
+    // is running; if it did, resolve the card's output sink now.
+    const command = state.shellCommands?.find((entry) => entry.toolUseId === toolUseId)?.command;
+    if (command) {
+      applyShellCommandToCard(state, toolUseId, command);
+    }
     return;
   }
 
@@ -869,6 +1318,7 @@ function applyCodexItem(state: StreamJsonState, event: StreamJsonEvent, timestam
         title: "Codex",
         body: compactBody(text),
         timestamp,
+        model: state.latestModel,
       });
     }
     return;
@@ -940,6 +1390,14 @@ function maybeEmitTurnSummary(state: StreamJsonState, event: StreamJsonEvent, re
   if (type !== "result" && type !== "turn.completed") {
     return;
   }
+  // A subagent ends its own turn with a `result` carrying `parent_tool_use_id`.
+  // That is not the main agent's turn ending: emitting here would both bury a
+  // footer inside the agent card and — worse — reset `turnStartedAt` /
+  // `turnStartTokens`, so the parent's real footer would report only the sliver
+  // of time since the last child finished ("Worked for 0.1s", no token count).
+  if (state.activeParentAgentId !== undefined) {
+    return;
+  }
   const reportedMs = Number(event.duration_ms ?? (event as { durationMs?: unknown }).durationMs ?? 0);
   pushTurnSummary(state, receivedAt, reportedMs);
 }
@@ -950,11 +1408,15 @@ function maybeEmitTurnSummary(state: StreamJsonState, event: StreamJsonEvent, re
 // supplied one, else 0 to fall back to wall-clock.
 function pushTurnSummary(state: StreamJsonState, receivedAt: string, reportedMs: number): void {
   // Tokens consumed during this turn: the delta of the cumulative counter since
-  // the turn began (robust across Claude/Codex). Fall back to the whole total
-  // when we never captured a start (e.g. the process resumed mid-turn).
+  // the turn began (robust across Claude/Codex). Falling back to the whole total
+  // is only right when we never captured a start (the process resumed mid-turn);
+  // a turn that genuinely burned nothing must report 0. Reporting the session
+  // total for a zero delta is what let the bookkeeping turn after an interrupt
+  // slip past the "no tokens, under a second" guard below and render as
+  // "Worked for 0.1s · 6.2M tokens".
   const endTokens = state.tokenUsage.totalTokens;
-  const startTokens = state.turnStartTokens ?? 0;
-  const turnTokens = endTokens > startTokens ? endTokens - startTokens : endTokens;
+  const turnTokens =
+    state.turnStartTokens === undefined ? endTokens : Math.max(0, endTokens - state.turnStartTokens);
 
   // Duration: the runtime's own measurement when present, else wall clock from
   // when this turn first started working.
@@ -976,6 +1438,15 @@ function pushTurnSummary(state: StreamJsonState, receivedAt: string, reportedMs:
   state.turnStartTokens = undefined;
 
   if (parts.length === 0) {
+    return;
+  }
+
+  // A turn that burned no tokens in under a second did no work: it is the
+  // bookkeeping `result` the CLI emits after an interrupt (the echoed user
+  // message flips the state back to "working", so a fresh turn clock starts a
+  // heartbeat before the result lands). "Worked for 0.1s" under an interrupt
+  // notice says nothing and reads like a broken turn — say nothing instead.
+  if (turnTokens === 0 && durationMs < 1000) {
     return;
   }
 
@@ -1053,7 +1524,14 @@ function applyAppServerItem(state: StreamJsonState, item: Record<string, unknown
       const text = asString(item.text);
       if (text) {
         state.latestAssistantText = compactBody(text).slice(0, 160);
-        pushItem(state, { id: messageItemId(itemId), kind: "assistant", title: "Codex", body: compactBody(text), timestamp });
+        pushItem(state, {
+          id: messageItemId(itemId),
+          kind: "assistant",
+          title: "Codex",
+          body: compactBody(text),
+          timestamp,
+          model: state.latestModel,
+        });
       }
       return;
     }
@@ -1105,6 +1583,41 @@ function applyAppServerItem(state: StreamJsonState, item: Record<string, unknown
       if (completed) {
         const result = item.result ?? item.error ?? item.arguments;
         pushItem(state, { id: toolUseItemId(itemId), kind: "tool", title: tool, body: compactBody(stringifyRecord(result)), timestamp });
+      }
+      return;
+    }
+    case "functionCallOutput": {
+      if (completed) {
+        const name = asString(item.name) ?? "Tool output";
+        state.latestTool = name;
+        pushItem(state, {
+          id: toolResultItemId(itemId),
+          kind: "tool",
+          title: name,
+          body: compactBody(stringifyRecord(item.output)),
+          timestamp,
+        });
+      }
+      return;
+    }
+    case "contextCompaction": {
+      state.latestTool = completed ? undefined : "Compacting context";
+      if (completed) {
+        pushItem(state, {
+          id: `codex:compaction:${itemId}`,
+          kind: "system",
+          title: "Context compacted",
+          body: "Codex compacted the conversation context and continued.",
+          timestamp,
+        });
+      }
+      return;
+    }
+    case "imageView": {
+      const path = asString(item.path);
+      state.latestTool = "view_image";
+      if (completed && path) {
+        pushItem(state, { id: toolUseItemId(itemId), kind: "tool", title: "Viewed image", body: path, timestamp });
       }
       return;
     }
@@ -1175,10 +1688,12 @@ export function applyAppServerNotification(
 
   switch (method) {
     case "thread/started": {
-      const id = asString(asRecord(p.thread)?.id);
+      const thread = asRecord(p.thread);
+      const id = asString(thread?.id);
       if (id) {
         state.codexThreadId = id;
       }
+      state.latestModel = asString(p.model) ?? asString(thread?.model) ?? state.latestModel;
       return state;
     }
     case "turn/started": {
@@ -1195,17 +1710,38 @@ export function applyAppServerNotification(
       if (delta) {
         const itemId = asString(p.itemId) ?? state.activeAssistantMessageId ?? "assistant-delta";
         state.activeAssistantMessageId = itemId;
-        pushItem(state, { id: messageItemId(itemId), kind: "assistant", title: "Codex", body: delta, timestamp: receivedAt }, true);
+        pushItem(
+          state,
+          {
+            id: messageItemId(itemId),
+            kind: "assistant",
+            title: "Codex",
+            body: delta,
+            timestamp: receivedAt,
+            model: state.latestModel,
+          },
+          true,
+        );
       }
       return state;
     }
     case "item/started": {
       state.agentState = "working";
-      applyAppServerItem(state, asRecord(p.item), asString(asRecord(p.item)?.timestamp) ?? receivedAt, false);
+      const item = asRecord(p.item);
+      applyAppServerItem(state, item, asString(item?.timestamp) ?? receivedAt, false);
+      // Preserve the subtype for the live status bar. A generic item/started
+      // makes a long compaction indistinguishable from a frozen turn.
+      if (asString(item?.type) === "contextCompaction") {
+        state.currentEventType = "contextCompaction:started";
+      }
       return state;
     }
     case "item/completed": {
-      applyAppServerItem(state, asRecord(p.item), receivedAt, true);
+      const item = asRecord(p.item);
+      applyAppServerItem(state, item, receivedAt, true);
+      if (asString(item?.type) === "contextCompaction") {
+        state.currentEventType = "contextCompaction:completed";
+      }
       return state;
     }
     case "thread/tokenUsage/updated": {
@@ -1220,7 +1756,10 @@ export function applyAppServerNotification(
       // of reporting a clean finish.
       const status = asString(turn?.status);
       const turnError = asRecord(turn?.error);
-      const failure = readableCodexErrorMessage(asString(turnError?.message));
+      const misalignment = asRecord(turnError?.misalignment);
+      const failure = readableCodexErrorMessage(
+        asString(misalignment?.detailedExplanation) ?? asString(turnError?.message),
+      );
       if (status === "failed" && failure) {
         pushItem(state, {
           id: `codex:error:${asString(turn?.id) ?? state.sequence}`,
@@ -1253,6 +1792,47 @@ export function applyAppServerNotification(
       }
       // A retrying error keeps the turn alive; a terminal one needs the operator.
       state.agentState = p.willRetry === true ? "working" : "needs_action";
+      return state;
+    }
+    case "warning":
+    case "guardianWarning":
+    case "modelProvider/authRecoveryStarted":
+    case "modelProvider/authRecoveryCompleted": {
+      const body = asString(p.message);
+      if (body) {
+        pushItem(state, {
+          id: `codex:notice:${method}:${body.slice(0, 80)}`,
+          kind: "system",
+          title: method === "guardianWarning" ? "Codex safety warning" : "Codex notice",
+          body: compactBody(body),
+          timestamp: receivedAt,
+        });
+      }
+      return state;
+    }
+    case "deprecationNotice":
+    case "configWarning": {
+      const summary = asString(p.summary) ?? "Codex configuration notice";
+      const details = asString(p.details);
+      const path = asString(p.path);
+      pushItem(state, {
+        id: `codex:notice:${method}:${summary.slice(0, 80)}`,
+        kind: "system",
+        title: method === "deprecationNotice" ? "Codex deprecation" : "Codex configuration warning",
+        body: compactBody([summary, details, path].filter(Boolean).join("\n")),
+        timestamp: receivedAt,
+      });
+      return state;
+    }
+    case "autoApprovalReview/strictReviewRequired": {
+      pushItem(state, {
+        id: `codex:strict-review:${asString(p.turnId) ?? state.sequence}`,
+        kind: "system",
+        title: "Strict review required",
+        body: "Codex requires manual review before this action can continue.",
+        timestamp: receivedAt,
+      });
+      state.agentState = "needs_action";
       return state;
     }
     default:
@@ -1334,6 +1914,13 @@ export function applyStreamJsonEvent(
     state.activeAssistantMessageId = asString(message.id);
   }
   const role = message?.role === "user" ? "user" : message?.role === "assistant" ? "assistant" : undefined;
+  if (role === "user") {
+    // Anything from the user's side — a new prompt, or a tool result because the
+    // CLI recovered on its own and kept going — means the API error we were
+    // holding did not end the turn after all. Drop it, so it can't make a later
+    // clean `result` look like a dropped connection and trigger a resend.
+    state.pendingApiError = undefined;
+  }
   if (role) {
     applyContentParts(state, event, role, message?.content, itemTimestamp);
     addUsage(state.tokenUsage, message?.usage);

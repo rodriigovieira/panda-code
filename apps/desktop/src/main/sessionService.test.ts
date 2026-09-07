@@ -27,6 +27,7 @@ function fakeStreamSession(request: SessionStartRequest): ManagedStreamSession {
     stdoutBuffer: "",
     cwd: request.cwd,
     request,
+    lastPromptAt: Date.now(),
   };
 }
 
@@ -76,6 +77,22 @@ describe("sendInput", () => {
 
     await expect(service.sendInput({ id: "sess-1", data: "hi" })).resolves.toEqual({ ok: true });
     expect(streamSessions.get("sess-1")?.process.stdin.write).toHaveBeenCalledWith("hi\n");
+  });
+
+  it("marks a live stream section working the moment its prompt is written", async () => {
+    // Claude answers a prompt with `system:init` in ~200ms but can take 10s+ to
+    // emit its first real event, and system notices don't move the state. A
+    // state left at "waiting" from the last turn's `result` therefore rode every
+    // snapshot in that window and reported the section Ready right after send.
+    const { service, deps, streamSessions } = makeService();
+    const session = fakeStreamSession(baseRequest());
+    session.state.agentState = "waiting";
+    streamSessions.set("sess-1", session);
+
+    await service.sendInput({ id: "sess-1", data: "hi" });
+
+    expect(session.state.agentState).toBe("working");
+    expect(deps.sendStreamSnapshot).toHaveBeenCalledWith("sess-1", session);
   });
 
   it("restarts a dormant section from its stored thread and delivers the prompt", async () => {
@@ -255,5 +272,103 @@ describe("switchSession", () => {
     service.switchSession({ id: "sess-1", effort: "high" });
 
     expect(resumeRequests.get("sess-1")).toMatchObject({ runtime: "codex", effort: "high", codexThreadId: "th-1" });
+  });
+});
+
+/**
+ * Hibernation is "kill the process, keep the section" — the reaper's teardown.
+ * What these guard is the difference between that and stopping a section: a
+ * hibernated section must come back on its next prompt with its conversation
+ * intact, and must never have looked like it crashed on the way out.
+ *
+ * The refusals matter as much as the successes. `hibernateSession` returning
+ * false is the last line of defence before an eviction turns into data loss,
+ * and it is the only thing standing between a section with no resume id and
+ * permanent deletion.
+ */
+describe("hibernateSession", () => {
+  it("tears down a live Claude section and keeps it resumable", () => {
+    const { service, streamSessions, resumeRequests, deps } = makeService();
+    const live = fakeStreamSession(baseRequest({ model: "opus" }));
+    live.state.claudeSessionId = "claude-abc";
+    streamSessions.set("sess-1", live);
+
+    expect(service.hibernateSession("sess-1")).toBe(true);
+
+    expect(live.process.kill).toHaveBeenCalled();
+    // Removed from the live map *before* the async close event fires, which is
+    // what makes the exit handler take its stale-exit branch — a hibernated
+    // section must not surface as a crash.
+    expect(streamSessions.has("sess-1")).toBe(false);
+    expect(resumeRequests.get("sess-1")).toMatchObject({ claudeSessionId: "claude-abc", model: "opus" });
+    expect(deps.refreshSleepBlocker).toHaveBeenCalled();
+  });
+
+  it("reports the section idle rather than exited before killing it", () => {
+    const { service, streamSessions, deps } = makeService();
+    const live = fakeStreamSession(baseRequest());
+    live.state.claudeSessionId = "claude-abc";
+    live.state.agentState = "working";
+    streamSessions.set("sess-1", live);
+
+    service.hibernateSession("sess-1");
+
+    // The phone would otherwise sit on a stale badge for a section that no
+    // longer has a process behind it.
+    expect(live.state.agentState).toBe("waiting");
+    expect(deps.sendStreamSnapshot).toHaveBeenCalledWith("sess-1", live);
+  });
+
+  it("refuses a section with no resume id instead of destroying it", () => {
+    const { service, streamSessions } = makeService();
+    const live = fakeStreamSession(baseRequest());
+    streamSessions.set("sess-1", live);
+
+    // Nothing to `--resume` from: hibernating this would lose the conversation.
+    expect(service.hibernateSession("sess-1")).toBe(false);
+    expect(live.process.kill).not.toHaveBeenCalled();
+    expect(streamSessions.has("sess-1")).toBe(true);
+  });
+
+  it("refuses a section that is not live", () => {
+    const { service } = makeService();
+    expect(service.hibernateSession("sess-1")).toBe(false);
+  });
+
+  it("resumes a hibernated section on its next prompt", async () => {
+    const { service, streamSessions, deps } = makeService();
+    const live = fakeStreamSession(baseRequest({ model: "opus" }));
+    live.state.claudeSessionId = "claude-abc";
+    streamSessions.set("sess-1", live);
+    service.hibernateSession("sess-1");
+
+    const result = await service.sendInput({ id: "sess-1", data: "still there?" });
+
+    expect(result).toEqual({ ok: true });
+    expect(deps.startStreamSession).toHaveBeenCalledWith(
+      expect.objectContaining({ claudeSessionId: "claude-abc", model: "opus" }),
+    );
+    expect(streamSessions.get("sess-1")?.process.stdin.write).toHaveBeenCalledWith("still there?\n");
+  });
+
+  it("stops a codex section's thread and stores the live thread id", () => {
+    const stop = vi.fn();
+    const { service, resumeRequests } = makeService({
+      appServer: {
+        has: (id: string) => id === "sess-1",
+        ids: () => ["sess-1"],
+        getRequest: () => baseRequest({ runtime: "codex", command: "codex" }),
+        threadId: () => "th-live",
+        sendInput: vi.fn(),
+        answerApproval: vi.fn(),
+        stop,
+        updateOverrides: vi.fn(),
+        replay: vi.fn(),
+      },
+    });
+
+    expect(service.hibernateSession("sess-1")).toBe(true);
+    expect(stop).toHaveBeenCalledWith("sess-1");
+    expect(resumeRequests.get("sess-1")).toMatchObject({ codexThreadId: "th-live" });
   });
 });

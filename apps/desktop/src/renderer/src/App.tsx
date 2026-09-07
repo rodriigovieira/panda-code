@@ -1,30 +1,47 @@
+import { agentAttentionAllowed, normalizeNotificationChannels, resolveNotificationChannels } from "../../shared/notification-channels";
+import { codexModelCatalog, codexDisplayName } from "../../shared/model-catalog";
 import {
+  Activity,
   AlertTriangle,
+  Archive,
+  ArchiveRestore,
   ArrowDown,
   Bell,
+  BookOpen,
   Bot,
   Camera,
   Check,
   ChevronDown,
   ChevronRight,
   ChevronUp,
+  Clock,
+  CloudDownload,
   Copy,
+  CornerDownRight,
   CornerUpLeft,
   Cpu,
   ExternalLink,
+  Eye,
+  EyeOff,
   FileDiff,
   Folder,
   FolderOpen,
   FolderPlus,
   Gauge,
+  FileText,
   GitBranch,
+  GitCommitHorizontal,
+  Globe,
   GripVertical,
   Image,
   Info,
+  Kanban,
   LayoutPanelLeft,
   LineChart,
   ListPlus,
+  LocateFixed,
   MessageSquare,
+  Mic,
   Pencil,
   Plus,
   RefreshCw,
@@ -39,20 +56,26 @@ import {
   StarOff,
   TerminalSquare,
   Trash2,
+  Unlink,
   User,
   Wrench,
   X,
   Zap,
 } from "lucide-react";
-import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactElement, ReactNode } from "react";
 import type {
+  AgentActivity,
+  AgentAttentionEvent,
   AgentState,
   AgentRuntime,
   AppPreferences,
   ArtifactRun,
   ConversationItem,
+  ConversationPageCursor,
   ConversationSearchResult,
+  CodexModel,
+  GroqModel,
   DesktopApi,
   ExecutionMode,
   PendingApproval,
@@ -63,29 +86,83 @@ import type {
   EditorTarget,
   SessionFileChange,
   SessionFileChanges,
+  SessionModelChange,
+  SessionMobileNotificationStatus,
+  SessionPromptHistoryEntry,
   SessionRuntimeEvent,
   SessionStatus,
   TokenUsageStats,
   UsageCostReport,
   UsageProvider,
   UsageSnapshot,
+  WorkspaceGitCommit,
+  WorkspaceGitRemote,
   WorkspaceGitStatus,
+  WorkspaceGitTreeEntry,
+  WorkspaceWorkflowRun,
 } from "../../shared/ipc";
+import { CONSERVE_HYGIENE, effectiveHygiene } from "../../shared/ipc";
 import { formatTurnDuration, formatTurnTokens, isTurnSummaryItem } from "../../shared/stream-json";
+import { canAdopt, topLevelThreads } from "../../shared/workspace-peers";
+import { SECTION_TITLE_CAP, compactSectionTitle } from "../../shared/section-title";
 import { EMPTY_BTW, mergeBtwItems, serializeBtwContext, type BtwState } from "./btw";
-import { groupQuietWork, mergeConversationItems } from "./conversation";
+import {
+  groupQuietWork,
+  hiddenTranscriptCount as computeHiddenTranscriptCount,
+  mergeConversationItems,
+  parsePeerPrompt,
+  selectTranscriptsToDrop,
+  shouldCollapsePrompt,
+  shouldReloadTranscript,
+  type FocusedFeedEntry,
+} from "./conversation";
 import { exportFilename, parseExportCommand, serializeConversation } from "./export";
 import { DRAFT_THREAD_ID, isDraftThread, isSectionWorthKeeping, persistableThreads } from "./draft";
-import { parseBodyBlocks } from "./formatting";
-import { renderInline } from "./inline";
+import { recordRendererPerf, startRendererPerf } from "./perf-client";
+import { FormattedBody } from "./FormattedBody";
+import { BacklogCardsContext, OPEN_BACKLOG_ITEM_EVENT, type BacklogCardIndex } from "./inline";
 import { buildPromptWithImageAttachments } from "./prompt";
+import { promptHistoryPreview } from "./prompt-history";
+import {
+  localFileUrl,
+  mediaFileName,
+  OPEN_MEDIA_PREVIEW_EVENT,
+  type MediaKind,
+  type MediaPreviewRequest,
+} from "./media";
+import { VideoPlayer } from "./videoPlayer";
+import { DocumentReader } from "./DocumentReader";
+import {
+  documentWordCount,
+  isReadableDocPath,
+  isTextDocumentRequest,
+  OPEN_DOCUMENT_EVENT,
+  openDocument,
+  type DocumentRequest,
+} from "./documents";
+import { backlogSessionPrompt, COLUMN_LABELS } from "../../shared/backlog";
+import { BacklogBoard } from "./Backlog";
+import { SectionTasks, TaskOverlay, useWorkspaceBacklog, type LinkedSection } from "./Task";
+import { DICTATION_FALLBACK_LOCALE, DICTATION_LOCALES } from "../../shared/dictation";
+import { DictationBar, DictationMicButton } from "./DictationBar";
+import { useDictation, useDictationTarget } from "./dictation";
+import { ScheduledTasksPanel } from "./ScheduledTasks";
+import { emptyBrowserState, type BrowserState } from "../../shared/browser";
+import { BrowserPanel, type BrowserPresentation } from "./BrowserPanel";
 import { TerminalView } from "./TerminalView";
 import { SessionCostCard, UsageReportPanel } from "./usage";
+import { MachineDrawer, useMachineStats } from "./machine";
 
 type Thread = PersistedThread;
 
 type WorkspaceGroup = {
   cwd: string;
+  /**
+   * The group's TOP-LEVEL rows only. A sub-thread is not one of these: it is
+   * reached through `childrenById` under the section that opened it, so paging
+   * ("show 5 more") counts pieces of work rather than counting a busy
+   * orchestrator's children against the sections next to it.
+   */
   threads: Thread[];
   lastActiveAt: string;
 };
@@ -149,6 +226,21 @@ type ComposerShortcutHint = {
   description: string;
 };
 
+/**
+ * A backlog card as the composer's `#` menu shows it.
+ *
+ * Flattened out of the board on purpose: the composer needs a number, a title
+ * and enough context to pick between two cards with similar names, and giving
+ * it the whole `BacklogItem` would re-render the field on every edit an agent
+ * makes to a description nobody is looking at.
+ */
+type ComposerCard = {
+  number: number;
+  title: string;
+  summary: string;
+  column: string;
+};
+
 type LaunchSettings = {
   runtime: AgentRuntime;
   model: string;
@@ -159,6 +251,11 @@ type LaunchSettings = {
 type ImagePreview = {
   path: string;
   url: string;
+  /**
+   * Images came first; a recording reaches the same viewer now that an agent
+   * can put an mp4 in its reply, so the dialog has to know which tag to use.
+   */
+  kind: MediaKind;
 };
 
 type TerminalTab = {
@@ -189,6 +286,15 @@ type RunInspectorInfo = {
 };
 
 const STORAGE_KEY = "panda-code.threads.v1";
+/**
+ * Persisting the section store costs a full re-serialization of every section —
+ * measured at ~62 ms in the renderer plus the same again in main, for a store
+ * that had reached 7.8 MB. Unbatched, that ran on every `threads` change, and
+ * `localStorage.setItem` is synchronous, so the UI thread ate all of it. A short
+ * trailing debounce collapses a burst of updates into one write; the pending
+ * write is flushed on teardown so nothing is lost if the window closes first.
+ */
+const THREADS_PERSIST_DEBOUNCE_MS = 500;
 const DEFAULT_COMMAND_KEY = "panda-code.default-command.v1";
 const DEFAULT_RUNTIME_KEY = "panda-code.default-runtime.v1";
 const DEFAULT_MODEL_KEY = "panda-code.default-model.v1";
@@ -197,10 +303,25 @@ const DEFAULT_PERMISSION_MODE_KEY = "panda-code.default-permission-mode.v1";
 const DEFAULT_CODEX_MODEL_KEY = "panda-code.default-codex-model.v1";
 const DEFAULT_CODEX_EFFORT_KEY = "panda-code.default-codex-effort.v1";
 const DEFAULT_CODEX_SANDBOX_KEY = "panda-code.default-codex-sandbox.v1";
+const DEFAULT_GROQ_MODEL_KEY = "panda-code.default-groq-model.v1";
+const LEGACY_CODEX_REVIEW_MODEL = "codex-auto-review";
 const USAGE_PROVIDER_KEY = "panda-code.usage-provider.v1";
 const EXPANDED_WORKSPACES_KEY = "panda-code.expanded-workspaces.v1";
+// View preference, mirrored to the relay so a paired phone's list agrees:
+// hides a section from its workspace group without stopping or deleting it.
+// The localStorage copy is the offline-first cache; setSessionArchived/
+// onSessionArchived keep it in sync with mobile's own archive set.
+const ARCHIVED_THREADS_KEY = "panda-code.archived-threads.v1";
+// The starred list folds like a workspace group does. Stores the COLLAPSED
+// state, so the default — and anything unparseable — is the list showing.
+const STARRED_COLLAPSED_KEY = "panda-code.starred-collapsed.v1";
 const WORKSPACE_ORDER_KEY = "panda-code.workspace-order.v1";
+// Parents whose sub-threads are folded away. Stores the COLLAPSED ones, so the
+// default for a section that has just delegated is to show what it delegated.
+const COLLAPSED_SUBTHREADS_KEY = "panda-code.collapsed-subthreads.v1";
 const NOTIFICATIONS_KEY = "panda-code.notifications.v1";
+const AGENT_NOTIFICATIONS_KEY = "panda-code.agent-notifications.v1";
+const SESSION_NOTIFICATION_CHANNELS_KEY = "panda-code.session-notification-channels.v1";
 // Opt-in quiet transcript: only your prompts, the agent's replies, and the
 // final answer stay in the feed; everything else folds into one work group.
 const FOCUS_MODE_KEY = "panda-code.focus-mode.v1";
@@ -231,6 +352,29 @@ function clampBtwWidth(value: number): number {
   return Math.min(BTW_MAX_WIDTH, Math.max(BTW_MIN_WIDTH, Math.round(value)));
 }
 
+// The browser is the same shape of thing as /btw — a column beside the
+// conversation rather than a band under it — so it gets the same treatment.
+// Wider by default, because it holds real web pages rather than chat.
+const BROWSER_WIDTH_KEY = "panda-code.browser-width.v1";
+const BROWSER_MIN_WIDTH = 360;
+const BROWSER_DEFAULT_WIDTH = 560;
+
+/**
+ * The conversation never gets squeezed out of its own window.
+ *
+ * A flat maximum is not enough: on a small window a "reasonable" browser width
+ * can still leave nothing to talk to the agent in, and then the only way back is
+ * a resizer the user can no longer reach. The ceiling is whatever the window can
+ * spare after the conversation keeps this much.
+ */
+const CONVERSATION_MIN_WIDTH = 420;
+
+function clampBrowserWidth(value: number): number {
+  const available = (typeof window === "undefined" ? 1440 : window.innerWidth) - CONVERSATION_MIN_WIDTH;
+  const max = Math.max(BROWSER_MIN_WIDTH, available);
+  return Math.min(max, Math.max(BROWSER_MIN_WIDTH, Math.round(value)));
+}
+
 function readStorageItem(key: string): string | null {
   const value = localStorage.getItem(key);
   if (value !== null) {
@@ -245,38 +389,60 @@ const USAGE_REFRESH_INTERVAL_MS = 5 * 60_000;
 type SelectorOption = { value: string; label: string; hint: string; badge?: string };
 
 const RUNTIME_OPTIONS: Array<{ value: AgentRuntime; label: string; hint: string }> = [
-  { value: "claude", label: "Claude", hint: "Claude Code stream-json sessions" },
-  { value: "codex", label: "Codex", hint: "OpenAI Codex sessions" },
+  { value: "claude", label: "Claude", hint: "Run locally with Claude Code" },
+  { value: "codex", label: "Codex", hint: "Run locally with Codex" },
+  { value: "groq", label: "Groq", hint: "Direct Groq API sessions" },
+];
+const GROQ_MODEL_OPTIONS: SelectorOption[] = [
+  { value: "llama-3.3-70b-versatile", label: "Llama 3.3 70B", hint: "General coding and reasoning" },
+  { value: "llama-3.1-8b-instant", label: "Llama 3.1 8B", hint: "Fast, lightweight responses", badge: "Fast" },
+  { value: "openai/gpt-oss-120b", label: "GPT OSS 120B", hint: "Large open-weight model", badge: "Recommended" },
 ];
 const CLAUDE_MODEL_OPTIONS: SelectorOption[] = [
   { value: "", label: "Default", hint: "Use the Claude Code default for this account", badge: "Default" },
-  { value: "sonnet", label: "Sonnet", hint: "Daily coding, reviews, and scoped feature work", badge: "Balanced" },
-  { value: "claude-opus-5", label: "Opus 5.0", hint: "Latest Opus — hard reasoning, migrations, and larger refactors", badge: "Opus 5.0" },
-  { value: "claude-opus-4-8", label: "Opus 4.8", hint: "Previous-generation Opus — pin when you want 4.8 specifically", badge: "Opus 4.8" },
+  { value: "sonnet", label: "Sonnet", hint: "Latest Sonnet for daily coding, reviews, and features", badge: "Balanced" },
+  { value: "opus", label: "Opus", hint: "Latest Opus for complex reasoning and larger refactors", badge: "Advanced" },
   { value: "best", label: "Best available", hint: "Fable where available, otherwise latest Opus", badge: "Auto" },
-  { value: "fable", label: "Fable", hint: "Long-running, ambiguous, highly autonomous work", badge: "Max" },
+  { value: "fable", label: "Fable", hint: "Latest Fable (5.1 on current Claude Code), where available", badge: "Deep work" },
   { value: "opusplan", label: "Opus plan", hint: "Opus for planning, Sonnet for execution", badge: "Plan" },
   { value: "sonnet[1m]", label: "Sonnet 1M", hint: "Long-context Sonnet sessions where available", badge: "1M" },
   { value: "opus[1m]", label: "Opus 1M", hint: "Long-context Opus sessions where available", badge: "1M" },
   { value: "haiku", label: "Haiku", hint: "Quick, simple prompts and low-latency checks", badge: "Fast" },
+  { value: "claude-opus-5", label: "Opus 5", hint: "Latest Opus — hard reasoning, migrations, and larger refactors", badge: "Pinned" },
+  { value: "claude-opus-4-8", label: "Opus 4.8", hint: "Previous-generation Opus — pin when you want 4.8 specifically", badge: "Opus 4.8" },
 ];
-const CODEX_MODEL_OPTIONS: SelectorOption[] = [
-  { value: "", label: "Default", hint: "Uses your Codex default model", badge: "Default" },
-  { value: "codex-auto-review", label: "Auto Review", hint: "Codex CLI managed model for review-style coding" },
-];
+const CODEX_DEFAULT_MODEL_OPTION: SelectorOption = {
+  value: "",
+  label: "Default",
+  hint: "Uses your Codex default model",
+  badge: "Default",
+};
 
-// The Claude models surfaced as always-visible pills (in this display order);
-// everything else lives behind the "More" disclosure. Codex has few enough
-// models that all of them stay visible.
-const CLAUDE_PRIMARY_MODEL_VALUES = ["claude-opus-5", "claude-opus-4-8", "sonnet", "fable", ""];
-
-function modelOptions(runtime: AgentRuntime): SelectorOption[] {
-  return runtime === "codex" ? CODEX_MODEL_OPTIONS : CLAUDE_MODEL_OPTIONS;
+function codexModelOptions(models: CodexModel[]): SelectorOption[] {
+  return [
+    CODEX_DEFAULT_MODEL_OPTION,
+    ...codexModelCatalog(models).map((model) => ({
+      value: model.id,
+      label: codexDisplayName(model),
+      hint: model.description || `Use ${model.displayName}`,
+      badge: model.isDefault ? "Recommended" : model.id === "gpt-6-astra" && !models.some((entry) => entry.id === model.id) ? "Check access" : undefined,
+    })),
+  ];
 }
 
-function modelLabel(runtime: AgentRuntime, value: string | undefined): string {
+function modelOptions(runtime: AgentRuntime, codexModels: CodexModel[] = [], groqModels: GroqModel[] = []): SelectorOption[] {
+  if (runtime === "codex") return codexModelOptions(codexModels);
+  if (runtime === "groq") {
+    return groqModels.length > 0
+      ? groqModels.map((model) => ({ value: model.id, label: model.displayName, hint: model.description }))
+      : GROQ_MODEL_OPTIONS;
+  }
+  return CLAUDE_MODEL_OPTIONS;
+}
+
+function modelLabel(runtime: AgentRuntime, value: string | undefined, codexModels: CodexModel[] = []): string {
   const trimmed = value?.trim() ?? "";
-  return modelOptions(runtime).find((option) => option.value === trimmed)?.label ?? (trimmed || "Default");
+  return modelOptions(runtime, codexModels).find((option) => option.value === trimmed)?.label ?? (trimmed || "Default");
 }
 
 const CLAUDE_EFFORT_OPTIONS: Array<{ value: string; label: string; hint: string }> = [
@@ -296,13 +462,36 @@ const CODEX_EFFORT_OPTIONS: Array<{ value: string; label: string; hint: string }
   { value: "xhigh", label: "X-High", hint: "Hard multi-step work" },
 ];
 
-function effortOptions(runtime: AgentRuntime): Array<{ value: string; label: string; hint: string }> {
-  return runtime === "codex" ? CODEX_EFFORT_OPTIONS : CLAUDE_EFFORT_OPTIONS;
+function effortOptions(
+  runtime: AgentRuntime,
+  model = "",
+  codexModels: CodexModel[] = [],
+): Array<{ value: string; label: string; hint: string }> {
+  if (runtime !== "codex") return CLAUDE_EFFORT_OPTIONS;
+  const selected = model ? codexModelCatalog(codexModels).find((entry) => entry.id === model) : codexModels.find((entry) => entry.isDefault);
+  if (!selected || selected.supportedReasoningEfforts.length === 0) return CODEX_EFFORT_OPTIONS;
+  const defaultEffort = selected.supportedReasoningEfforts.find(
+    (effort) => effort.value === selected.defaultReasoningEffort,
+  );
+  return [
+    {
+      value: "",
+      label: "Default",
+      hint: defaultEffort
+        ? `Uses ${selected.displayName}'s ${defaultEffort.value === "xhigh" ? "X-High" : defaultEffort.value} reasoning — ${defaultEffort.description}`
+        : `Uses ${selected.displayName}'s default reasoning`,
+    },
+    ...selected.supportedReasoningEfforts.map((effort) => ({
+      value: effort.value,
+      label: effort.value === "xhigh" ? "X-High" : effort.value.charAt(0).toUpperCase() + effort.value.slice(1),
+      hint: effort.description,
+    })),
+  ];
 }
 
-function effortLabel(runtime: AgentRuntime, value: string | undefined): string {
+function effortLabel(runtime: AgentRuntime, value: string | undefined, model = "", codexModels: CodexModel[] = []): string {
   const trimmed = value?.trim() ?? "";
-  return effortOptions(runtime).find((option) => option.value === trimmed)?.label ?? (trimmed || "Default");
+  return effortOptions(runtime, model, codexModels).find((option) => option.value === trimmed)?.label ?? (trimmed || "Default");
 }
 
 const CLAUDE_PERMISSION_OPTIONS: Array<{ value: string; label: string; hint: string }> = [
@@ -367,7 +556,7 @@ const COMPOSER_SLASH_COMMANDS: ComposerSlashCommand[] = [
     label: "/prompts",
     insertText: "/prompts",
     description: "Show prompts sent and queued in this session",
-    hint: "Useful for reviewing what was asked",
+    hint: "Also on ⌘⇧P",
     keywords: ["prompt", "prompts", "history", "queue"],
     runImmediately: true,
   },
@@ -446,22 +635,24 @@ const COMPOSER_SHORTCUT_HINTS: ComposerShortcutHint[] = [
   { keys: "Enter", description: "Send now, or queue while the agent is working" },
   { keys: "Cmd/Ctrl Enter", description: "Send immediately into the active turn" },
   { keys: "Cmd/Ctrl J", description: "Toggle the terminal" },
+  { keys: "Cmd/Ctrl Shift J", description: "Toggle the browser" },
   { keys: "Cmd/Ctrl F", description: "Search conversations" },
+  { keys: "Cmd/Ctrl B", description: "Show or hide the sidebar" },
+  { keys: "Cmd/Ctrl Shift B", description: "Open this workspace's backlog" },
+  { keys: "Cmd/Ctrl Shift G", description: "Git status for this workspace" },
+  { keys: "Cmd/Ctrl Shift D", description: "Dictate hands-free — press again to stop" },
+  { keys: "Hold Option Space", description: "Dictate while held (push to talk)" },
   { keys: "Cmd/Ctrl 1-9", description: "Switch sections from the sidebar order" },
+  { keys: "Cmd/Ctrl [", description: "Back to the previously visited section" },
+  { keys: "Cmd/Ctrl ]", description: "Forward again through visited sections" },
+  { keys: "Cmd/Ctrl ,", description: "Open Settings" },
 ];
 
 function agentDisplayName(runtime: AgentRuntime | undefined): string {
-  return runtime === "codex" ? "Codex" : "Claude";
+  return runtime === "codex" ? "Codex" : runtime === "groq" ? "Groq" : "Claude";
 }
 
-// ---------------------------------------------------------------------------
-// Model selector — a single rounded card that replaces the old row of four
-// dropdown buttons (runtime / model / effort / permissions). Every dimension is
-// a discrete "slider": a track with evenly-spaced stops and a draggable thumb
-// that snaps to the nearest option. Provider comes first; a fifth speed slider
-// appears only for Codex. Dragging is committed on release so a session only
-// restarts once per change.
-// ---------------------------------------------------------------------------
+// Shared session configuration controls. Only reasoning is ordinal.
 
 type SelectorSliderOption = { value: string; label: string; hint: string; badge?: string };
 
@@ -625,140 +816,89 @@ function PillGroup(props: {
   );
 }
 
-// The model dimension of the selector: pills for the common models, a "More"
-// disclosure for the rest, and a free-text escape hatch for anything off-list.
-// Shared by the per-session selector popover and the per-provider defaults in
-// Settings, so both offer the same choices.
+// Shared model browser for session details, quick start, and provider defaults.
 function ModelPicker(props: {
   runtime: AgentRuntime;
   model: string;
+  codexModels: CodexModel[];
+  groqModels?: GroqModel[];
   onSelect: (value: string) => void;
 }): ReactElement {
-  const { runtime, model, onSelect } = props;
-  const isCodex = runtime === "codex";
+  const { runtime, model, codexModels, groqModels = [], onSelect } = props;
+  const [query, setQuery] = useState("");
   const [showCustom, setShowCustom] = useState(false);
-  const [showMore, setShowMore] = useState(false);
   const [customDraft, setCustomDraft] = useState("");
-
-  // Represent an off-list model as a synthetic "Custom" entry so it still shows
-  // as selected. Split into always-visible "primary" pills and the rest, which
-  // live behind the "More" disclosure.
-  const baseModels = modelOptions(runtime);
-  const allModels: SelectorSliderOption[] =
-    model && !baseModels.some((option) => option.value === model)
-      ? [...baseModels, { value: model, label: model, hint: "Custom model", badge: "Custom" }]
-      : baseModels;
-  const primaryModels: SelectorSliderOption[] = isCodex
-    ? allModels
-    : CLAUDE_PRIMARY_MODEL_VALUES.map((value) =>
-        allModels.find((option) => option.value === value),
-      ).filter((option): option is SelectorSliderOption => Boolean(option));
-  const secondaryModels = allModels.filter((option) => !primaryModels.includes(option));
-  const activeModel = allModels.find((option) => option.value === model) ?? allModels[0];
-  const activeIsSecondary = secondaryModels.some((option) => option.value === model);
-  // Keep the selected model visible: force the disclosure open when the active
-  // model lives in the secondary set (the user can't hide their own selection).
-  const moreOpen = showMore || activeIsSecondary;
-
-  const submitCustom = (): void => {
-    const next = customDraft.trim();
-    if (!next) return;
-    onSelect(next);
-    setCustomDraft("");
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { setQuery(""); setShowCustom(false); }, [runtime]);
+  const options = [...modelOptions(runtime, codexModels, groqModels)];
+  if (model && !options.some((option) => option.value === model)) {
+    options.push({ value: model, label: model, hint: "Saved custom model", badge: "Custom" });
+  }
+  const filtered = options.filter((option) =>
+    `${option.label} ${option.value} ${option.hint}`.toLowerCase().includes(query.trim().toLowerCase()),
+  );
+  const applyCustom = (): void => {
+    if (!customDraft.trim()) return;
+    onSelect(customDraft.trim());
     setShowCustom(false);
+    setQuery("");
   };
-
   return (
-    <div className="selector-group" style={{ "--slider-accent": "#c9a24a" } as CSSProperties}>
+    <div className="selector-group model-browser">
       <div className="selector-slider-head">
-        <span className="selector-slider-label">
-          <span className="selector-slider-icon">
-            <Cpu size={13} aria-hidden="true" />
-          </span>
-          Model
-        </span>
-        {activeModel?.badge ? (
-          <span className="selector-slider-value">
-            <em>{activeModel.badge}</em>
-          </span>
-        ) : null}
+        <span className="selector-slider-label"><Cpu size={13} aria-hidden="true" />Model</span>
+        <span className="model-browser-count">{options.length} options</span>
       </div>
-      <div className="selector-pills" role="radiogroup" aria-label="Model">
-        {primaryModels.map((option) => (
-          <button
-            key={option.value || "default"}
-            type="button"
-            role="radio"
-            aria-checked={option.value === model}
-            className={`selector-pill ${option.value === model ? "selected" : ""}`}
-            title={option.hint}
-            onClick={() => onSelect(option.value)}
-          >
-            {option.label}
+      <label className="model-browser-search">
+        <Search size={14} aria-hidden="true" />
+        <input aria-label={`Search ${agentDisplayName(runtime)} models`} placeholder="Find a model…"
+          value={query} onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              listRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+            }
+          }} />
+        {query ? <button type="button" aria-label="Clear model search" onClick={() => setQuery("")}><X size={12} /></button> : null}
+      </label>
+      <div ref={listRef} className="codex-model-options" role="radiogroup" aria-label={`${agentDisplayName(runtime)} model`}
+        onKeyDown={(event) => {
+          const buttons = Array.from(listRef.current?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+          const index = buttons.indexOf(event.target as HTMLButtonElement);
+          if (index < 0 || !buttons.length) return;
+          let next = index;
+          if (event.key === "ArrowDown" || event.key === "ArrowRight") next = (index + 1) % buttons.length;
+          else if (event.key === "ArrowUp" || event.key === "ArrowLeft") next = (index - 1 + buttons.length) % buttons.length;
+          else if (event.key === "Home") next = 0;
+          else if (event.key === "End") next = buttons.length - 1;
+          else return;
+          event.preventDefault();
+          buttons[next]?.focus();
+        }}>
+        {filtered.map((option) => (
+          <button key={option.value || "default"} type="button" role="radio" aria-checked={option.value === model}
+            className={`codex-model-option ${option.value === model ? "selected" : ""}`}
+            onClick={() => onSelect(option.value)}>
+            <span className="codex-model-copy">
+              <span className="codex-model-title"><strong>{option.label}</strong>{option.badge ? <em>{option.badge}</em> : null}</span>
+              <span className="codex-model-description">{option.hint}</span>
+            </span>
+            <span className="codex-model-check" aria-hidden="true">{option.value === model ? <Check size={13} /> : null}</span>
           </button>
         ))}
-        {secondaryModels.length > 0 ? (
-          <button
-            type="button"
-            className={`selector-pill selector-pill-more ${moreOpen ? "active" : ""}`}
-            aria-expanded={moreOpen}
-            onClick={() => setShowMore((open) => !open)}
-          >
-            More
-            <ChevronDown size={12} aria-hidden="true" />
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className={`selector-pill selector-pill-icon ${showCustom ? "active" : ""}`}
-          onClick={() => {
-            setCustomDraft(model);
-            setShowCustom((open) => !open);
-          }}
-          title="Enter a custom model"
-          aria-label="Enter a custom model"
-        >
-          <Pencil size={12} aria-hidden="true" />
-        </button>
+        {!filtered.length ? <p className="model-browser-empty">No matching models. Try another name or enter a custom ID.</p> : null}
       </div>
-      {moreOpen && secondaryModels.length > 0 ? (
-        <div className="selector-pills selector-pills-secondary" role="radiogroup" aria-label="More models">
-          {secondaryModels.map((option) => (
-            <button
-              key={option.value || "default"}
-              type="button"
-              role="radio"
-              aria-checked={option.value === model}
-              className={`selector-pill ${option.value === model ? "selected" : ""}`}
-              title={option.hint}
-              onClick={() => onSelect(option.value)}
-            >
-              {option.label}
-            </button>
-          ))}
-        </div>
-      ) : null}
-      {showCustom ? (
-        <div className="selector-custom">
-          <input
-            value={customDraft}
-            autoFocus
-            spellCheck={false}
-            placeholder={isCodex ? "gpt-..." : "claude-... or alias"}
-            onChange={(event) => setCustomDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                submitCustom();
-              }
-            }}
-          />
-          <button type="button" className="selector-custom-apply" onClick={submitCustom}>
-            Apply
-          </button>
-        </div>
-      ) : null}
-      <p className="selector-slider-hint">{activeModel?.hint}</p>
+      {runtime === "codex" && !codexModels.length ? <p className="selector-slider-hint">No catalog received from Codex yet. Use its default or enter a model ID available to your account.</p> : null}
+      <button type="button" className="codex-model-custom" aria-expanded={showCustom}
+        onClick={() => { setCustomDraft(query.trim() || model); setShowCustom(!showCustom); }}>
+        <Plus size={12} aria-hidden="true" />Use a custom model
+      </button>
+      {showCustom ? <div className="selector-custom">
+        <input aria-label="Custom model ID" value={customDraft} autoFocus spellCheck={false} placeholder="Model ID or alias"
+          onChange={(event) => setCustomDraft(event.target.value)}
+          onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); applyCustom(); } }} />
+        <button type="button" className="selector-custom-apply" disabled={!customDraft.trim()} onClick={applyCustom}>Apply</button>
+      </div> : null}
     </div>
   );
 }
@@ -767,6 +907,8 @@ function ModelSelector(props: {
   runtime: AgentRuntime;
   model: string;
   effort: string;
+  codexModels: CodexModel[];
+  groqModels?: GroqModel[];
   permissionMode: string;
   open: boolean;
   onToggle: (open: boolean) => void;
@@ -775,9 +917,20 @@ function ModelSelector(props: {
   onSelectEffort: (value: string) => void;
   onSelectPermission: (value: string) => void;
 }): ReactElement {
-  const { runtime, model, effort, permissionMode, open, onToggle } = props;
+  const { runtime, model, effort, permissionMode, codexModels, open, onToggle } = props;
   const isCodex = runtime === "codex";
   const anchorRef = useRef<HTMLDivElement>(null);
+  const [availableHeight, setAvailableHeight] = useState(620);
+  useLayoutEffect(() => {
+    if (!open) return;
+    const measure = (): void => {
+      const bottom = anchorRef.current?.getBoundingClientRect().bottom ?? 0;
+      setAvailableHeight(Math.max(120, window.innerHeight - bottom - 24));
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [open]);
 
   // Capture-phase so the selector still dismisses inside containers (e.g. the
   // quick-start dialog) that stopPropagation before clicks reach window.
@@ -788,11 +941,12 @@ function ModelSelector(props: {
         onToggle(false);
       }
     };
+    anchorRef.current?.querySelector<HTMLInputElement>(".model-browser-search input")?.focus();
     document.addEventListener("pointerdown", handlePointerDown, true);
     return () => document.removeEventListener("pointerdown", handlePointerDown, true);
   }, [open, onToggle]);
 
-  const summary = `${modelLabel(runtime, model)} · ${effortLabel(runtime, effort)}`;
+  const summary = modelLabel(runtime, model, codexModels) + (runtime === "groq" ? "" : ` · ${effortLabel(runtime, effort, model, codexModels)}`);
 
   return (
     <div className="model-select-anchor" ref={anchorRef}>
@@ -813,7 +967,8 @@ function ModelSelector(props: {
         <ChevronDown size={13} aria-hidden="true" />
       </button>
       {open ? (
-        <div className="selector-card" role="dialog" aria-label="Session model" onClick={(event) => event.stopPropagation()}>
+        <div className="selector-card" style={{ maxHeight: availableHeight }} role="dialog" aria-label="Session model" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); onToggle(false); anchorRef.current?.querySelector<HTMLButtonElement>("button")?.focus(); } }}>
+          <div className="model-panel-heading"><div><strong>Session configuration</strong><span>Changes apply to this section</span></div><button type="button" className="ghost-icon-button" aria-label="Close model selector" onClick={() => onToggle(false)}><X size={15} /></button></div>
           <PillGroup
             icon={<Bot size={13} aria-hidden="true" />}
             label="Provider"
@@ -822,15 +977,15 @@ function ModelSelector(props: {
             value={runtime}
             onSelect={(value) => props.onSelectRuntime(value as AgentRuntime)}
           />
-          <ModelPicker runtime={runtime} model={model} onSelect={props.onSelectModel} />
-          <SelectorSlider
+          <ModelPicker runtime={runtime} model={model} codexModels={codexModels} groqModels={props.groqModels} onSelect={props.onSelectModel} />
+          {runtime !== "groq" ? <SelectorSlider
             icon={<Zap size={13} aria-hidden="true" />}
             label={isCodex ? "Reasoning" : "Effort"}
             accent="#66c98b"
-            options={effortOptions(runtime)}
+            options={effortOptions(runtime, model, codexModels)}
             value={effort}
             onSelect={props.onSelectEffort}
-          />
+          /> : null}
           <PillGroup
             icon={<ShieldCheck size={13} aria-hidden="true" />}
             label={isCodex ? "Sandbox" : "Permissions"}
@@ -855,6 +1010,8 @@ function RuntimeDefaults(props: {
   isDefault: boolean;
   model: string;
   effort: string;
+  codexModels: CodexModel[];
+  groqModels?: GroqModel[];
   permissionMode: string;
   onSelectModel: (value: string) => void;
   onSelectEffort: (value: string) => void;
@@ -867,15 +1024,15 @@ function RuntimeDefaults(props: {
         <h3>{agentDisplayName(props.runtime)} defaults</h3>
         {props.isDefault ? <span className="runtime-defaults-badge">Default provider</span> : null}
       </header>
-      <ModelPicker runtime={props.runtime} model={props.model} onSelect={props.onSelectModel} />
-      <SelectorSlider
+      <ModelPicker runtime={props.runtime} model={props.model} codexModels={props.codexModels} groqModels={props.groqModels} onSelect={props.onSelectModel} />
+      {props.runtime !== "groq" ? <SelectorSlider
         icon={<Zap size={13} aria-hidden="true" />}
         label={isCodex ? "Reasoning" : "Effort"}
         accent="#66c98b"
-        options={effortOptions(props.runtime)}
+        options={effortOptions(props.runtime, props.model, props.codexModels)}
         value={props.effort}
         onSelect={props.onSelectEffort}
-      />
+      /> : null}
       <PillGroup
         icon={<ShieldCheck size={13} aria-hidden="true" />}
         label={isCodex ? "Sandbox" : "Permissions"}
@@ -894,7 +1051,7 @@ function RuntimeDefaults(props: {
 // a notification or dock badge.
 const FINISH_SETTLE_MS = 4_000;
 const INITIAL_VISIBLE_SESSIONS = 5;
-const VISIBLE_SESSIONS_STEP = 10;
+const VISIBLE_SESSIONS_STEP = 5;
 const EMPTY_TOKEN_USAGE: TokenUsageStats = {
   inputTokens: 0,
   outputTokens: 0,
@@ -912,6 +1069,7 @@ const EMPTY_USAGE_COST_REPORT: UsageCostReport = {
 };
 const EMPTY_ATTACHMENTS: ImageAttachment[] = [];
 const EMPTY_QUEUED: QueuedPrompt[] = [];
+const EMPTY_CONVERSATION: ConversationItem[] = [];
 const EMPTY_ARTIFACTS: ArtifactRun[] = [];
 
 const fallbackApi: DesktopApi = {
@@ -920,10 +1078,17 @@ const fallbackApi: DesktopApi = {
   logEvent: () => Promise.resolve(),
   setBadgeCount: () => Promise.resolve(),
   focusWindow: () => Promise.resolve(),
+  perfSnapshot: () => Promise.resolve({ since: Date.now(), operations: [], slowest: [] }),
+  perfReset: () => Promise.resolve(),
+  reportPerf: () => Promise.resolve(),
   loadThreads: () => Promise.resolve([]),
   saveThreads: () => Promise.resolve(),
   setSessionStarred: () => Promise.resolve(),
+  setSessionArchived: () => Promise.resolve(),
+  syncLocalArchivedThreads: () => Promise.resolve(),
+  setSessionParent: () => Promise.resolve(),
   setSessionTitle: () => Promise.resolve(),
+  setUnsentDraftSessions: () => Promise.resolve(),
   listSessions: () => Promise.resolve([]),
   savePastedImage: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
   exportConversation: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
@@ -937,6 +1102,10 @@ const fallbackApi: DesktopApi = {
       fetchedAt: new Date().toISOString(),
       unavailableReason: "Usage unavailable.",
     }),
+  listCodexModels: () => Promise.resolve([]),
+  getGroqApiKeyConfigured: () => Promise.resolve(false),
+  setGroqApiKey: () => Promise.resolve(false),
+  listGroqModels: () => Promise.resolve([]),
   loadUsageCost: () => Promise.resolve(EMPTY_USAGE_COST_REPORT),
   startSession: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
   sendInput: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
@@ -944,6 +1113,7 @@ const fallbackApi: DesktopApi = {
   getPathForFile: () => "",
   resizeSession: () => Promise.resolve(),
   stopSession: () => Promise.resolve(),
+  killSectionCommands: () => Promise.resolve({ killed: 0, names: [] }),
   startTerminal: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
   terminalInput: () => Promise.resolve(),
   resizeTerminal: () => Promise.resolve(),
@@ -951,12 +1121,69 @@ const fallbackApi: DesktopApi = {
   listTerminals: () => Promise.resolve([]),
   onTerminalData: () => () => undefined,
   onTerminalExit: () => () => undefined,
+  onAgentAttention: () => () => undefined,
+  browserState: () => Promise.resolve(emptyBrowserState()),
+  browserOpen: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
+  browserNavigate: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
+  browserCloseTab: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
+  browserSelectTab: () => Promise.resolve(),
+  browserSetActiveThread: () => Promise.resolve(),
+  browserSetFloating: () => Promise.resolve(),
+  browserSetPanelVisible: () => Promise.resolve(),
+  browserFocusThread: () => Promise.resolve(),
+  onBrowserFocusThread: () => () => undefined,
+  browserBack: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
+  browserForward: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
+  browserReload: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
+  browserAttach: () => Promise.resolve(),
+  browserReport: () => Promise.resolve(),
+  browserSetNoteHidden: () => Promise.resolve(false),
+  browserResolveNote: () => Promise.resolve({ ok: false }),
+  browserActivity: () => Promise.resolve([]),
+  onBrowserState: () => () => undefined,
+  onBrowserActivity: () => () => undefined,
+  onBrowserReveal: () => () => undefined,
+  browserCaptureStageReady: () => Promise.resolve(),
+  onBrowserCaptureStage: () => () => undefined,
+  onBrowserCaptureRelease: () => () => undefined,
   searchConversations: () => Promise.resolve([]),
-  loadPreferences: () => Promise.resolve({ quickStartShortcut: "", hideDockIcon: false, notificationsPaused: false, remoteKeepAwake: "off", preferredEditor: "cursor" }),
-  savePreferences: () => Promise.resolve({ quickStartShortcut: "", hideDockIcon: false, notificationsPaused: false, remoteKeepAwake: "off", preferredEditor: "cursor" }),
+  loadPreferences: () =>
+    Promise.resolve({
+      quickStartShortcut: "",
+      hideDockIcon: false,
+      notificationsPaused: false,
+      remoteKeepAwake: "off",
+      conserveMode: false,
+      preferredEditor: "cursor",
+      relayUrl: "",
+      dictationLocale: DICTATION_FALLBACK_LOCALE,
+      maxLiveSessions: 6,
+      idleSessionTimeoutMinutes: 30,
+      transcriptWindowSize: 2000,
+      retainedTranscripts: 12,
+    }),
+  savePreferences: () =>
+    Promise.resolve({
+      quickStartShortcut: "",
+      hideDockIcon: false,
+      notificationsPaused: false,
+      remoteKeepAwake: "off",
+      conserveMode: false,
+      preferredEditor: "cursor",
+      relayUrl: "",
+      dictationLocale: DICTATION_FALLBACK_LOCALE,
+      maxLiveSessions: 6,
+      idleSessionTimeoutMinutes: 30,
+      transcriptWindowSize: 2000,
+      retainedTranscripts: 12,
+    }),
   getRemotePairing: () => Promise.resolve({ status: "disabled", message: "Remote relay is unavailable." }),
   refreshRemotePairing: () => Promise.resolve({ status: "disabled", message: "Remote relay is unavailable." }),
   listRemotePairedDevices: () => Promise.resolve([]),
+  setRemoteMobileNotifications: () => Promise.resolve([]),
+  setNotificationChannels: () => fallbackApi.loadPreferences(),
+  getSessionMobileNotifications: () => Promise.resolve({ available: false, phoneCount: 0, subscribedPhones: 0 }),
+  setSessionMobileNotifications: () => Promise.resolve({ available: false, phoneCount: 0, subscribedPhones: 0 }),
   revokeRemotePairedDevice: () => Promise.resolve([]),
   onRemotePairingChanged: () => () => undefined,
   onPreferencesChanged: () => () => undefined,
@@ -969,17 +1196,65 @@ const fallbackApi: DesktopApi = {
   onPromptSubmitted: () => () => undefined,
   onSessionStarted: () => () => undefined,
   onSessionStarred: () => () => undefined,
+  onSessionArchived: () => () => undefined,
+  onSessionRemotePrompt: () => () => undefined,
   onSessionExit: () => () => undefined,
+  onSessionHibernated: () => () => undefined,
   btwAsk: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
   btwClear: () => Promise.resolve(),
   onBtwData: () => () => undefined,
   listArtifacts: () => Promise.resolve([]),
   revealPath: () => Promise.resolve(false),
   loadWorkspaceGit: () =>
-    Promise.resolve({ isRepo: false, changes: [], stashes: [], worktrees: [], branches: [], folders: [] }),
+    Promise.resolve({ isRepo: false, remotes: [], changes: [], stashes: [], worktrees: [], branches: [], folders: [] }),
+  fetchWorkspaceGitRemotes: () =>
+    Promise.resolve({ isRepo: false, remotes: [], changes: [], stashes: [], worktrees: [], branches: [], folders: [] }),
+  loadWorkspaceGitLog: () => Promise.resolve({ isRepo: false, commits: [], skip: 0, hasMore: false }),
+  loadWorkspaceWorkflowRuns: () => Promise.resolve({ runs: [], limit: 10, hasMore: false }),
+  loadWorkspaceTree: () => Promise.resolve({ path: "", entries: [] }),
+  readTextFile: (request) =>
+    Promise.resolve({ path: request.path, name: "", content: "", size: 0, truncated: false, error: "Desktop bridge is unavailable." }),
+  writeTextFile: (request) =>
+    Promise.resolve({ path: request.path, size: 0, savedAt: 0, error: "Desktop bridge is unavailable." }),
   loadSessionFileChanges: () => Promise.resolve({ isRepo: false, files: [], added: 0, removed: 0 }),
+  loadBacklog: (cwd: string) => Promise.resolve({ version: 1 as const, cwd, items: [], nextNumber: 1, updatedAt: new Date(0).toISOString() }),
+  mutateBacklog: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
+  onBacklogChanged: () => () => {},
+  loadSchedule: (cwd: string) => Promise.resolve({ version: 1 as const, cwd, items: [], updatedAt: new Date(0).toISOString() }),
+  mutateSchedule: () => Promise.resolve({ ok: false, message: "Desktop bridge is unavailable. Open this inside Electron." }),
+  onScheduleChanged: () => () => {},
+  loadMachineStats: () =>
+    Promise.resolve({
+      capturedAt: new Date(0).toISOString(),
+      hostname: "unavailable",
+      platform: "unknown",
+      uptimeSec: 0,
+      cpuCount: 1,
+      loadAvg: [0, 0, 0] as [number, number, number],
+      cpuPct: null,
+      memTotalBytes: 0,
+      memAvailableBytes: null,
+      memUsedPct: null,
+      swapUsedBytes: null,
+      swapTotalBytes: null,
+      diskUsedPct: null,
+      diskFreeBytes: null,
+      topByCpu: [],
+      topByMemory: [],
+      sectionCommands: [],
+      error: "Desktop bridge is unavailable. Open this inside Electron.",
+    }),
   listEditors: () => Promise.resolve([]),
   openInEditor: () => Promise.resolve(false),
+  copyFileToClipboard: () => Promise.resolve(false),
+  showAttachmentContextMenu: () => Promise.resolve(false),
+  dictationAvailable: () => Promise.resolve(false),
+  prepareDictation: () => Promise.resolve(),
+  startDictation: () => Promise.resolve(false),
+  stopDictation: () => Promise.resolve(),
+  cancelDictation: () => Promise.resolve(),
+  restartDictation: () => Promise.resolve(),
+  onDictation: () => () => undefined,
 };
 
 // The /btw side-chat defaults to a fast model — it is a quick aside about the
@@ -1045,7 +1320,8 @@ function storedDefaultCommand(): string {
 }
 
 function storedDefaultRuntime(): AgentRuntime {
-  return readStorageItem(DEFAULT_RUNTIME_KEY) === "codex" ? "codex" : "claude";
+  const stored = readStorageItem(DEFAULT_RUNTIME_KEY);
+  return stored === "codex" || stored === "groq" ? stored : "claude";
 }
 
 function storedDefaultModel(): string {
@@ -1061,7 +1337,8 @@ function storedDefaultPermissionMode(): string {
 }
 
 function storedDefaultCodexModel(): string {
-  return readStorageItem(DEFAULT_CODEX_MODEL_KEY)?.trim() ?? "";
+  const stored = readStorageItem(DEFAULT_CODEX_MODEL_KEY)?.trim() ?? "";
+  return stored === LEGACY_CODEX_REVIEW_MODEL ? "" : stored;
 }
 
 function storedDefaultCodexEffort(): string {
@@ -1072,10 +1349,56 @@ function storedDefaultCodexSandbox(): string {
   return readStorageItem(DEFAULT_CODEX_SANDBOX_KEY)?.trim() || "read-only";
 }
 
+function storedDefaultGroqModel(): string {
+  const stored = readStorageItem(DEFAULT_GROQ_MODEL_KEY)?.trim();
+  return stored === "llama-3.3-70b-versatile" || !stored ? "openai/gpt-oss-120b" : stored;
+}
+
 // Codex sessions default to the persistent app-server transport; "exec" keeps
 // the legacy one-shot `codex exec --json` path. See docs/codex-app-server-migration.md.
 function storedNotificationsEnabled(): boolean {
   return readStorageItem(NOTIFICATIONS_KEY) !== "off";
+}
+
+function storedAgentNotificationsEnabled(): boolean {
+  return readStorageItem(AGENT_NOTIFICATIONS_KEY) === "on";
+}
+
+type SessionNotificationOverrides = Record<string, { desktop?: boolean; agent?: boolean }>;
+
+function storedSessionNotificationOverrides(): SessionNotificationOverrides {
+  try {
+    const parsed = JSON.parse(readStorageItem(SESSION_NOTIFICATION_CHANNELS_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as SessionNotificationOverrides : {};
+  } catch {
+    return {};
+  }
+}
+
+/** A quiet five-second two-note chime for the full-screen agent notificator. */
+function playAgentNotificationSound(): () => void {
+  const context = new AudioContext();
+  const gain = context.createGain();
+  gain.gain.setValueAtTime(0.035, context.currentTime);
+  gain.connect(context.destination);
+  const oscillators: OscillatorNode[] = [];
+  for (let offset = 0; offset < 5; offset += 0.8) {
+    const oscillator = context.createOscillator();
+    oscillator.type = "sine";
+    oscillator.frequency.value = Math.round(offset) % 2 === 0 ? 523.25 : 659.25;
+    oscillator.connect(gain);
+    oscillator.start(context.currentTime + offset);
+    oscillator.stop(context.currentTime + Math.min(offset + 0.24, 5));
+    oscillators.push(oscillator);
+  }
+  const timer = window.setTimeout(() => void context.close(), 5_000);
+  return () => {
+    window.clearTimeout(timer);
+    for (const oscillator of oscillators) {
+      try { oscillator.stop(); } catch { /* already stopped */ }
+    }
+    void context.close();
+  };
 }
 
 function storedFocusMode(): boolean {
@@ -1086,6 +1409,20 @@ function storedScratchWorkspace(): string {
   return readStorageItem(SCRATCH_WORKSPACE_KEY)?.trim() ?? "";
 }
 
+function storedCollapsedSubthreads(): Set<string> {
+  const stored = readStorageItem(COLLAPSED_SUBTHREADS_KEY);
+  if (!stored) {
+    return new Set();
+  }
+
+  try {
+    const parsed = JSON.parse(stored) as unknown;
+    return new Set(Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
 function storedSidebarWidth(): number {
   const raw = Number(readStorageItem(SIDEBAR_WIDTH_KEY));
   return Number.isFinite(raw) && raw > 0 ? clampSidebarWidth(raw) : SIDEBAR_DEFAULT_WIDTH;
@@ -1094,6 +1431,11 @@ function storedSidebarWidth(): number {
 function storedBtwWidth(): number {
   const raw = Number(readStorageItem(BTW_WIDTH_KEY));
   return Number.isFinite(raw) && raw > 0 ? clampBtwWidth(raw) : BTW_DEFAULT_WIDTH;
+}
+
+function storedBrowserWidth(): number {
+  const raw = Number(readStorageItem(BROWSER_WIDTH_KEY));
+  return Number.isFinite(raw) && raw > 0 ? clampBrowserWidth(raw) : BROWSER_DEFAULT_WIDTH;
 }
 
 function storedUsageProvider(): UsageProvider {
@@ -1116,6 +1458,24 @@ function loadStoredTerminalTabs(): Record<string, TerminalTab[]> {
 
 function loadExpandedWorkspaces(): Set<string> {
   const stored = readStorageItem(EXPANDED_WORKSPACES_KEY);
+  if (!stored) {
+    return new Set();
+  }
+
+  try {
+    const parsed = JSON.parse(stored) as string[];
+    return new Set(Array.isArray(parsed) ? parsed : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function loadStarredCollapsed(): boolean {
+  return readStorageItem(STARRED_COLLAPSED_KEY) === "true";
+}
+
+function loadArchivedThreads(): Set<string> {
+  const stored = readStorageItem(ARCHIVED_THREADS_KEY);
   if (!stored) {
     return new Set();
   }
@@ -1178,6 +1538,34 @@ function threadOrderKey(thread: Thread): string {
   return thread.lastPromptAt ?? thread.createdAt;
 }
 
+/**
+ * A section's rows in the order the sidebar paints them: itself, then each
+ * visible sub-thread's own subtree.
+ *
+ * Drives Cmd+1-9, which counts what is ON SCREEN — a numbering that skipped the
+ * nested rows would point at the wrong section for every row below the first
+ * parent that has any. Depth is capped where the links are written
+ * (`MAX_SUBTHREAD_DEPTH`), and the recursion follows a tree that cannot contain
+ * a cycle for the same reason.
+ */
+function flattenThreadTree(
+  thread: Thread,
+  childrenByParent: Map<string, Thread[]>,
+  collapsed: ReadonlySet<string>,
+  visibleSubthreadCounts: Readonly<Record<string, number>>,
+): Thread[] {
+  const rows = [thread];
+  if (collapsed.has(thread.id)) {
+    return rows;
+  }
+  const children = childrenByParent.get(thread.id) ?? [];
+  const visible = Math.min(visibleSubthreadCounts[thread.id] ?? INITIAL_VISIBLE_SESSIONS, children.length);
+  for (const child of children.slice(0, visible)) {
+    rows.push(...flattenThreadTree(child, childrenByParent, collapsed, visibleSubthreadCounts));
+  }
+  return rows;
+}
+
 function dedupeThreadsByClaudeSession(threads: Thread[]): Thread[] {
   const byClaudeSession = new Map<string, Thread>();
   const byCodexThread = new Map<string, Thread>();
@@ -1222,6 +1610,21 @@ function dedupeThreadsByClaudeSession(threads: Thread[]): Thread[] {
   );
 }
 
+/**
+ * Settle sections this renderer has no evidence are alive.
+ *
+ * Only for threads read out of localStorage, where "running" is a leftover from
+ * however the last window went away. It is NOT applied to what main returns
+ * from `threads:load`: main checks the actual processes, so a second window
+ * opening while the first has live sections must take main's word rather than
+ * declaring them all dead and persisting that.
+ */
+function settleStoredThreads(threads: Thread[]): Thread[] {
+  return threads.map((thread) =>
+    thread.status === "running" ? { ...thread, status: "exited" as const, agentState: "exited" as const } : thread,
+  );
+}
+
 function normalizeThreads(threads: Thread[]): Thread[] {
   const normalizedThreads =
     threads.length > 0
@@ -1234,11 +1637,13 @@ function normalizeThreads(threads: Thread[]): Thread[] {
               runtime === "codex" && (!thread.command.trim() || thread.command.trim() === DEFAULT_COMMAND)
                 ? DEFAULT_CODEX_COMMAND
                 : thread.command,
-            model: thread.model,
+            // Older builds exposed a synthetic review mode as a model. It is
+            // not advertised by Codex's model catalog, so migrate it back to
+            // the provider default instead of surfacing it as a fake custom model.
+            model: runtime === "codex" && thread.model === LEGACY_CODEX_REVIEW_MODEL ? undefined : thread.model,
             titleSource: thread.titleSource ?? "auto",
             executionMode: "stream-json" as const,
-            status: thread.status === "running" ? "exited" : thread.status,
-            agentState: thread.status === "running" ? "exited" : thread.agentState ?? "exited",
+            agentState: thread.agentState ?? "exited",
           };
         })
       : // Nothing stored means a first run (or a cleared list), which lands on the
@@ -1259,7 +1664,7 @@ function loadLocalThreads(): Thread[] {
 
   try {
     const parsed = JSON.parse(stored) as Thread[];
-    return normalizeThreads(parsed);
+    return settleStoredThreads(normalizeThreads(parsed));
   } catch {
     return [];
   }
@@ -1560,16 +1965,65 @@ function shortcutDisplay(accelerator: string): string {
     .join(" ");
 }
 
-// Turns an API model id ("claude-opus-4-8-20250915") into a short display
-// name ("Opus 4.8"). Unknown formats fall back to the raw id.
+// Turns provider model ids into compact labels for message headers. Unknown
+// formats fall back to the raw id so a newly released model is still visible.
 function modelDisplayName(modelId: string): string {
-  const match = modelId.match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d+)?$/);
-  if (!match) {
-    return modelId;
+  const claude = modelId.match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d+)?$/);
+  if (claude) {
+    const family = claude[1] ?? "";
+    return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${claude[2]}${claude[3] ? `.${claude[3]}` : ""}`;
   }
 
-  const family = match[1] ?? "";
-  return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${match[2]}${match[3] ? `.${match[3]}` : ""}`;
+  return modelId.replace(/^gpt-/i, "GPT-").replace(/-(astra|sol|terra|luna)$/i, (_, name: string) =>
+    ` ${name.charAt(0).toUpperCase()}${name.slice(1)}`,
+  );
+}
+
+function modelChangeMarkers(thread: Thread, codexModels: CodexModel[]): ConversationItem[] {
+  return (thread.modelChanges ?? []).map((change, index) => {
+    const from = modelLabel(change.runtime, change.fromModel, codexModels);
+    const to = modelLabel(change.runtime, change.toModel, codexModels);
+    return {
+      id: `model-change:${thread.id}:${change.at}:${index}`,
+      kind: "marker",
+      title: "Model changed",
+      body: `${from} → ${to}`,
+      timestamp: change.at,
+    };
+  });
+}
+
+/**
+ * Drops each marker in at the point in the transcript where it happened rather
+ * than pinning them all to the end — a model switch made ten turns ago belongs
+ * next to the turn it changed, not below the latest reply. The base item order
+ * is left untouched; only the markers get placed.
+ */
+function mergeMarkersByTime(items: ConversationItem[], markers: ConversationItem[]): ConversationItem[] {
+  if (markers.length === 0) {
+    return items;
+  }
+
+  const ordered = [...markers].sort(
+    (a, b) => new Date(a.timestamp ?? 0).getTime() - new Date(b.timestamp ?? 0).getTime(),
+  );
+  const merged: ConversationItem[] = [];
+  let next = 0;
+
+  for (const item of items) {
+    const at = item.timestamp ? new Date(item.timestamp).getTime() : Number.NaN;
+    while (Number.isFinite(at)) {
+      const marker = ordered[next];
+      if (!marker || new Date(marker.timestamp ?? 0).getTime() > at) {
+        break;
+      }
+      merged.push(marker);
+      next += 1;
+    }
+    merged.push(item);
+  }
+
+  return [...merged, ...ordered.slice(next)];
 }
 
 function resetsLabel(value: string): string {
@@ -1606,16 +2060,49 @@ function gitStatusLabel(code: string): string {
   return parts.length > 0 ? Array.from(new Set(parts)).join(" / ") : "unchanged";
 }
 
+type GitSyncTone = "synced" | "ahead" | "behind" | "diverged" | "unknown";
+
+/**
+ * The one-line answer to "am I in sync?" for a single remote. Tone drives the
+ * colour, so "behind" and "diverged" read differently from a clean "up to date".
+ */
+function gitSyncSummary(remote: WorkspaceGitRemote): { tone: GitSyncTone; label: string } {
+  if (!remote.ref) {
+    return { tone: "unknown", label: "branch not on this remote" };
+  }
+
+  const ahead = remote.ahead ?? 0;
+  const behind = remote.behind ?? 0;
+  if (ahead === 0 && behind === 0) {
+    return { tone: "synced", label: "up to date" };
+  }
+
+  if (ahead > 0 && behind > 0) {
+    return { tone: "diverged", label: `diverged — ${ahead} ahead, ${behind} behind` };
+  }
+
+  return ahead > 0
+    ? { tone: "ahead", label: `${ahead} to push` }
+    : { tone: "behind", label: `${behind} to pull` };
+}
+
+/** Overall drawer headline: the upstream's state if there is one, else the first remote's. */
+function gitOverallSync(status: WorkspaceGitStatus): { tone: GitSyncTone; label: string } {
+  if (status.remotes.length === 0) {
+    return { tone: "unknown", label: "no remotes" };
+  }
+
+  const primary = status.remotes.find((remote) => remote.upstream) ?? status.remotes[0];
+  if (!primary) {
+    return { tone: "unknown", label: "no remotes" };
+  }
+
+  const summary = gitSyncSummary(primary);
+  return { tone: summary.tone, label: `${primary.ref ?? primary.name} · ${summary.label}` };
+}
+
 function isImageFile(file: File): boolean {
   return file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|heic|heif|tiff?|bmp)$/i.test(file.name);
-}
-
-function imageAttachmentNameFromPath(path: string): string {
-  return path.split("/").filter(Boolean).at(-1) ?? "image";
-}
-
-function localImageUrl(path: string): string {
-  return `file://${path.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 function attachedImagePathsFromBody(value: string): string[] {
@@ -1711,7 +2198,9 @@ function isThinkingItem(item: ConversationItem): boolean {
  * handoff is the exception — it carries the user's own prompt inside it.
  */
 function isQuietFeedItem(item: ConversationItem): boolean {
-  if (item.kind === "user" || item.kind === "marker" || isTurnSummaryItem(item)) {
+  // A subagent is delegated conversation, not background noise: folding its
+  // card into an "Agent work" line hides the only place its work is reported.
+  if (item.kind === "user" || item.kind === "marker" || item.kind === "agent" || isTurnSummaryItem(item)) {
     return false;
   }
 
@@ -1805,110 +2294,102 @@ function compactPreview(value: string, maxLength = 100): string {
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}...` : normalized;
 }
 
-// renderInline lives in ./inline — it walks marked's CommonMark inline lexer
-// into React nodes. See that module for why the old regex approach was replaced.
+/** Long enough that a mid-turn passage is worth reading at document width. */
+const READER_WORD_THRESHOLD = 100;
 
-function FormattedBody({ value }: { value: string }): React.ReactElement {
-  const blocks = useMemo(() => parseBodyBlocks(value), [value]);
+// FormattedBody lives in ./FormattedBody, and the inline renderer it uses in
+// ./inline — the backlog renders Markdown out of the same pair.
+
+function AgentBadge({
+  state,
+  compact = false,
+  onStopClick,
+  stopArmed = false,
+}: {
+  state: AgentState;
+  compact?: boolean;
+  /** When set, the badge doubles as a stop control (sidebar rows only). */
+  onStopClick?: (event: React.SyntheticEvent) => void;
+  stopArmed?: boolean;
+}): React.ReactElement {
+  const stoppable = Boolean(onStopClick);
+  // Not a <button>: the badge sits inside the row's own button, and nesting
+  // one would be invalid HTML. role/tabIndex/keydown give it the same
+  // affordance without the nesting.
   return (
-    <div className="formatted-body">
-      {blocks.map((block, index) => {
-        if (block.type === "code") {
-          return (
-            <pre className="formatted-code" key={`code:${index}`}>
-              {block.language ? <span className="formatted-code-language">{block.language}</span> : null}
-              <code>{block.code}</code>
-            </pre>
-          );
-        }
-
-        if (block.type === "task-notification") {
-          return (
-            <section className="task-notification-card" key={`task-notification:${index}`}>
-              <div className="task-notification-kicker">
-                <span className="task-notification-icon">
-                  <Bell size={13} aria-hidden="true" />
-                </span>
-                <strong>Task notification</strong>
-                {block.taskId ? <code>{block.taskId}</code> : null}
-              </div>
-              {block.summary ? <p className="task-notification-summary">{renderInline(block.summary)}</p> : null}
-              {block.event ? <p className="task-notification-event">{renderInline(block.event)}</p> : null}
-            </section>
-          );
-        }
-
-        if (block.type === "table") {
-          return (
-            <div className="formatted-table-shell" key={`table:${index}`}>
-              <table className="formatted-table">
-                <thead>
-                  <tr>
-                    {block.headers.map((header, headerIndex) => (
-                      <th key={`${header}:${headerIndex}`}>{renderInline(header)}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {block.rows.map((row, rowIndex) => (
-                    <tr key={`row:${rowIndex}`}>
-                      {row.map((cell, cellIndex) => (
-                        <td key={`${cell}:${cellIndex}`}>{renderInline(cell)}</td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          );
-        }
-
-        if (block.type === "quote") {
-          return (
-            <blockquote key={`quote:${index}`}>
-              <FormattedBody value={block.text} />
-            </blockquote>
-          );
-        }
-
-        if (block.type === "rule") {
-          return <hr key={`rule:${index}`} />;
-        }
-
-        if (block.type === "heading") {
-          return <h3 key={`heading:${index}`}>{renderInline(block.text)}</h3>;
-        }
-
-        if (block.type === "list") {
-          const ListTag = block.ordered ? "ol" : "ul";
-          return (
-            <ListTag key={`list:${index}`}>
-              {block.items.map((item, itemIndex) => (
-                <li className={item.checked === undefined ? undefined : "task-list-item"} key={`${item.text}:${itemIndex}`}>
-                  {item.checked === undefined ? null : (
-                    <input checked={item.checked} disabled readOnly type="checkbox" aria-label={item.checked ? "Completed" : "Incomplete"} />
-                  )}
-                  <span>{renderInline(item.text)}</span>
-                </li>
-              ))}
-            </ListTag>
-          );
-        }
-
-        return <p key={`paragraph:${index}`}>{renderInline(block.text)}</p>;
-      })}
-    </div>
+    <span
+      className={`agent-badge ${state} ${compact ? "compact" : ""} ${stoppable ? "stoppable" : ""} ${
+        stopArmed ? "stop-armed" : ""
+      }`}
+      {...(stoppable
+        ? {
+            role: "button" as const,
+            tabIndex: 0,
+            title: stopArmed ? "Click again to stop this section" : "Stop this section",
+            "aria-label": stopArmed ? "Click again to stop this section" : "Stop this section",
+            onClick: onStopClick,
+            onKeyDown: (event: React.KeyboardEvent) => {
+              if (event.key === "Enter" || event.key === " ") {
+                onStopClick?.(event);
+              }
+            },
+          }
+        : {})}
+    >
+      {stopArmed ? (
+        <>
+          <span className="agent-badge-square" aria-hidden="true" />
+          <span>Stop?</span>
+        </>
+      ) : (
+        <>
+          {state === "working" ? <span className="agent-spinner" aria-hidden="true" /> : null}
+          {state === "needs_action" ? <AlertTriangle size={13} aria-hidden="true" /> : null}
+          {state === "waiting" ? <span className="agent-badge-dot" aria-hidden="true" /> : null}
+          {state === "exited" ? <span className="agent-badge-square" aria-hidden="true" /> : null}
+          <span>{agentStateLabel(state)}</span>
+        </>
+      )}
+    </span>
   );
 }
 
-function AgentBadge({ state, compact = false }: { state: AgentState; compact?: boolean }): React.ReactElement {
+/** One mark on a sidebar row: an icon, optionally a number, and what it means. */
+type ThreadMark = {
+  key: string;
+  className: string;
+  icon: React.ReactElement;
+  count?: number;
+  label: string;
+};
+
+/**
+ * The marks on a sidebar row — sub-threads, terminals, browser pages, an unsent
+ * draft.
+ *
+ * One of them beside a title is fine. Four is not: the sidebar is narrow and
+ * resizable, and pills win that fight against the title every time. So past one
+ * they fold into a cluster of bare icons, slightly overlapped, and hovering the
+ * cluster spreads them back out with their counts. Nothing is dropped and
+ * nothing has to be clicked — the row still says *what* is going on at rest, and
+ * says *how much* when you look at it.
+ *
+ * The counts stay in the DOM while folded (hidden with width, not `display`) so
+ * the tooltip and the screen-reader label are the full sentence either way.
+ */
+function ThreadMarks({ marks }: { marks: (ThreadMark | null)[] }): React.ReactElement | null {
+  const present = marks.filter((mark): mark is ThreadMark => mark !== null);
+  if (present.length === 0) {
+    return null;
+  }
   return (
-    <span className={`agent-badge ${state} ${compact ? "compact" : ""}`}>
-      {state === "working" ? <span className="agent-spinner" aria-hidden="true" /> : null}
-      {state === "needs_action" ? <AlertTriangle size={13} aria-hidden="true" /> : null}
-      {state === "waiting" ? <span className="agent-badge-dot" aria-hidden="true" /> : null}
-      {state === "exited" ? <span className="agent-badge-square" aria-hidden="true" /> : null}
-      <span>{agentStateLabel(state)}</span>
+    <span className={`thread-marks ${present.length > 1 ? "grouped" : ""}`}>
+      {present.map((mark) => (
+        <span key={mark.key} className={`thread-mark ${mark.className}`} title={mark.label} aria-label={mark.label}>
+          {mark.icon}
+          {mark.count === undefined ? null : <span className="thread-mark-count">{mark.count}</span>}
+        </span>
+      ))}
     </span>
   );
 }
@@ -1962,9 +2443,11 @@ function CyclingWord(): React.ReactElement {
 function WorkingStatusBar({
   state,
   detail,
+  workingLabel,
 }: {
   state: AgentState;
   detail?: string;
+  workingLabel?: string;
 }): React.ReactElement | null {
   if (state === "exited") {
     return null;
@@ -1974,7 +2457,7 @@ function WorkingStatusBar({
     return (
       <div className={`working-status working`} role="status" aria-live="polite">
         <span className="agent-spinner" aria-hidden="true" />
-        <CyclingWord />
+        {workingLabel ? <span className="working-word">{workingLabel}</span> : <CyclingWord />}
         {detail ? <span className="working-status-detail">{detail}</span> : null}
       </div>
     );
@@ -2076,10 +2559,12 @@ function SessionFileRow({
         {meta.code}
       </code>
       <span className="files-name" title={file.absolutePath}>
-        <span className="files-name-inner">
-          {dir ? <span className="files-dir">{dir}</span> : null}
-          {name}
-        </span>
+        <span className="files-file">{name}</span>
+        {dir ? (
+          <span className="files-dir">
+            <span className="files-dir-inner">{dir.replace(/\/$/, "")}</span>
+          </span>
+        ) : null}
       </span>
       {file.binary ? (
         <span className="files-binary">binary</span>
@@ -2091,6 +2576,20 @@ function SessionFileRow({
       )}
       <DiffBlips added={file.added} removed={file.removed} />
       <span className="files-row-actions">
+        {isReadableDocPath(file.path) ? (
+          // The common case this exists for: an agent was asked for a document
+          // and wrote one. Read it here rather than in an editor.
+          <button
+            className="ghost-icon-button"
+            type="button"
+            onClick={() => openDocument({ path: file.absolutePath })}
+            disabled={!file.exists}
+            aria-label="Read in Panda Code"
+            title="Read in Panda Code"
+          >
+            <BookOpen size={13} aria-hidden="true" />
+          </button>
+        ) : null}
         <button
           className="ghost-icon-button"
           type="button"
@@ -2114,6 +2613,415 @@ function SessionFileRow({
       </span>
     </li>
   );
+}
+
+/** Commits per page in the history tab. */
+const GIT_LOG_PAGE_SIZE = 50;
+
+/**
+ * A workspace's commit history, one page at a time.
+ *
+ * Paged rather than infinite-scrolled: the question this answers is "what has
+ * been going on here lately", which is a handful of pages at most, and a page
+ * you can step back from is easier to hold onto than a list that grows under
+ * the scrollbar. Its own state, keyed by `cwd`, so switching workspaces starts
+ * over at the head instead of showing page 4 of a different repo.
+ */
+function GitHistoryPanel({ cwd, desktopApi }: { cwd: string; desktopApi: DesktopApi }): ReactElement {
+  const [commits, setCommits] = useState<WorkspaceGitCommit[]>([]);
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void desktopApi
+      .loadWorkspaceGitLog({ cwd, skip: page * GIT_LOG_PAGE_SIZE, limit: GIT_LOG_PAGE_SIZE })
+      .then((log) => {
+        if (cancelled) return;
+        setCommits(log.commits);
+        setHasMore(log.hasMore);
+        setError(log.error ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setError("Failed to read the commit history");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cwd, desktopApi, page]);
+
+  if (loading && commits.length === 0) {
+    return <div className="git-empty">Reading commit history…</div>;
+  }
+
+  if (commits.length === 0) {
+    return <div className="git-empty">{error ?? "No commits yet."}</div>;
+  }
+
+  const first = page * GIT_LOG_PAGE_SIZE + 1;
+  const last = page * GIT_LOG_PAGE_SIZE + commits.length;
+
+  return (
+    <section className="git-section">
+      <div className="git-section-head">
+        <span>Commits</span>
+        <em>
+          {first}–{last}
+        </em>
+      </div>
+      <ul className="git-list git-log-list">
+        {commits.map((commit) => (
+          <GitCommitRow key={commit.hash} commit={commit} />
+        ))}
+      </ul>
+      <div className="git-log-pager">
+        <button
+          className="quiet-action"
+          type="button"
+          onClick={() => setPage((current) => Math.max(0, current - 1))}
+          disabled={page === 0 || loading}
+        >
+          <ChevronUp size={13} aria-hidden="true" />
+          Newer
+        </button>
+        <span className="git-sub">page {page + 1}</span>
+        <button
+          className="quiet-action"
+          type="button"
+          onClick={() => setPage((current) => current + 1)}
+          disabled={!hasMore || loading}
+        >
+          <ChevronDown size={13} aria-hidden="true" />
+          Older
+        </button>
+      </div>
+      {error ? <p className="git-note">{error}</p> : null}
+    </section>
+  );
+}
+
+function GitCommitRow({ commit }: { commit: WorkspaceGitCommit }): ReactElement {
+  const [copied, setCopied] = useState(false);
+  const when = commit.date ? relativeAge(commit.date) : "";
+
+  return (
+    <li className="git-row git-row-stack git-log-row">
+      <span className="git-log-subject" title={commit.subject}>
+        {commit.subject || "(no message)"}
+      </span>
+      <span className="git-log-meta">
+        <button
+          className="git-log-hash"
+          type="button"
+          title="Copy the full SHA"
+          onClick={() => {
+            void navigator.clipboard.writeText(commit.hash).then(() => {
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1200);
+            });
+          }}
+        >
+          <GitCommitHorizontal size={12} aria-hidden="true" />
+          {copied ? "copied" : commit.shortHash}
+        </button>
+        <span className="git-sub">{commit.author}</span>
+        {when ? <span className="git-sub">{when === "now" ? "just now" : `${when} ago`}</span> : null}
+        {commit.refs.map((ref) => (
+          <span key={ref} className="git-badge">
+            {ref}
+          </span>
+        ))}
+      </span>
+    </li>
+  );
+}
+
+const WORKFLOW_RUN_BATCH = 10;
+
+function workflowTone(run: WorkspaceWorkflowRun): "success" | "failure" | "active" | "neutral" {
+  if (run.status !== "completed") return "active";
+  if (run.conclusion === "success") return "success";
+  if (["failure", "timed_out", "cancelled", "action_required"].includes(run.conclusion ?? "")) return "failure";
+  return "neutral";
+}
+
+function workflowStatusLabel(run: WorkspaceWorkflowRun): string {
+  if (run.status !== "completed") return run.status.replaceAll("_", " ");
+  return (run.conclusion || "completed").replaceAll("_", " ");
+}
+
+function GitHubActionsPanel({ cwd, desktopApi }: { cwd: string; desktopApi: DesktopApi }): ReactElement {
+  const [runs, setRuns] = useState<WorkspaceWorkflowRun[]>([]);
+  const [limit, setLimit] = useState(WORKFLOW_RUN_BATCH);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [reload, setReload] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void desktopApi.loadWorkspaceWorkflowRuns({ cwd, limit }).then((result) => {
+      if (cancelled) return;
+      setRuns(result.runs);
+      setHasMore(result.hasMore);
+      setError(result.error ?? null);
+    }).catch(() => {
+      if (!cancelled) setError("Could not load GitHub Actions runs.");
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [cwd, desktopApi, limit, reload]);
+
+  if (loading && runs.length === 0) return <div className="git-empty">Reading GitHub Actions…</div>;
+  if (runs.length === 0) {
+    return (
+      <div className="git-empty git-actions-empty">
+        <span>{error ?? "No workflow runs yet."}</span>
+        <button className="quiet-action" type="button" onClick={() => setReload((value) => value + 1)}>Retry</button>
+      </div>
+    );
+  }
+
+  return (
+    <section className="git-section">
+      <div className="git-section-head git-actions-head">
+        <span>Recent workflow runs</span>
+        <em>{runs.length}</em>
+        <button className="ghost-icon-button" type="button" onClick={() => setReload((value) => value + 1)} disabled={loading} title="Refresh workflow runs" aria-label="Refresh workflow runs">
+          <RefreshCw size={13} aria-hidden="true" />
+        </button>
+      </div>
+      <ul className="git-list git-actions-list">
+        {runs.map((run) => {
+          const tone = workflowTone(run);
+          return (
+            <li key={run.databaseId} className="git-row git-row-stack git-action-row">
+              <a href={run.url} target="_blank" rel="noreferrer" className="git-action-link">
+                <span className={`git-action-status git-action-status-${tone}`} aria-hidden="true">
+                  {tone === "success" ? <Check size={12} /> : tone === "failure" ? <X size={12} /> : <Activity size={12} />}
+                </span>
+                <span className="git-action-copy">
+                  <strong title={run.displayTitle}>{run.displayTitle || run.name}</strong>
+                  <span className="git-log-meta">
+                    <span>{run.name}</span>
+                    {run.headBranch ? <span className="git-badge">{run.headBranch}</span> : null}
+                    {run.createdAt ? <span>{relativeAge(run.createdAt) === "now" ? "just now" : `${relativeAge(run.createdAt)} ago`}</span> : null}
+                  </span>
+                </span>
+                <span className={`git-action-result git-action-result-${tone}`}>{workflowStatusLabel(run)}</span>
+                <ExternalLink size={12} aria-hidden="true" />
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+      {hasMore ? (
+        <button className="quiet-action git-actions-more" type="button" onClick={() => setLimit((value) => value + WORKFLOW_RUN_BATCH)} disabled={loading}>
+          {loading ? "Loading…" : "See 10 more"}
+        </button>
+      ) : null}
+      {error ? <p className="git-note">{error}</p> : null}
+    </section>
+  );
+}
+
+/**
+ * The workspace as a file tree, read one level at a time.
+ *
+ * Folders are collapsed until clicked and their children fetched on first
+ * expand — a monorepo has hundreds of thousands of files, and none of them are
+ * worth walking for a panel nobody has opened. Loaded levels stay cached for
+ * as long as the drawer is open, so collapsing and re-expanding is free.
+ */
+function WorkspaceTreePanel({
+  cwd,
+  desktopApi,
+  editorName,
+  onOpen,
+  onReveal,
+}: {
+  cwd: string;
+  desktopApi: DesktopApi;
+  editorName?: string;
+  onOpen: (path: string) => void;
+  onReveal: (path: string) => void;
+}): ReactElement {
+  const [levels, setLevels] = useState<Map<string, WorkspaceGitTreeEntry[]>>(new Map());
+  const [errors, setErrors] = useState<Map<string, string>>(new Map());
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
+
+  const load = useCallback(
+    (path: string): void => {
+      setLoadingPaths((current) => new Set(current).add(path));
+      void desktopApi
+        .loadWorkspaceTree({ cwd, path })
+        .then((tree) => {
+          setLevels((current) => new Map(current).set(path, tree.entries));
+          setErrors((current) => {
+            const next = new Map(current);
+            if (tree.error) next.set(path, tree.error);
+            else next.delete(path);
+            return next;
+          });
+        })
+        .catch(() => {
+          setErrors((current) => new Map(current).set(path, "Could not read this folder"));
+        })
+        .finally(() => {
+          setLoadingPaths((current) => {
+            const next = new Set(current);
+            next.delete(path);
+            return next;
+          });
+        });
+    },
+    [cwd, desktopApi],
+  );
+
+  // Root only; everything below it waits to be asked for.
+  useEffect(() => {
+    setLevels(new Map());
+    setErrors(new Map());
+    setExpanded(new Set());
+    load("");
+  }, [cwd, load]);
+
+  const toggle = useCallback(
+    (path: string): void => {
+      setExpanded((current) => {
+        const next = new Set(current);
+        if (next.has(path)) {
+          next.delete(path);
+        } else {
+          next.add(path);
+        }
+        return next;
+      });
+      if (!levels.has(path)) load(path);
+    },
+    [levels, load],
+  );
+
+  const renderLevel = (path: string, depth: number): ReactNode => {
+    const entries = levels.get(path);
+    const error = errors.get(path);
+    if (!entries) {
+      return loadingPaths.has(path) ? (
+        <li className="git-row git-tree-row" style={{ paddingLeft: 8 + depth * 14 }}>
+          <span className="git-sub">Reading…</span>
+        </li>
+      ) : error ? (
+        <li className="git-row git-tree-row" style={{ paddingLeft: 8 + depth * 14 }}>
+          <span className="git-sub">{error}</span>
+        </li>
+      ) : null;
+    }
+
+    return (
+      <>
+        {entries.map((entry) => {
+          const open = expanded.has(entry.path);
+          return (
+            <Fragment key={entry.path}>
+              <li className={`git-row git-tree-row ${entry.ignored ? "is-ignored" : ""}`} style={{ paddingLeft: 8 + depth * 14 }}>
+                {entry.kind === "directory" ? (
+                  <button
+                    className="git-tree-toggle"
+                    type="button"
+                    onClick={() => toggle(entry.path)}
+                    aria-expanded={open}
+                    aria-label={open ? `Collapse ${entry.name}` : `Expand ${entry.name}`}
+                  >
+                    <ChevronRight size={12} className={open ? "rotated" : ""} aria-hidden="true" />
+                    {open ? <FolderOpen size={13} aria-hidden="true" /> : <Folder size={13} aria-hidden="true" />}
+                    <span className="git-tree-name">{entry.name}</span>
+                  </button>
+                ) : isReadableDocPath(entry.name) ? (
+                  // A document the app can show itself: the row opens the
+                  // reader, the way a folder row expands.
+                  <button className="git-tree-leaf git-tree-doc" type="button" onClick={() => openDocument({ path: entry.absolutePath })}>
+                    <span className="git-tree-toggle-gap" />
+                    <BookOpen size={13} aria-hidden="true" />
+                    <span className="git-tree-name">{entry.name}</span>
+                    {typeof entry.size === "number" ? <span className="git-sub">{formatBytes(entry.size)}</span> : null}
+                  </button>
+                ) : (
+                  <span className="git-tree-leaf">
+                    <span className="git-tree-toggle-gap" />
+                    <FileText size={13} aria-hidden="true" />
+                    <span className="git-tree-name">{entry.name}</span>
+                    {typeof entry.size === "number" ? <span className="git-sub">{formatBytes(entry.size)}</span> : null}
+                  </span>
+                )}
+                <span className="files-row-actions">
+                  <button
+                    className="ghost-icon-button"
+                    type="button"
+                    onClick={() => onOpen(entry.absolutePath)}
+                    aria-label={editorName ? `Open in ${editorName}` : "Open in editor"}
+                    title={editorName ? `Open in ${editorName}` : "Open in editor"}
+                  >
+                    <ExternalLink size={13} aria-hidden="true" />
+                  </button>
+                  <button
+                    className="ghost-icon-button"
+                    type="button"
+                    onClick={() => onReveal(entry.absolutePath)}
+                    aria-label="Reveal in Finder"
+                    title="Reveal in Finder"
+                  >
+                    <Folder size={13} aria-hidden="true" />
+                  </button>
+                </span>
+              </li>
+              {entry.kind === "directory" && open ? renderLevel(entry.path, depth + 1) : null}
+            </Fragment>
+          );
+        })}
+        {error ? (
+          <li className="git-row git-tree-row" style={{ paddingLeft: 8 + depth * 14 }}>
+            <span className="git-sub">{error}</span>
+          </li>
+        ) : null}
+      </>
+    );
+  };
+
+  const rootEntries = levels.get("");
+  if (!rootEntries && loadingPaths.has("")) {
+    return <div className="git-empty">Reading the workspace…</div>;
+  }
+
+  if (rootEntries && rootEntries.length === 0) {
+    return <div className="git-empty">{errors.get("") ?? "This folder is empty."}</div>;
+  }
+
+  return (
+    <section className="git-section">
+      <div className="git-section-head">
+        <span>Files</span>
+        <em>{rootEntries?.length ?? 0}</em>
+      </div>
+      <ul className="git-list git-tree">{renderLevel("", 0)}</ul>
+    </section>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /**
@@ -2214,11 +3122,17 @@ const ConversationCard = memo(function ConversationCard({
   const thinking = isThinkingItem(item);
   const privateThinking = isPrivateThinkingItem(item);
   const runtimeHandoff = item.kind === "user" || item.kind === "system" ? runtimeHandoffParts(item.body) : null;
+  const peerPrompt = item.kind === "user" ? parsePeerPrompt(item.body) : null;
   const [handoffExpanded, setHandoffExpanded] = useState(expanded);
+  const [promptExpanded, setPromptExpanded] = useState(false);
 
   useEffect(() => {
     setHandoffExpanded(expanded);
   }, [expanded, item.id]);
+
+  useEffect(() => {
+    setPromptExpanded(false);
+  }, [item.id]);
 
   // End-of-turn stats footer: a subtle line that reads as a caption on the
   // assistant reply it follows, not a collapsible activity row.
@@ -2245,7 +3159,7 @@ const ConversationCard = memo(function ConversationCard({
 
     return (
       <>
-        <div className="conversation-line system system-notice runtime-handoff-line">
+        <div className="conversation-line system system-notice runtime-handoff-line" data-conversation-item-id={item.id}>
           <button className="conversation-line-header" type="button" onClick={() => setHandoffExpanded((open) => !open)} aria-expanded={handoffExpanded}>
             <span className="conversation-line-icon">
               <ShieldCheck size={15} aria-hidden="true" />
@@ -2285,8 +3199,9 @@ const ConversationCard = memo(function ConversationCard({
   }
 
   const collapsible = (item.kind === "tool" || item.kind === "system" || thinking) && !privateThinking;
-  const attachedImages = item.kind === "user" ? attachedImagePathsFromBody(item.body) : [];
-  const displayBody = attachedImages.length > 0 ? bodyWithoutAttachedImageList(item.body) : item.body;
+  const promptBody = peerPrompt?.body ?? item.body;
+  const attachedImages = item.kind === "user" ? attachedImagePathsFromBody(promptBody) : [];
+  const displayBody = attachedImages.length > 0 ? bodyWithoutAttachedImageList(promptBody) : promptBody;
   const preview = compactPreview(item.body);
   const icon =
     item.kind === "user" ? (
@@ -2308,8 +3223,8 @@ const ConversationCard = memo(function ConversationCard({
         <div className="conversation-marker-pill">
           <strong>{item.title ?? item.body}</strong>
           {item.body && item.body !== item.title ? <small>{item.body}</small> : null}
+          {item.timestamp ? <time>{formatTime(item.timestamp)}</time> : null}
         </div>
-        {item.timestamp ? <time>{formatTime(item.timestamp)}</time> : null}
         <span />
       </div>
     );
@@ -2351,6 +3266,12 @@ const ConversationCard = memo(function ConversationCard({
     );
   }
 
+  // A mid-turn passage earns the reader only once it is long enough that
+  // reading it in the transcript's column is the wrong shape for it; the final
+  // reply — the card below — always gets the button.
+  const readerTitle = "Read in Markdown editor";
+  const openInReader = (): void => openDocument({ text: item.body, title: item.title ?? "Reply" });
+
   if (item.kind === "assistant" && midTurn) {
     return (
       <div className="conversation-passage">
@@ -2360,29 +3281,83 @@ const ConversationCard = memo(function ConversationCard({
         <div className="conversation-passage-body">
           <FormattedBody value={displayBody} />
         </div>
+        {documentWordCount(displayBody) >= READER_WORD_THRESHOLD ? (
+          <button className="conversation-read-button" type="button" onClick={openInReader} aria-label={readerTitle} title={readerTitle}>
+            <BookOpen size={13} aria-hidden="true" />
+          </button>
+        ) : null}
+        {item.timestamp ? <time>{formatTime(item.timestamp)}</time> : null}
       </div>
     );
   }
 
   return (
-    <article className={`conversation-card ${item.kind}`}>
+    <article className={`conversation-card ${item.kind}${peerPrompt ? " peer-message" : ""}`} data-conversation-item-id={item.id}>
       <div className="conversation-card-header">
-        <span className="conversation-icon">{icon}</span>
-        <strong>{item.title ?? (item.kind === "user" ? "You" : "Claude")}</strong>
+        <span className="conversation-icon">{peerPrompt ? <GitBranch size={15} aria-hidden="true" /> : icon}</span>
+        <strong>{peerPrompt?.senderTitle ?? item.title ?? (item.kind === "user" ? "You" : "Claude")}</strong>
+        {peerPrompt ? (
+          <>
+            <span className="peer-origin-badge">Panda Peers</span>
+            <span className="peer-relation">
+              {peerPrompt.relation === "subthread"
+                ? "Sub-thread report"
+                : peerPrompt.relation === "parent"
+                  ? "Parent section"
+                  : peerPrompt.relation === "delegated"
+                    ? "Delegated task"
+                    : "Peer section"}
+            </span>
+          </>
+        ) : null}
         {item.kind === "assistant" && item.model ? (
           <span className="conversation-model" title={item.model}>
             {modelDisplayName(item.model)}
           </span>
         ) : null}
         {item.timestamp ? <time>{formatTime(item.timestamp)}</time> : null}
+        {item.kind === "assistant" && displayBody.trim().length > 0 ? (
+          <button className="conversation-read-button" type="button" onClick={openInReader} aria-label={readerTitle} title={readerTitle}>
+            <BookOpen size={13} aria-hidden="true" />
+          </button>
+        ) : null}
       </div>
-      <div className="conversation-body">
-        <FormattedBody value={displayBody} />
-        {attachedImages.length > 0 ? <MessageImageAttachments paths={attachedImages} onPreviewImage={onPreviewImage} /> : null}
+      <div
+        className={`conversation-body-wrap ${
+          item.kind === "user" && shouldCollapsePrompt(displayBody) && !promptExpanded ? "prompt-collapsed" : ""
+        }`}
+      >
+        <div className="conversation-body">
+          <FormattedBody value={displayBody} />
+          {attachedImages.length > 0 ? <MessageImageAttachments paths={attachedImages} onPreviewImage={onPreviewImage} /> : null}
+        </div>
+        {item.kind === "user" && shouldCollapsePrompt(displayBody) ? (
+          <div className="prompt-expander">
+            <button type="button" onClick={() => setPromptExpanded((open) => !open)} aria-expanded={promptExpanded}>
+              {promptExpanded ? "View less" : "View more"}
+              {promptExpanded ? <ChevronUp size={13} aria-hidden="true" /> : <ChevronDown size={13} aria-hidden="true" />}
+            </button>
+          </div>
+        ) : null}
       </div>
     </article>
   );
 });
+
+/**
+ * What a card with nothing in it should say. A running shell whose pipeline
+ * ends in `| tail` really will show nothing until it exits — naming the stage
+ * turns a card that looks stuck into one that is merely quiet.
+ */
+function emptyAgentCardText(agent: AgentActivity | undefined, status: string): string {
+  if (status !== "running") {
+    return "No transcript for this agent.";
+  }
+  if (agent?.outputBufferedBy) {
+    return `No output yet — this command pipes its output into \`${agent.outputBufferedBy}\`, which prints nothing until the command exits.`;
+  }
+  return "No output yet…";
+}
 
 // A subagent the main turn delegated to (Task/Agent tool). Renders as a
 // collapsible card, its child transcript nested inside — the same shape the
@@ -2396,6 +3371,8 @@ const AgentCard = memo(function AgentCard({
   expandedChildIds,
   onToggleChild,
   onPreviewImage,
+  onKill,
+  killDisabled,
 }: {
   item: ConversationItem;
   expanded: boolean;
@@ -2404,9 +3381,15 @@ const AgentCard = memo(function AgentCard({
   expandedChildIds: Set<string>;
   onToggleChild: (itemId: string) => void;
   onPreviewImage: (path: string) => void;
+  onKill?: (item: ConversationItem) => void;
+  killDisabled?: boolean;
 }): React.ReactElement {
   const agent = item.agent;
   const status = agent?.status ?? "running";
+  // Real Task/Agent subagent delegation always carries a subagent_type; a
+  // plain or background Bash command never does. Only the latter gets the
+  // terminal styling and the kill button below.
+  const isCommand = !agent?.subagentType;
   const statusIcon =
     status === "completed" ? (
       <Check size={13} aria-hidden="true" />
@@ -2430,7 +3413,7 @@ const AgentCard = memo(function AgentCard({
   }
 
   return (
-    <div className={`agent-card ${status}`}>
+    <div className={`agent-card ${status} ${isCommand ? "command" : ""}`}>
       <button
         className="agent-card-header"
         type="button"
@@ -2438,22 +3421,43 @@ const AgentCard = memo(function AgentCard({
         aria-expanded={expanded}
       >
         <span className="agent-card-icon">
-          <Sparkles size={15} aria-hidden="true" />
+          {isCommand ? <TerminalSquare size={15} aria-hidden="true" /> : <Sparkles size={15} aria-hidden="true" />}
         </span>
-        <strong className="agent-card-title">{item.title ?? "Agent"}</strong>
+        <strong className={`agent-card-title ${isCommand ? "command-text" : ""}`}>{item.title ?? "Agent"}</strong>
         {agent?.subagentType ? <span className="agent-card-badge">{agent.subagentType}</span> : null}
         <span className={`agent-card-status ${status}`}>
           {statusIcon}
           <span>{status === "running" ? (agent?.background ? "running in background…" : "running…") : status}</span>
         </span>
         {meta.length > 0 ? <span className="agent-card-meta">{meta.join(" · ")}</span> : null}
+        {isCommand && status === "running" && onKill ? (
+          <button
+            className="ghost-icon-button agent-card-kill"
+            type="button"
+            disabled={killDisabled}
+            title={killDisabled ? "Process not found — it may have already finished" : "Kill this command"}
+            aria-label="Kill command"
+            onClick={(event) => {
+              event.stopPropagation();
+              onKill(item);
+            }}
+          >
+            <X size={13} aria-hidden="true" />
+          </button>
+        ) : null}
         <span className="collapse-chevron" aria-hidden="true">
           {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </span>
       </button>
       <div className={`conversation-collapse-region ${expanded ? "expanded" : "collapsed"}`}>
         <div className="agent-card-body">
-          {agent?.outputTail ? (
+          <div className="agent-card-summary">
+            {item.timestamp ? <span>started {formatTime(item.timestamp)}</span> : null}
+            {status === "running" && item.timestamp ? <span>working for {relativeAge(item.timestamp)}</span> : null}
+            {agent?.summary && childItems.length > 0 ? <span>{agent.summary}</span> : null}
+          </div>
+          {expanded && isCommand && item.title ? <pre className="agent-card-command-full">{item.title}</pre> : null}
+          {!expanded ? null : agent?.outputTail ? (
             // A background shell streams no nested transcript; its real output
             // is the file the main process tailed for us.
             <pre className="agent-card-output">{agent.outputTail}</pre>
@@ -2461,7 +3465,7 @@ const AgentCard = memo(function AgentCard({
             // No nested items and no output file: history rebuilt from the
             // transcript, or a task that has not written anything yet.
             <div className="agent-card-empty">
-              {agent?.summary ?? (status === "running" ? "No output yet…" : "No transcript for this agent.")}
+              {agent?.summary ?? emptyAgentCardText(agent, status)}
             </div>
           ) : (
             childItems.map((child) => {
@@ -2484,17 +3488,13 @@ const AgentCard = memo(function AgentCard({
 });
 
 /**
- * Focus mode: a run of tool calls, system activity, thinking, and subagents
- * folded into one line. The conversation itself — your prompts, the agent's
- * replies, the final answer — stays unbroken; click to unfold the work.
+ * Focus mode: a run of tool calls, system activity, and thinking folded into
+ * one line. The conversation itself — your prompts, the agent's replies, the
+ * final answer, and any subagent card — stays unbroken; click to unfold the work.
  */
 function workGroupSummary(items: ConversationItem[]): string {
-  const agentCount = items.filter((item) => item.kind === "agent").length;
   const labels: string[] = [];
   for (const item of items) {
-    if (item.kind === "agent") {
-      continue;
-    }
     const label = (item.title ?? (isThinkingItem(item) ? "Thinking" : "Activity")).trim();
     if (label && !labels.includes(label)) {
       labels.push(label);
@@ -2502,9 +3502,6 @@ function workGroupSummary(items: ConversationItem[]): string {
   }
 
   const parts = [`${items.length} step${items.length === 1 ? "" : "s"}`];
-  if (agentCount > 0) {
-    parts.push(`${agentCount} agent${agentCount === 1 ? "" : "s"}`);
-  }
   if (labels.length > 0) {
     parts.push(labels.length > 4 ? `${labels.slice(0, 4).join(", ")}…` : labels.join(", "));
   }
@@ -2559,10 +3556,20 @@ function MessageImageAttachments({
   return (
     <div className="message-image-grid" aria-label="Attached images">
       {paths.map((path) => {
-        const name = imageAttachmentNameFromPath(path);
+        const name = mediaFileName(path);
         return (
-          <button className="message-image-thumb" key={path} type="button" onClick={() => onPreviewImage(path)} title={path}>
-            <img alt={name} src={localImageUrl(path)} />
+          <button
+            className="message-image-thumb"
+            key={path}
+            type="button"
+            onClick={() => onPreviewImage(path)}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              void window.claudeSections?.showAttachmentContextMenu(path);
+            }}
+            title={path}
+          >
+            <img alt={name} src={localFileUrl(path)} />
             <span>{name}</span>
           </button>
         );
@@ -2579,11 +3586,15 @@ type ComposerFieldProps = {
   disabled: boolean;
   placeholder: string;
   slashCommands: ComposerSlashCommand[];
+  /** This workspace's board, for `#` mentions. Empty when the board is empty. */
+  cards: ComposerCard[];
   shortcutHints: ComposerShortcutHint[];
   // Live text is mirrored into this ref so App can read it (on submit/queue/btw)
   // without re-rendering on every keystroke.
   textRef: React.MutableRefObject<string>;
   onHasTextChange: (hasText: boolean) => void;
+  /** Points dictation at this field, so speaking types into whatever has focus. */
+  onFieldFocus: () => void;
   onEnter: (modifiers: { meta: boolean }) => void;
   onPaste: (event: React.ClipboardEvent) => void;
   onCommit: (threadId: string, text: string) => void;
@@ -2602,9 +3613,11 @@ const ComposerField = memo(
       disabled,
       placeholder,
       slashCommands,
+      cards,
       shortcutHints,
       textRef,
       onHasTextChange,
+      onFieldFocus,
       onEnter,
       onPaste,
       onCommit,
@@ -2634,6 +3647,31 @@ const ComposerField = memo(
       focused && slashQuery !== null && dismissedSlashValue !== value && filteredSlashCommands.length > 0;
     const selectedSlashIndex = Math.min(slashIndex, Math.max(0, filteredSlashCommands.length - 1));
 
+    /**
+     * `#` mentions: the same palette, pointed at the workspace's board.
+     *
+     * Matched at the end of the text rather than at the caret because that is
+     * where typing happens; a `#` edited into the middle of a finished sentence
+     * is a rare enough case to leave to typing the number by hand. A slash
+     * command owns the whole value, so the two can never both be up.
+     */
+    const cardMatch = value.match(/(?:^|\s)#([^\s#]{0,40})$/);
+    const cardQuery = cardMatch ? (cardMatch[1] ?? "").toLowerCase() : null;
+    const filteredCards = useMemo(() => {
+      if (cardQuery === null || cards.length === 0) {
+        return [];
+      }
+      const matching = cardQuery
+        ? cards.filter((card) => String(card.number) === cardQuery || `${card.title} ${card.summary}`.toLowerCase().includes(cardQuery))
+        : cards;
+      // The board is up to 500 cards and the menu is a popover; the first
+      // handful of a board that is already in "most recently filed first" order
+      // is the useful end of it.
+      return matching.slice(0, 8);
+    }, [cardQuery, cards]);
+    const showCardPalette = focused && !showSlashPalette && cardQuery !== null && dismissedSlashValue !== value && filteredCards.length > 0;
+    const selectedCardIndex = Math.min(slashIndex, Math.max(0, filteredCards.length - 1));
+
     const commitValue = useCallback((next: string): void => {
       const hadText = valueRef.current.trim().length > 0;
       if (next !== valueRef.current) {
@@ -2650,6 +3688,23 @@ const ComposerField = memo(
 
     const focusFieldSoon = (): void => {
       window.requestAnimationFrame(() => areaRef.current?.focus());
+    };
+
+    /**
+     * Replace the `#query` being typed with the card's number.
+     *
+     * Just `#12` goes into the prompt — not the title, not a link. It is what
+     * the user typed, it is what the agent is told to resolve through
+     * `backlog_list`, and it is what the transcript turns back into a link to
+     * the card. A trailing space so the sentence carries on.
+     */
+    const applyCard = (card: ComposerCard): void => {
+      const head = value.slice(0, value.length - (cardMatch?.[0].length ?? 0));
+      const separator = cardMatch?.[0].startsWith("#") ? "" : " ";
+      commitValue(`${head}${head ? separator : ""}#${card.number} `);
+      setSlashIndex(0);
+      setDismissedSlashValue(null);
+      focusFieldSoon();
     };
 
     const applySlashCommand = (command: ComposerSlashCommand): void => {
@@ -2677,7 +3732,7 @@ const ComposerField = memo(
 
     useEffect(() => {
       setSlashIndex(0);
-    }, [slashQuery]);
+    }, [slashQuery, cardQuery]);
 
     useImperativeHandle(
       ref,
@@ -2734,10 +3789,40 @@ const ComposerField = memo(
             </div>
           </div>
         ) : null}
+        {showCardPalette ? (
+          <div id="composer-card-mentions" className="slash-command-palette" role="listbox" aria-label="Backlog cards">
+            <div className="slash-command-list">
+              {filteredCards.map((card, index) => (
+                <button
+                  key={card.number}
+                  type="button"
+                  className={`slash-command-option ${index === selectedCardIndex ? "selected" : ""}`}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    applyCard(card);
+                  }}
+                  role="option"
+                  aria-selected={index === selectedCardIndex}
+                >
+                  <span className="slash-command-main">
+                    <strong>
+                      #{card.number} {card.title}
+                    </strong>
+                    <span>{card.summary}</span>
+                  </span>
+                  <em>{card.column}</em>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <textarea
           ref={areaRef}
           value={value}
-          onFocus={() => setFocused(true)}
+          onFocus={() => {
+            setFocused(true);
+            onFieldFocus();
+          }}
           onBlur={() => setFocused(false)}
           onChange={(event) => commitValue(event.target.value)}
           onPaste={onPaste}
@@ -2768,6 +3853,43 @@ const ComposerField = memo(
               }
             }
 
+            if (showCardPalette) {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setSlashIndex((current) => (current + 1) % filteredCards.length);
+                return;
+              }
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setSlashIndex((current) => (current - 1 + filteredCards.length) % filteredCards.length);
+                return;
+              }
+              // Tab takes the highlighted card; Enter is left alone once the
+              // number is unambiguous, so "#12<enter>" sends rather than
+              // re-picking a card the user has already named.
+              if (event.key === "Tab") {
+                event.preventDefault();
+                const card = filteredCards[selectedCardIndex];
+                if (card) {
+                  applyCard(card);
+                }
+                return;
+              }
+              if (event.key === "Enter" && !event.shiftKey && filteredCards.length > 0 && cardQuery !== String(filteredCards[0]?.number)) {
+                event.preventDefault();
+                const card = filteredCards[selectedCardIndex];
+                if (card) {
+                  applyCard(card);
+                }
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setDismissedSlashValue(value);
+                return;
+              }
+            }
+
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               onEnter({ meta: event.metaKey || event.ctrlKey });
@@ -2776,7 +3898,7 @@ const ComposerField = memo(
           placeholder={placeholder}
           disabled={disabled}
           aria-label="Prompt"
-          aria-controls={showSlashPalette ? "composer-slash-commands" : undefined}
+          aria-controls={showSlashPalette ? "composer-slash-commands" : showCardPalette ? "composer-card-mentions" : undefined}
         />
       </>
     );
@@ -2792,7 +3914,17 @@ type PromptHistoryRecord = {
   attachments: number;
   timestamp?: string;
   queued: boolean;
+  conversationItemId?: string;
 };
+
+function promptHistoryText(body: string): string {
+  const images = attachedImagePathsFromBody(body);
+  return images.length > 0 ? bodyWithoutAttachedImageList(body) : body;
+}
+
+function promptHistorySignature(text: string, timestamp?: string): string {
+  return `${timestamp ?? ""}\u0000${text.replace(/\s+/g, " ").trim()}`;
+}
 
 function promptTimeLabel(iso?: string): string {
   if (!iso) return "";
@@ -2807,23 +3939,19 @@ function PromptHistoryRow({
   latest,
   query,
   onReuse,
+  onGoTo,
 }: {
   record: PromptHistoryRecord;
   badge: string;
   latest: boolean;
   query: string;
   onReuse: (text: string) => void;
+  onGoTo: (record: PromptHistoryRecord) => void;
 }): ReactElement {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<number | undefined>(undefined);
-  const { tag, headline } = useMemo(() => classifyPrompt(record.text), [record.text]);
-  const body = record.text.trim();
-  // Hand-typed prompts show verbatim; only genuinely long ones (or machine
-  // blobs, which are summarised) need the disclosure.
-  const long = body.length > 420 || body.split("\n").length > 9;
-  const collapsible = Boolean(tag) || long;
-  const showRaw = !collapsible || expanded;
+  const { tag } = useMemo(() => classifyPrompt(record.text), [record.text]);
 
   useEffect(() => () => window.clearTimeout(copyTimerRef.current), []);
 
@@ -2839,6 +3967,7 @@ function PromptHistoryRow({
   const displayText = record.text.trim().length > 0
     ? record.text
     : `${record.attachments} image${record.attachments === 1 ? "" : "s"}`;
+  const { text: visibleText, collapsible } = promptHistoryPreview(displayText, expanded);
 
   return (
     <div className={`prompt-history-item${record.queued ? " queued" : ""}${latest ? " latest" : ""}`}>
@@ -2862,6 +3991,17 @@ function PromptHistoryRow({
         ) : null}
         <div className="prompt-history-actions">
           {time ? <span className="prompt-history-time">{time}</span> : null}
+          {!record.queued ? (
+            <button
+              className="prompt-history-action"
+              type="button"
+              onClick={() => onGoTo(record)}
+              aria-label="Go to this prompt in the conversation"
+              title="Go to prompt in conversation"
+            >
+              <LocateFixed size={12} aria-hidden="true" />
+            </button>
+          ) : null}
           <button
             className="prompt-history-action"
             type="button"
@@ -2882,19 +4022,18 @@ function PromptHistoryRow({
           </button>
         </div>
       </div>
-      {showRaw ? (
-        <div className={`prompt-history-text${tag ? " raw" : ""}`}>
-          <PromptHistoryHighlight text={displayText} query={query} />
-        </div>
-      ) : (
-        <div className="prompt-history-summary">
-          <PromptHistoryHighlight text={headline || displayText} query={query} />
-        </div>
-      )}
+      <div className={`prompt-history-text${tag ? " raw" : ""}`}>
+        <PromptHistoryHighlight text={visibleText} query={query} />
+      </div>
       {collapsible ? (
-        <button className="prompt-history-more" type="button" onClick={() => setExpanded((open) => !open)}>
+        <button
+          className="prompt-history-more"
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((open) => !open)}
+        >
           {expanded ? <ChevronUp size={12} aria-hidden="true" /> : <ChevronDown size={12} aria-hidden="true" />}
-          {expanded ? "Show less" : tag ? "Show raw prompt" : "Show full prompt"}
+          {expanded ? "View less" : "View more"}
         </button>
       ) : null}
     </div>
@@ -2927,11 +4066,13 @@ function PromptHistoryDialog({
   queued,
   onClose,
   onReuse,
+  onGoTo,
 }: {
   sent: PromptHistoryRecord[];
   queued: PromptHistoryRecord[];
   onClose: () => void;
   onReuse: (text: string) => void;
+  onGoTo: (record: PromptHistoryRecord) => void;
 }): ReactElement {
   const [query, setQuery] = useState("");
   const needle = query.trim().toLowerCase();
@@ -2967,7 +4108,7 @@ function PromptHistoryDialog({
           <strong>Prompts</strong>
           <span>{subtitle}</span>
         </div>
-        <button className="ghost-icon-button" type="button" onClick={onClose} aria-label="Close">
+        <button className="ghost-icon-button" type="button" onClick={onClose} aria-label="Close" title="Close (⌘⇧P)">
           <X size={15} aria-hidden="true" />
         </button>
       </div>
@@ -3027,6 +4168,7 @@ function PromptHistoryDialog({
                     latest={false}
                     query={query}
                     onReuse={onReuse}
+                    onGoTo={onGoTo}
                   />
                 ))}
               </div>
@@ -3044,6 +4186,7 @@ function PromptHistoryDialog({
                       latest={index === 0}
                       query={query}
                       onReuse={onReuse}
+                      onGoTo={onGoTo}
                     />
                   );
                 })}
@@ -3055,6 +4198,323 @@ function PromptHistoryDialog({
     </div>
   );
 }
+
+type ThreadRowProps = {
+  thread: Thread;
+  depth: number;
+  activeId: string;
+  attentionThreadIds: Set<string>;
+  collapsedSubthreads: Set<string>;
+  subthreadsByParent: Map<string, Thread[]>;
+  visibleSubthreadCounts: Record<string, number>;
+  archivedThreadIds: Set<string>;
+  terminalTabsByThread: Record<string, TerminalTab[]>;
+  browserMarksByThread: Record<string, { tabs: number; note: boolean }>;
+  unsentDraftThreadIds: Set<string>;
+  registerThreadRow: (id: string, el: HTMLElement | null) => void;
+  toggleSubthreads: (parentId: string) => void;
+  setActiveThreadId: (id: string) => void;
+  setContextMenu: (menu: ContextMenuState) => void;
+  showMoreSubthreads: (parentId: string, total: number) => void;
+  showLessSubthreads: (parentId: string) => void;
+  stopThreadSession: (threadId: string) => void;
+  toggleArchiveThread: (threadId: string) => void;
+};
+
+/** How long an armed stop badge waits for the second click before disarming. */
+const STOP_ARM_TIMEOUT_MS = 4000;
+
+// A row in the sidebar's thread tree, one per section (recursing into
+// sub-threads). Split out from App's render body and memoized because a
+// running section's stream ticks (one IPC message per token, from EVERY
+// running section, see onSessionRuntime) touch App state dozens of times a
+// second — without this boundary every tick re-executed this ~180-line
+// tree-construction for all 40+ sections in the sidebar, not just the one
+// that changed. Correctness depends on the props actually staying
+// referentially stable across unrelated ticks: `thread` only gets a new
+// identity when updateThread's dirty-check finds a real change (see its
+// comment), and the Set/Map/Record props below are only replaced by their
+// own setters, none of which fire on the streaming hot path.
+const ThreadRow = memo(function ThreadRow({
+  thread,
+  depth,
+  activeId,
+  attentionThreadIds,
+  collapsedSubthreads,
+  subthreadsByParent,
+  visibleSubthreadCounts,
+  archivedThreadIds,
+  terminalTabsByThread,
+  browserMarksByThread,
+  unsentDraftThreadIds,
+  registerThreadRow,
+  toggleSubthreads,
+  setActiveThreadId,
+  setContextMenu,
+  showMoreSubthreads,
+  showLessSubthreads,
+  stopThreadSession,
+  toggleArchiveThread,
+}: ThreadRowProps): React.ReactElement {
+  const terminalCount = terminalTabsByThread[thread.id]?.length ?? 0;
+  const browserMark = browserMarksByThread[thread.id];
+  const children = subthreadsByParent.get(thread.id) ?? [];
+  const collapsed = collapsedSubthreads.has(thread.id);
+  const archived = archivedThreadIds.has(thread.id);
+  // A running sub-thread is the one thing worth surfacing on a collapsed
+  // parent: it is the state where "something is happening that you cannot
+  // see" would otherwise be true.
+  const busyChildren = children.filter((child) => child.agentState === "working").length;
+  const visibleChildren = Math.min(
+    visibleSubthreadCounts[thread.id] ?? INITIAL_VISIBLE_SESSIONS,
+    children.length,
+  );
+  const canShowMoreChildren = visibleChildren < children.length;
+  const canShowLessChildren = visibleChildren > INITIAL_VISIBLE_SESSIONS;
+
+  // Stopping a section from the sidebar is a shortcut for something the row
+  // otherwise can't do, so it asks twice: the first click arms the badge
+  // ("Stop?"), the second one within STOP_ARM_TIMEOUT_MS actually stops. An
+  // accidental click just leaves a badge that quietly disarms itself.
+  const [stopArmed, setStopArmed] = useState(false);
+  const stopArmTimerRef = useRef<number | undefined>(undefined);
+  const stoppable = thread.agentState === "working" || thread.agentState === "needs_action";
+
+  useEffect(() => {
+    return () => {
+      if (stopArmTimerRef.current !== undefined) {
+        window.clearTimeout(stopArmTimerRef.current);
+      }
+    };
+  }, []);
+
+  // A section that stopped on its own (or was stopped elsewhere) must not keep
+  // a live "Stop?" badge sitting on it.
+  useEffect(() => {
+    if (!stoppable && stopArmed) {
+      setStopArmed(false);
+    }
+  }, [stoppable, stopArmed]);
+
+  const handleStopClick = (event: React.SyntheticEvent): void => {
+    // The badge lives inside the row button; without this the click also
+    // selects the section.
+    event.preventDefault();
+    event.stopPropagation();
+    if (stopArmTimerRef.current !== undefined) {
+      window.clearTimeout(stopArmTimerRef.current);
+      stopArmTimerRef.current = undefined;
+    }
+    if (stopArmed) {
+      setStopArmed(false);
+      stopThreadSession(thread.id);
+      return;
+    }
+    setStopArmed(true);
+    stopArmTimerRef.current = window.setTimeout(() => {
+      stopArmTimerRef.current = undefined;
+      setStopArmed(false);
+    }, STOP_ARM_TIMEOUT_MS);
+  };
+
+  return (
+    <div
+      className="thread-branch"
+      data-depth={depth}
+      data-thread-id={thread.id}
+      ref={(el) => registerThreadRow(thread.id, el)}
+    >
+      <div className={`thread-row ${children.length > 0 ? "has-subthreads" : ""}`} style={{ "--thread-depth": depth } as React.CSSProperties}>
+        {children.length > 0 ? (
+          <button
+            className="subthread-toggle"
+            type="button"
+            onClick={() => toggleSubthreads(thread.id)}
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? `Show ${children.length} sub-threads` : `Hide ${children.length} sub-threads`}
+            title={collapsed ? `Show ${children.length} sub-thread${children.length === 1 ? "" : "s"}` : "Hide sub-threads"}
+          >
+            {collapsed ? <ChevronRight size={12} aria-hidden="true" /> : <ChevronDown size={12} aria-hidden="true" />}
+          </button>
+        ) : depth > 0 ? (
+          <span className="subthread-branch-mark" aria-hidden="true" />
+        ) : (
+          /* The chevron gutter is unconditional, so a childless top-level row
+             still has to fill it — otherwise the row's own button slides into
+             the 16px column and the title collapses to nothing. */
+          <span className="subthread-gutter-spacer" aria-hidden="true" />
+        )}
+        <button
+          className={`thread-item ${thread.id === activeId ? "active" : ""} ${
+            attentionThreadIds.has(thread.id) ? "needs-attention" : ""
+          } ${depth > 0 ? "subthread-item" : ""} ${archived ? "archived-thread" : ""}`}
+          type="button"
+          onClick={() => setActiveThreadId(thread.id)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            setActiveThreadId(thread.id);
+            setContextMenu({ threadId: thread.id, x: event.clientX, y: event.clientY });
+          }}
+        >
+          <AgentBadge
+            compact
+            state={thread.agentState}
+            stopArmed={stopArmed}
+            onStopClick={stoppable ? handleStopClick : undefined}
+          />
+          <span className="thread-copy">
+            <strong>
+              {thread.starred ? <Star size={11} className="thread-star" aria-hidden="true" /> : null}
+              {archived ? <Archive size={11} className="thread-archive-mark" aria-hidden="true" /> : null}
+              <span className="thread-title-text">{thread.title}</span>
+              {/* The marks: what this section has going that the row cannot
+                  otherwise say — hidden sub-threads, live terminals, open
+                  pages, an unsent draft. Grouped rather than listed, because
+                  on a narrow sidebar four pills eat the title; see
+                  `.thread-marks` in the stylesheet, which folds them to icons
+                  and reopens them on hover. */}
+              <ThreadMarks
+                marks={[
+                  collapsed && children.length > 0
+                    ? {
+                        key: "subthreads",
+                        className: `thread-subthread-count ${busyChildren > 0 ? "busy" : ""}`,
+                        icon: <GitBranch size={11} aria-hidden="true" />,
+                        count: children.length,
+                        label:
+                          busyChildren > 0
+                            ? `${children.length} sub-thread${children.length === 1 ? "" : "s"}, ${busyChildren} running`
+                            : `${children.length} sub-thread${children.length === 1 ? "" : "s"}`,
+                      }
+                    : null,
+                  terminalCount > 0
+                    ? {
+                        key: "terminals",
+                        className: "thread-terminal-count",
+                        icon: <TerminalSquare size={11} aria-hidden="true" />,
+                        count: terminalCount,
+                        label: `${terminalCount} active terminal${terminalCount === 1 ? "" : "s"}`,
+                      }
+                    : null,
+                  // A page open is a page the section (or the user) can still be
+                  // acting in, and it is invisible from any other row. A note on
+                  // one is the browser waiting on the user, so it is coloured
+                  // like the other things that want them.
+                  browserMark
+                    ? {
+                        key: "browser",
+                        className: `thread-browser-count ${browserMark.note ? "has-note" : ""}`,
+                        icon: <Globe size={11} aria-hidden="true" />,
+                        count: browserMark.tabs,
+                        label: browserMark.note
+                          ? `${browserMark.tabs} page${browserMark.tabs === 1 ? "" : "s"} open — one is waiting on you`
+                          : `${browserMark.tabs} page${browserMark.tabs === 1 ? "" : "s"} open`,
+                      }
+                    : null,
+                  // A prompt typed here and never sent: invisible from anywhere
+                  // but this section, and the one thing in the row the user
+                  // still owes an action on.
+                  unsentDraftThreadIds.has(thread.id)
+                    ? {
+                        key: "draft",
+                        className: "draft-mark",
+                        icon: <Pencil size={9} aria-hidden="true" />,
+                        label: "Unsent draft",
+                      }
+                    : null,
+                ]}
+              />
+            </strong>
+          </span>
+          {/* One grid cell, two layers: the timestamp normally, the archive
+              toggle crossfaded in over it on hover — instead of a permanent
+              extra column, which pushed the time away from the title and
+              widened the empty middle gap on every row, hovered or not. */}
+          <span className="thread-trailing">
+            <time title={thread.lastPromptAt ? `Last prompt ${formatTime(thread.lastPromptAt)}` : "No prompt submitted"}>
+              {relativeAge(thread.lastPromptAt)}
+            </time>
+            {thread.draft ? null : (
+              // Not a <button>: sits inside the row's own button, same
+              // reasoning as AgentBadge's stop control above — nesting would
+              // be invalid HTML. The right-click menu still has Archive too.
+              <span
+                className="thread-archive-toggle"
+                role="button"
+                tabIndex={0}
+                title={archived ? "Unarchive" : "Archive"}
+                aria-label={archived ? "Unarchive this section" : "Archive this section"}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  toggleArchiveThread(thread.id);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    toggleArchiveThread(thread.id);
+                  }
+                }}
+              >
+                {archived ? <ArchiveRestore size={13} aria-hidden="true" /> : <Archive size={13} aria-hidden="true" />}
+              </span>
+            )}
+          </span>
+        </button>
+      </div>
+      {collapsed
+        ? null
+        : children.slice(0, visibleChildren).map((child) => (
+            <ThreadRow
+              key={child.id}
+              thread={child}
+              depth={depth + 1}
+              activeId={activeId}
+              attentionThreadIds={attentionThreadIds}
+              collapsedSubthreads={collapsedSubthreads}
+              subthreadsByParent={subthreadsByParent}
+              visibleSubthreadCounts={visibleSubthreadCounts}
+              archivedThreadIds={archivedThreadIds}
+              terminalTabsByThread={terminalTabsByThread}
+              browserMarksByThread={browserMarksByThread}
+              unsentDraftThreadIds={unsentDraftThreadIds}
+              registerThreadRow={registerThreadRow}
+              toggleSubthreads={toggleSubthreads}
+              setActiveThreadId={setActiveThreadId}
+              setContextMenu={setContextMenu}
+              showMoreSubthreads={showMoreSubthreads}
+              showLessSubthreads={showLessSubthreads}
+              stopThreadSession={stopThreadSession}
+              toggleArchiveThread={toggleArchiveThread}
+            />
+          ))}
+      {!collapsed && children.length > INITIAL_VISIBLE_SESSIONS ? (
+        <div
+          className="thread-list-more subthread-list-more"
+          style={{ "--thread-depth": depth + 1 } as React.CSSProperties}
+        >
+          {canShowMoreChildren ? (
+            <button
+              className="thread-more-button"
+              type="button"
+              onClick={() => showMoreSubthreads(thread.id, children.length)}
+            >
+              <ChevronDown size={13} aria-hidden="true" />
+              Show {Math.min(VISIBLE_SESSIONS_STEP, children.length - visibleChildren)} more
+            </button>
+          ) : null}
+          {canShowLessChildren ? (
+            <button className="thread-more-button" type="button" onClick={() => showLessSubthreads(thread.id)}>
+              <ChevronUp size={13} aria-hidden="true" />
+              Show less
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+});
 
 export default function App(): React.ReactElement {
   const desktopApi = window.claudeSections ?? fallbackApi;
@@ -3069,6 +4529,12 @@ export default function App(): React.ReactElement {
     () => threads.find((thread) => !thread.draft)?.id ?? DRAFT_THREAD_ID,
   );
   const [conversationItems, setConversationItems] = useState<Record<string, ConversationItem[]>>({});
+  const [conversationPages, setConversationPages] = useState<
+    Record<string, { beforeCursor?: ConversationPageCursor; hasEarlier: boolean; loading?: boolean }>
+  >({});
+  const [conversationLoadState, setConversationLoadState] = useState<
+    Record<string, "loading" | "loaded" | "error">
+  >({});
   const [tokenUsageByThread, setTokenUsageByThread] = useState<Record<string, TokenUsageStats>>({});
   const [runtimeActivityByThread, setRuntimeActivityByThread] = useState<Record<string, RuntimeActivity>>({});
   const [runtimeStatusByThread, setRuntimeStatusByThread] = useState<Record<string, RuntimeStatus>>({});
@@ -3081,15 +4547,41 @@ export default function App(): React.ReactElement {
   const [btwWidth, setBtwWidth] = useState(storedBtwWidth);
   const [resizingBtw, setResizingBtw] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<"general" | "defaults" | "usage" | "notifications" | "phone">("general");
+  const [settingsTab, setSettingsTab] = useState<
+    "general" | "defaults" | "performance" | "usage" | "notifications" | "phone"
+  >("general");
   const [showTokenInfo, setShowTokenInfo] = useState(false);
   // Cost for the section whose info card is open. Fetched from the persisted
   // ledger rather than derived from the live token snapshot, so it survives a
   // resumed process and a Claude ↔ Codex handoff.
   const [sessionCostReport, setSessionCostReport] = useState<UsageCostReport | null>(null);
+  // The kanban board, opened from a workspace's right-click menu. Only the cwd
+  // is held here — the board owns its own loading, its own live updates, and its
+  // own writes, since agents change the same file from outside this window.
+  const [backlogWorkspace, setBacklogWorkspace] = useState<string | null>(null);
+  // Card the board should scroll to and highlight, when the board was opened
+  // from that card's own view.
+  const [backlogFocusId, setBacklogFocusId] = useState<string | null>(null);
+  /**
+   * One backlog card, open on its own over whatever is on screen.
+   *
+   * This is where a `panda://backlog/<id>` link lands, and where a section's
+   * task list opens a task. It is deliberately not the board: a link that says
+   * "this card" used to open a kanban board with the card's editor stacked on
+   * top of it, which is two rooms too many for one destination.
+   */
+  const [taskView, setTaskView] = useState<{ cwd: string; itemId: string } | null>(null);
+  // Same shape as the backlog above, for the workspace's scheduled tasks panel.
+  const [scheduleWorkspace, setScheduleWorkspace] = useState<string | null>(null);
+  // "What is this Mac doing?" — one drawer for the whole box, not per workspace:
+  // every section shares the same CPU and the same 8 GB.
+  const [machineOpen, setMachineOpen] = useState(false);
+  const machine = useMachineStats(desktopApi, machineOpen);
   const [gitWorkspace, setGitWorkspace] = useState<string | null>(null);
   const [gitStatus, setGitStatus] = useState<WorkspaceGitStatus | null>(null);
   const [gitLoading, setGitLoading] = useState(false);
+  const [gitFetching, setGitFetching] = useState(false);
+  const [gitTab, setGitTab] = useState<"status" | "history" | "actions" | "files">("status");
   // Changed-files drawer: which section it is reporting on, and that section's
   // file list. Held by thread id rather than by cwd because the whole point is
   // per-section attribution inside a shared working tree.
@@ -3099,17 +4591,39 @@ export default function App(): React.ReactElement {
   const [editors, setEditors] = useState<EditorTarget[]>([]);
   const [editorPickerOpen, setEditorPickerOpen] = useState(false);
   const [showSelector, setShowSelector] = useState(false);
+  const [settingsModelRuntime, setSettingsModelRuntime] = useState<AgentRuntime>("claude");
   const [usageProvider, setUsageProvider] = useState<UsageProvider>(storedUsageProvider);
   // Kept per provider so toggling Claude/Codex shows the other side's last numbers
   // instead of blanking to "unavailable" while its fetch is in flight.
   const [usageByProvider, setUsageByProvider] = useState<Partial<Record<UsageProvider, UsageSnapshot | null>>>({});
   const [usageLoadingProvider, setUsageLoadingProvider] = useState<UsageProvider | null>(null);
-  const refreshUsageRef = useRef<() => void>(() => {});
+  const refreshUsageRef = useRef<(force?: boolean) => void>(() => {});
   const usageRefreshTimerRef = useRef<number | undefined>(undefined);
-  const [notificationsEnabled, setNotificationsEnabled] = useState(storedNotificationsEnabled);
+  const [contextMobileNotifications, setContextMobileNotifications] = useState<SessionMobileNotificationStatus | null>(null);
   const [focusMode, setFocusMode] = useState(storedFocusMode);
   const [attentionThreadIds, setAttentionThreadIds] = useState<Set<string>>(() => new Set());
+  // Attention threads whose row is nowhere on screen right now — its workspace
+  // group is collapsed, it is folded under a collapsed parent, it is paged
+  // behind "show more", or it is simply scrolled past the fold. Those are the
+  // ones an OS notification is the only signal for, so the sidebar gets its
+  // own callout for them too. Tracked by IntersectionObserver against the
+  // scrollable section list; see the effect near the sidebar footer below.
+  const [offscreenAttentionIds, setOffscreenAttentionIds] = useState<Set<string>>(() => new Set());
+  const threadRowRefs = useRef<Map<string, HTMLElement>>(new Map());
+  const workspaceListRef = useRef<HTMLDivElement | null>(null);
+  const pendingScrollThreadIdRef = useRef<string | null>(null);
+  const registerThreadRow = useCallback((id: string, el: HTMLElement | null) => {
+    if (el) {
+      threadRowRefs.current.set(id, el);
+    } else {
+      threadRowRefs.current.delete(id);
+    }
+  }, []);
   const [visibleSessionCounts, setVisibleSessionCounts] = useState<Record<string, number>>({});
+  // Same paging as a workspace group, one page per parent row: a section that
+  // spawned twenty sub-threads shows five and a "show 5 more" under them,
+  // keyed by the parent's id.
+  const [visibleSubthreadCounts, setVisibleSubthreadCounts] = useState<Record<string, number>>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameDraft, setRenameDraft] = useState("");
@@ -3121,7 +4635,27 @@ export default function App(): React.ReactElement {
   const [defaultCodexModel, setDefaultCodexModel] = useState(storedDefaultCodexModel);
   const [defaultCodexEffort, setDefaultCodexEffort] = useState(storedDefaultCodexEffort);
   const [defaultCodexSandbox, setDefaultCodexSandbox] = useState(storedDefaultCodexSandbox);
+  const [defaultGroqModel, setDefaultGroqModel] = useState(storedDefaultGroqModel);
+  const [groqKeyConfigured, setGroqKeyConfigured] = useState(false);
+  const [groqKeyDraft, setGroqKeyDraft] = useState("");
+  const [groqModels, setGroqModels] = useState<GroqModel[]>([]);
+  const [codexModels, setCodexModels] = useState<CodexModel[]>([]);
   const [expandedWorkspaces, setExpandedWorkspaces] = useState(loadExpandedWorkspaces);
+  const [starredCollapsed, setStarredCollapsed] = useState(loadStarredCollapsed);
+  // Non-destructive view filter, mirrored to the relay: hides a section from
+  // its workspace group's default view. Never stops or deletes anything — see
+  // ARCHIVED_THREADS_KEY.
+  const [archivedThreadIds, setArchivedThreadIds] = useState(loadArchivedThreads);
+  // One-time push of whatever this Mac already had archived before the relay
+  // knew about archiving (or before it connected this run), so a phone that
+  // pairs later sees the same set without the user re-archiving anything.
+  useEffect(() => {
+    const ids = Array.from(archivedThreadIds);
+    if (ids.length > 0) void desktopApi.syncLocalArchivedThreads(ids);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Per-workspace "show archived" reveal, keyed by cwd like visibleSessionCounts.
+  const [showArchivedByCwd, setShowArchivedByCwd] = useState<Record<string, boolean>>({});
   const [workspaceOrder, setWorkspaceOrder] = useState(loadWorkspaceOrder);
   const [draggingWorkspace, setDraggingWorkspace] = useState<string | null>(null);
   // Where the dragged workspace would land if released now. Drives the live
@@ -3141,6 +4675,32 @@ export default function App(): React.ReactElement {
   const [expandedConversationItems, setExpandedConversationItems] = useState<Set<string>>(() => new Set());
   const [isSendingPrompt, setIsSendingPrompt] = useState(false);
   const [previewImage, setPreviewImage] = useState<ImagePreview | null>(null);
+  /**
+   * What the in-app reader is showing — as a browser-style stack, not a single
+   * document: following a link out of one document, or opening a reply while
+   * the reader is up, should leave a way back rather than losing where you were.
+   * `readerIndex` is the position in it; opening drops whatever was ahead.
+   */
+  const [reader, setReader] = useState<{ stack: DocumentRequest[]; index: number }>({ stack: [], index: 0 });
+  const readerDoc = reader.stack[reader.index] ?? null;
+  const readerOpen = reader.stack.length > 0;
+  const canReaderGoBack = reader.index > 0;
+  const canReaderGoForward = reader.index < reader.stack.length - 1;
+
+  const pushReaderDoc = useCallback((request: DocumentRequest): void => {
+    setReader(({ stack, index }) => {
+      // Same rule as a browser's: opening from partway back forgets the forward
+      // entries, so the stack is always the path actually taken to get here.
+      const kept = stack.length === 0 ? [] : stack.slice(0, index + 1);
+      return { stack: [...kept, request], index: kept.length };
+    });
+  }, []);
+
+  const stepReader = useCallback((delta: number): void => {
+    setReader(({ stack, index }) => ({ stack, index: Math.min(stack.length - 1, Math.max(0, index + delta)) }));
+  }, []);
+
+  const closeReader = useCallback((): void => setReader({ stack: [], index: 0 }), []);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [workspaceMenu, setWorkspaceMenu] = useState<WorkspaceMenuState>(null);
@@ -3148,13 +4708,75 @@ export default function App(): React.ReactElement {
   const [terminalTabsByThread, setTerminalTabsByThread] = useState<Record<string, TerminalTab[]>>(loadStoredTerminalTabs);
   const [activeTerminalTabByThread, setActiveTerminalTabByThread] = useState<Record<string, string>>({});
   const [openTerminalThreadIds, setOpenTerminalThreadIds] = useState<Set<string>>(() => new Set());
+  /**
+   * The browser panel is one per window, not one per section — unlike terminals.
+   * The tabs belong to the workspace and any section can be driving them, so a
+   * page an agent left open has to still be there when the user switches
+   * sections to go look at it.
+   */
+  /**
+   * Browser dock state.
+   *
+   * All of it is view state — which sections have the panel open, how each is
+   * presented, how wide the column is. No tab state lives here: main owns that,
+   * and `BrowserPanel` reads it from the `browser:state` broadcast. See
+   * `shared/browser.ts` for the model and `BrowserPanel.tsx` for the three
+   * presentations.
+   *
+   * Which sections have the browser panel open. Per section, like terminals: a
+   * section's tabs are its own, so whether its browser is showing is too.
+   */
+  const [openBrowserThreadIds, setOpenBrowserThreadIds] = useState<Set<string>>(() => new Set());
+  /** Docked column or full width, per section. The detached window is main's. */
+  const [browserPresentationByThread, setBrowserPresentationByThread] = useState<Record<string, BrowserPresentation>>({});
+  const [browserWidth, setBrowserWidth] = useState(storedBrowserWidth);
+  const [resizingBrowser, setResizingBrowser] = useState(false);
+  /**
+   * How many pages each section has open, for the sidebar's mark — the one thing
+   * about the browser this component needs from main.
+   *
+   * Deliberately a count and a flag rather than the state itself: `browser:state`
+   * fires on every title change and every loading toggle of every tab, and
+   * holding the tabs here would re-render the whole app on each. Collapsing to a
+   * digest and returning the previous object when nothing a row shows has moved
+   * makes React bail out of the render instead.
+   */
+  const [browserMarksByThread, setBrowserMarksByThread] = useState<Record<string, { tabs: number; note: boolean }>>({});
   const [preferences, setPreferences] = useState<AppPreferences>({
     quickStartShortcut: "",
     hideDockIcon: false,
     notificationsPaused: false,
     remoteKeepAwake: "off",
+    conserveMode: false,
     preferredEditor: "cursor",
+    relayUrl: "",
+    dictationLocale: DICTATION_FALLBACK_LOCALE,
+    maxLiveSessions: 6,
+    idleSessionTimeoutMinutes: 30,
+    transcriptWindowSize: 2000,
+    retainedTranscripts: 12,
   });
+  const notificationChannels = normalizeNotificationChannels(preferences.notificationChannels ?? {
+    desktop: storedNotificationsEnabled(), agent: storedAgentNotificationsEnabled(), sessions: storedSessionNotificationOverrides(),
+  });
+  const notificationsEnabled = notificationChannels.desktop;
+  const agentNotificationsEnabled = notificationChannels.agent;
+  const sessionNotificationOverrides = notificationChannels.sessions;
+  const anyDesktopNotificationsEnabled = notificationsEnabled || Object.values(sessionNotificationOverrides).some((entry) => entry.desktop === true);
+  const setNotificationsEnabled = (desktop: boolean): void => { void desktopApi.setNotificationChannels(null, { desktop }).then(setPreferences); };
+  const setAgentNotificationsEnabled = (agent: boolean): void => { void desktopApi.setNotificationChannels(null, { agent }).then(setPreferences); };
+  const [relayUrlDraft, setRelayUrlDraft] = useState("");
+  /**
+   * The model a NEW Claude section launches on. Conserve mode forces Sonnet:
+   * the usage ledger showed Opus at 88-90% of all tokens, which is the single
+   * biggest lever the mode has, and output is only ~0.1% of consumption so
+   * delegation guidance alone barely moved it.
+   *
+   * Only the *default* — an explicit per-section pick (`launchSettings.model`)
+   * still wins, and the Settings model picker keeps showing your own stored
+   * default rather than this, so turning Conserve off restores it untouched.
+   */
+  const launchDefaultModel = preferences.conserveMode ? "sonnet" : defaultModel;
   // Starts disabled, not "loading": a build with no relay configured would
   // otherwise flash "Connecting to the relay…" forever, since the main process
   // never sends a `remote:pairing` update for a bridge that never starts.
@@ -3163,12 +4785,30 @@ export default function App(): React.ReactElement {
     message: "Checking relay configuration…",
   });
   const [remoteDevices, setRemoteDevices] = useState<RemotePairedDevice[]>([]);
+  const mobileNotificationsEnabled = remoteDevices.length > 0 && remoteDevices.every((device) => device.notificationsEnabled);
   const [quickStartOpen, setQuickStartOpen] = useState(false);
+  const [attentionQueue, setAttentionQueue] = useState<AgentAttentionEvent[]>([]);
+  const [minimizedAttentionIds, setMinimizedAttentionIds] = useState<Set<string>>(new Set());
+  const activeAttention = attentionQueue.find((event) => !minimizedAttentionIds.has(event.id));
   const [quickStartDraft, setQuickStartDraft] = useState("");
+  // What the overlay's box holds *right now*, ahead of the next render.
+  //
+  // Dictation re-reads its target between results to spot manual edits, and the
+  // analyzer delivers several results per tick. A `useState` value still reads
+  // pre-write inside that tick, so every burst looked like the user had retyped
+  // the box: the transcript rebased onto stale text and restarted the recogniser,
+  // four times in eleven milliseconds. The section composer never had this because
+  // it reads `composerTextRef`; this is the same synchronous truth for the
+  // overlay. Write through `applyQuickStartDraft` so the two cannot drift.
+  const quickStartDraftRef = useRef("");
+  const applyQuickStartDraft = useCallback((value: string): void => {
+    quickStartDraftRef.current = value;
+    setQuickStartDraft(value);
+  }, []);
   const [quickStartCwd, setQuickStartCwd] = useState(DEFAULT_WORKSPACE);
   const [quickStartAttachments, setQuickStartAttachments] = useState<ImageAttachment[]>([]);
   const [quickStartRuntime, setQuickStartRuntime] = useState<AgentRuntime>(defaultRuntime);
-  const [quickStartModel, setQuickStartModel] = useState(defaultRuntime === "codex" ? defaultCodexModel : defaultModel);
+  const [quickStartModel, setQuickStartModel] = useState(defaultRuntime === "codex" ? defaultCodexModel : defaultRuntime === "groq" ? defaultGroqModel : launchDefaultModel);
   const [quickStartEffort, setQuickStartEffort] = useState(defaultRuntime === "codex" ? defaultCodexEffort : defaultEffort);
   const [quickStartPermissionMode, setQuickStartPermissionMode] = useState(
     defaultRuntime === "codex" ? defaultCodexSandbox : defaultPermissionMode,
@@ -3187,6 +4827,7 @@ export default function App(): React.ReactElement {
   const [, setClockTick] = useState(0);
 
   const conversationFeedRef = useRef<HTMLDivElement | null>(null);
+  const pendingPromptScrollItemIdRef = useRef<string | null>(null);
   const threadsRef = useRef(threads);
   const conversationItemsRef = useRef(conversationItems);
   // Read by the session-started listener: a runtime status can land BEFORE the
@@ -3200,6 +4841,12 @@ export default function App(): React.ReactElement {
   const pendingPromptRef = useRef<PendingPromptSend | null>(null);
   const shouldFollowConversationRef = useRef(true);
   const lastConversationThreadIdRef = useRef(activeThreadId);
+  // Read from the mount-once IPC listeners, which would otherwise close over the
+  // active id as it was at mount.
+  const activeThreadIdRef = useRef(activeThreadId);
+  // When each section's transcript was last on screen. A ref, not state: it
+  // feeds an eviction decision and must never itself trigger a render.
+  const transcriptViewedAtRef = useRef<Record<string, number>>({});
   const btwFeedRef = useRef<HTMLDivElement | null>(null);
   const shouldFollowBtwRef = useRef(true);
   const lastBtwThreadIdRef = useRef(activeThreadId);
@@ -3208,23 +4855,46 @@ export default function App(): React.ReactElement {
   const pendingLaunchRestartRef = useRef(new Set<string>());
   const hasLoadedStoredThreadsRef = useRef(false);
   const initialThreadsRef = useRef(threads);
+  /** Debounced section-store write awaiting its timer, or null if already written. */
+  const pendingThreadsWriteRef = useRef<(() => void) | null>(null);
   const lastComposerFocusThreadIdRef = useRef(activeThreadId);
   const prevAgentStateRef = useRef(new Map<string, AgentState>());
   const hasSeededAgentStatesRef = useRef(false);
   const finishTimersRef = useRef(new Map<string, number>());
   const settleHandlerRef = useRef<(threadId: string) => void>(() => undefined);
   const streamRuntimeThreadIdsRef = useRef(new Set<string>());
+  // Sections whose transcript was dropped when the reaper parked them, and has
+  // not been read back yet. Hibernation keeps a section's status at "running" on
+  // purpose (it did not crash, and the next prompt resumes it), so this is the
+  // only way the reload-on-activate effect can tell "live stream, transcript
+  // already in memory" from "process gone, transcript dropped, read it back from
+  // disk".
+  //
+  // Cleared by that reload, NOT by the section streaming again: a resume can be
+  // triggered by something other than you opening the section — your prompt to a
+  // parked section, or a sub-thread reporting back — and clearing on the first
+  // runtime tick left the flag off while the transcript was still missing. The
+  // section then read as plain "running", the reload was skipped, and opening it
+  // showed only the items streamed since the resume with its whole history gone
+  // from the window (it was never gone from disk).
+  const droppedTranscriptThreadIdsRef = useRef(new Set<string>());
   const dragDepthRef = useRef(0);
   // Latest default cwd for a new section, read by the global quick-start handler
   // (which can't depend on activeThread without re-subscribing the shortcut).
   const activeCwdRef = useRef(DEFAULT_WORKSPACE);
   const defaultLaunchSettingsRef = useRef<LaunchSettings>({
     runtime: defaultRuntime,
-    model: defaultRuntime === "codex" ? defaultCodexModel : defaultModel,
+    model: defaultRuntime === "codex" ? defaultCodexModel : defaultRuntime === "groq" ? defaultGroqModel : launchDefaultModel,
     effort: defaultRuntime === "codex" ? defaultCodexEffort : defaultEffort,
     permissionMode: defaultRuntime === "codex" ? defaultCodexSandbox : defaultPermissionMode,
   });
   const pendingQuickSubmitRef = useRef<string | null>(null);
+  /**
+   * Backlog cards the New Session route was seeded from, waiting for the
+   * section that will answer them. A card can only be linked to a section that
+   * exists, and the draft has no id until its first prompt promotes it.
+   */
+  const pendingTaskLinksRef = useRef<{ cwd: string; ids: string[] } | null>(null);
   // Reassigned every render with the latest closures so the stable (memo-safe)
   // callbacks handed to ComposerField always run current logic.
   const composerEnterRef = useRef<(modifiers: { meta: boolean }) => void>(() => undefined);
@@ -3249,6 +4919,33 @@ export default function App(): React.ReactElement {
     };
   }, [desktopApi]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const refreshModels = (): void => {
+      void desktopApi.listCodexModels().then((models) => {
+        if (!cancelled && models.length > 0) setCodexModels(models);
+      }).catch(() => { /* Keep the last catalog when the CLI is unavailable. */ });
+    };
+    refreshModels();
+    window.addEventListener("focus", refreshModels);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", refreshModels);
+    };
+  }, [desktopApi]);
+
+  useEffect(() => {
+    void desktopApi.getGroqApiKeyConfigured().then(setGroqKeyConfigured);
+  }, [desktopApi]);
+
+  useEffect(() => {
+    if (!groqKeyConfigured) {
+      setGroqModels([]);
+      return;
+    }
+    void desktopApi.listGroqModels().then(setGroqModels);
+  }, [desktopApi, groqKeyConfigured]);
+
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? threads[0],
     [activeThreadId, threads],
@@ -3265,16 +4962,18 @@ export default function App(): React.ReactElement {
   // generated since it was created. Cheap dir scan; refreshed on switch + on a
   // slow interval so the button shows up shortly after a `pnpm evidence` run.
   const activeArtifacts = artifactsByThread[activeThread?.id ?? ""] ?? EMPTY_ARTIFACTS;
+  const activeArtifactThreadId = activeThread?.id;
+  const activeArtifactCwd = activeThread?.cwd;
+  const activeArtifactSince = activeThread?.createdAt;
   useEffect(() => {
-    const thread = activeThread;
-    if (!thread) return;
+    if (!activeArtifactThreadId || !activeArtifactCwd || !activeArtifactSince) return;
     let cancelled = false;
     const refresh = () => {
       void desktopApi
-        .listArtifacts({ cwd: thread.cwd, sinceIso: thread.createdAt })
+        .listArtifacts({ cwd: activeArtifactCwd, sinceIso: activeArtifactSince })
         .then((runs) => {
           if (!cancelled) {
-            setArtifactsByThread((current) => ({ ...current, [thread.id]: runs }));
+            setArtifactsByThread((current) => ({ ...current, [activeArtifactThreadId]: runs }));
           }
         })
         .catch(() => undefined);
@@ -3285,7 +4984,7 @@ export default function App(): React.ReactElement {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeThread, desktopApi]);
+  }, [activeArtifactCwd, activeArtifactSince, activeArtifactThreadId, desktopApi]);
 
   const openArtifacts = useCallback(() => {
     const runs = artifactsByThread[activeThread?.id ?? ""];
@@ -3333,6 +5032,66 @@ export default function App(): React.ReactElement {
   const focusComposerSoon = useCallback(() => {
     window.requestAnimationFrame(() => composerFieldRef.current?.focus());
   }, []);
+
+  /**
+   * Sections holding a prompt that was written but never sent.
+   *
+   * The committed drafts only cover the *inactive* sections — the live field
+   * commits on unmount, so the section you are typing in right now is missing
+   * from that map and has to come from `composerHasText`. Attachments count too:
+   * a pasted screenshot with no text is still an unsent prompt.
+   *
+   * The New Session route is excluded — it has its own dot, and it is not a
+   * section the reaper can hibernate.
+   */
+  const unsentDraftThreadIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const [id, text] of Object.entries(promptDraftsByThread)) {
+      if (id !== DRAFT_THREAD_ID && text.trim()) ids.add(id);
+    }
+    for (const [id, attachments] of Object.entries(imageAttachmentsByThread)) {
+      if (id !== DRAFT_THREAD_ID && attachments.length > 0) ids.add(id);
+    }
+    const activeId = activeThread?.id;
+    if (activeId && activeId !== DRAFT_THREAD_ID) {
+      if (composerHasText) ids.add(activeId);
+      else if (!(imageAttachmentsByThread[activeId] ?? []).length) ids.delete(activeId);
+    }
+    return ids;
+  }, [promptDraftsByThread, imageAttachmentsByThread, activeThread?.id, composerHasText]);
+
+  // Hand the set to main so the hibernation reaper can spare those processes.
+  // Keyed on the sorted join so a re-render that doesn't change the set is free.
+  const unsentDraftKey = useMemo(() => [...unsentDraftThreadIds].sort().join("\u0000"), [unsentDraftThreadIds]);
+  useEffect(() => {
+    void desktopApi.setUnsentDraftSessions(unsentDraftKey ? unsentDraftKey.split("\u0000") : []);
+  }, [desktopApi, unsentDraftKey]);
+  // One microphone for the window; which input receives the words is decided by
+  // focus. Each composer registers itself below through `useDictationTarget`.
+  const dictation = useDictation(desktopApi);
+  // The section composer. Dictation types into it the same way the user does —
+  // through the field's own handle — so a spoken sentence and a typed
+  // correction can be mixed freely, and it reads the live value rather than
+  // App's render-time copy because the transcript has to notice edits the
+  // moment they happen.
+  const mainDictation = useDictationTarget(
+    dictation,
+    activeThread?.id ?? "composer",
+    useCallback(() => composerTextRef.current, []),
+    useCallback((text: string) => composerFieldRef.current?.setText(text), []),
+    focusComposerSoon,
+    true,
+  );
+  // The global-shortcut overlay. Same microphone, same shortcuts — the only
+  // difference is which box the words land in.
+  const quickStartInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const quickStartDictation = useDictationTarget(
+    dictation,
+    "quick-start",
+    () => quickStartDraftRef.current,
+    applyQuickStartDraft,
+    () => quickStartInputRef.current?.focus(),
+  );
   const contextThread = useMemo(
     () => threads.find((thread) => thread.id === contextMenu?.threadId),
     [contextMenu?.threadId, threads],
@@ -3346,15 +5105,118 @@ export default function App(): React.ReactElement {
     [filesThreadId, threads],
   );
   const activeConversation = useMemo(
-    () => (activeThread ? (conversationItems[activeThread.id] ?? []) : []),
-    [activeThread, conversationItems],
+    () =>
+      activeThread
+        ? mergeMarkersByTime(
+            conversationItems[activeThread.id] ?? [],
+            modelChangeMarkers(activeThread, codexModels),
+          )
+        : [],
+    [activeThread, codexModels, conversationItems],
   );
+  const activeStoredConversation = activeThread
+    ? (conversationItems[activeThread.id] ?? EMPTY_CONVERSATION)
+    : EMPTY_CONVERSATION;
+  const activeConversationRuntime = activeThread?.runtime ?? "claude";
+  const activeConversationCanLoad = Boolean(
+    activeThread &&
+      !onDraftRoute &&
+      shouldReloadTranscript({
+        status: activeThread.status,
+        transcriptDropped: droppedTranscriptThreadIdsRef.current.has(activeThread.id),
+      }) &&
+      ((activeConversationRuntime === "claude" && activeThread.claudeSessionId) ||
+        (activeConversationRuntime === "codex" && activeThread.codexThreadId)),
+  );
+  // Do not flash the misleading empty state while an idle section's history is
+  // on its way from disk. Cached messages remain visible during later refreshes.
+  const conversationHydrating = Boolean(
+    activeThread &&
+      activeStoredConversation.length === 0 &&
+      activeConversationCanLoad &&
+      conversationLoadState[activeThread.id] !== "loaded" &&
+      conversationLoadState[activeThread.id] !== "error",
+  );
+  // Items revealed beyond the configured window by "Show earlier", per section.
+  // Kept per section rather than reset on switch: having expanded a long history
+  // once, coming back to it and finding it re-collapsed reads as data loss.
+  const [revealedTranscriptItems, setRevealedTranscriptItems] = useState<Record<string, number>>({});
+
+  /**
+   * How much of the active section's transcript is mounted.
+   *
+   * Windowing only the *render*: every item stays in `conversationItems`, so
+   * search, export, /btw seeding and the turn-state derivations above keep
+   * seeing the whole conversation. The only thing bounded is how much of it
+   * becomes a React tree — which is the part that gets rebuilt on every turn
+   * boundary and is what makes a long section slow to type into.
+   */
+  const transcriptWindowSize = effectiveHygiene(preferences).transcriptWindowSize;
+  const hiddenTranscriptCount = useMemo(() => {
+    if (!activeThread) return 0;
+    const revealed = revealedTranscriptItems[activeThread.id] ?? 0;
+    return computeHiddenTranscriptCount(activeConversation.length, transcriptWindowSize, revealed);
+  }, [activeConversation.length, activeThread, revealedTranscriptItems, transcriptWindowSize]);
+  const windowedConversation = useMemo(
+    () => (hiddenTranscriptCount > 0 ? activeConversation.slice(hiddenTranscriptCount) : activeConversation),
+    [activeConversation, hiddenTranscriptCount],
+  );
+  const showEarlierTranscript = (): void => {
+    if (!activeThread) return;
+    const page = conversationPages[activeThread.id];
+    if (hiddenTranscriptCount === 0 && page?.hasEarlier && page.beforeCursor && !page.loading) {
+      const { id, cwd, claudeSessionId, codexThreadId } = activeThread;
+      setConversationPages((current) => ({ ...current, [id]: { ...current[id], hasEarlier: true, loading: true } }));
+      void desktopApi
+        .loadConversation({ cwd, claudeSessionId, codexThreadId, beforeCursor: page.beforeCursor })
+        .then(({ items, tokenUsage, beforeCursor, hasEarlier }) => {
+          setConversationItems((current) => ({ ...current, [id]: mergeConversationItems(current[id] ?? [], items) }));
+          setTokenUsageByThread((current) => ({ ...current, [id]: tokenUsage }));
+          setConversationPages((current) => ({
+            ...current,
+            [id]: { beforeCursor, hasEarlier: hasEarlier === true, loading: false },
+          }));
+        })
+        .catch(() => {
+          setConversationPages((current) => ({
+            ...current,
+            [id]: { ...current[id], hasEarlier: current[id]?.hasEarlier ?? true, loading: false },
+          }));
+        });
+      return;
+    }
+    const step = transcriptWindowSize > 0 ? transcriptWindowSize : hiddenTranscriptCount;
+    setRevealedTranscriptItems((current) => ({
+      ...current,
+      [activeThread.id]: (current[activeThread.id] ?? 0) + step,
+    }));
+  };
+
   const activeBtw = activeThread ? (btwByThread[activeThread.id] ?? EMPTY_BTW) : EMPTY_BTW;
+  // The board of the workspace on screen, for the two places a card is named by
+  // number rather than opened from the board: `#` in the composer, and `#12` in
+  // a rendered message. Both want the same live list, so it is loaded once here
+  // rather than by each of them.
+  const { backlog: activeBacklog } = useWorkspaceBacklog(activeThread?.cwd ?? null, desktopApi);
+  const backlogCards = useMemo<BacklogCardIndex>(
+    () => new Map(activeBacklog.items.map((item) => [item.number, { id: item.id, title: item.title }])),
+    [activeBacklog],
+  );
+  const composerCards = useMemo<ComposerCard[]>(
+    () =>
+      activeBacklog.items.map((item) => ({
+        number: item.number,
+        title: item.title,
+        summary: item.summary,
+        column: COLUMN_LABELS[item.column],
+      })),
+    [activeBacklog],
+  );
   const btwDraft = btwDraftByThread[activeDraftKey] ?? "";
   activeCwdRef.current = activeThread?.cwd ?? DEFAULT_WORKSPACE;
   defaultLaunchSettingsRef.current = {
     runtime: defaultRuntime,
-    model: defaultRuntime === "codex" ? defaultCodexModel : defaultModel,
+    model: defaultRuntime === "codex" ? defaultCodexModel : defaultRuntime === "groq" ? defaultGroqModel : launchDefaultModel,
     effort: defaultRuntime === "codex" ? defaultCodexEffort : defaultEffort,
     permissionMode: defaultRuntime === "codex" ? defaultCodexSandbox : defaultPermissionMode,
   };
@@ -3427,10 +5289,14 @@ export default function App(): React.ReactElement {
       workspaceMenu ||
       pendingDeleteThreadId ||
       previewImage ||
+      readerOpen ||
       quickStartOpen ||
       newSectionChooserOpen ||
       promptHistoryOpen ||
       searchOpen ||
+      backlogWorkspace ||
+      taskView ||
+      scheduleWorkspace ||
       gitWorkspace ||
       filesThreadId
     ) {
@@ -3450,51 +5316,40 @@ export default function App(): React.ReactElement {
     workspaceMenu,
     pendingDeleteThreadId,
     previewImage,
+    readerOpen,
     quickStartOpen,
     newSectionChooserOpen,
     promptHistoryOpen,
     searchOpen,
+    backlogWorkspace,
+    taskView,
+    scheduleWorkspace,
     gitWorkspace,
     filesThreadId,
     focusComposerSoon,
   ]);
+
+  // A `panda://backlog/<id>` link in a transcript. The board is per workspace
+  // and the link has no cwd in it, so it opens on the workspace of the section
+  // whose transcript is on screen — the one whose agent wrote the link. Just
+  // the card: the board is a button away on it, for when that is what was meant.
+  useEffect(() => {
+    const onOpenBacklogItem = (event: Event): void => {
+      const id = (event as CustomEvent<{ id?: string }>).detail?.id;
+      if (!id) {
+        return;
+      }
+      setTaskView({ cwd: activeCwdRef.current, itemId: id });
+    };
+    window.addEventListener(OPEN_BACKLOG_ITEM_EVENT, onOpenBacklogItem);
+    return () => window.removeEventListener(OPEN_BACKLOG_ITEM_EVENT, onOpenBacklogItem);
+  }, []);
 
   const logRenderer = useCallback(
     (event: string, details?: Record<string, unknown>) => {
       void desktopApi.logEvent({ source: "renderer", event, details });
     },
     [desktopApi],
-  );
-
-  const notifyThreadDone = useCallback(
-    (thread: Thread) => {
-      if (preferences.notificationsPaused || typeof Notification === "undefined" || Notification.permission !== "granted") {
-        return;
-      }
-
-      const needsAction = thread.agentState === "needs_action";
-      const notification = new Notification(thread.title?.trim() || "Panda Code", {
-        body: needsAction ? "Needs your input" : "Finished — ready for your next prompt",
-        tag: `panda-code:${thread.id}`,
-      });
-      notification.onclick = () => {
-        notification.close();
-        setShowSettings(false);
-        setQuickStartOpen(false);
-        setSearchOpen(false);
-        setPromptHistoryOpen(false);
-        setActiveThreadId(thread.id);
-        setExpandedWorkspaces((current) => new Set(current).add(thread.cwd));
-        setAttentionThreadIds((current) => {
-          if (!current.has(thread.id)) return current;
-          const next = new Set(current);
-          next.delete(thread.id);
-          return next;
-        });
-        void desktopApi.focusWindow().then(focusComposerSoon);
-      };
-    },
-    [desktopApi, focusComposerSoon, preferences.notificationsPaused],
   );
 
   // A section is project-less when it carries the flag or simply lives in the
@@ -3509,6 +5364,148 @@ export default function App(): React.ReactElement {
     (cwd: string): string => (isScratchCwd(cwd) ? SCRATCH_WORKSPACE_LABEL : workspaceName(cwd)),
     [isScratchCwd],
   );
+
+  /**
+   * Sub-threads by parent id, for every workspace at once.
+   *
+   * One map rather than one per group because a sub-thread renders wherever its
+   * parent does — including in the starred list, which is not a workspace group
+   * at all. Starred sections are excluded as CHILDREN (they are lifted to the
+   * top of the sidebar, and a row that renders twice is a row whose selected
+   * state can disagree with itself) but not as PARENTS.
+   */
+  const subthreadsByParent = useMemo<Map<string, Thread[]>>(() => {
+    const byParent = new Map<string, Thread[]>();
+    const ordered = [...threads].sort((first, second) => threadOrderKey(second).localeCompare(threadOrderKey(first)));
+    // Whatever renders at the top must NOT also render as somebody's child:
+    // that is one section on screen twice, with two selection states.
+    const roots = new Set(topLevelThreads(ordered.filter((thread) => !thread.draft)).map((thread) => thread.id));
+    for (const thread of ordered) {
+      if (thread.draft || thread.starred || !thread.parentId || roots.has(thread.id)) continue;
+      byParent.set(thread.parentId, [...(byParent.get(thread.parentId) ?? []), thread]);
+    }
+    return byParent;
+  }, [threads]);
+
+  /**
+   * Parents whose sub-threads are folded away. Collapsed rather than expanded is
+   * what is stored, so a section that gains sub-threads shows them: the whole
+   * point of the tree is that delegated work is visible without being looked
+   * for, and a default of "hidden until you expand" is the flat list again.
+   */
+  const [collapsedSubthreads, setCollapsedSubthreads] = useState<Set<string>>(storedCollapsedSubthreads);
+
+  useEffect(() => {
+    localStorage.setItem(COLLAPSED_SUBTHREADS_KEY, JSON.stringify([...collapsedSubthreads]));
+  }, [collapsedSubthreads]);
+
+  /**
+   * Selects a section and unfolds whatever is hiding its row — its workspace
+   * group, a collapsed parent — then scrolls that row into view once it has
+   * mounted. Shared by the notification click and the sidebar's own
+   * off-screen-finish callout, so both land the same way.
+   */
+  const jumpToThread = useCallback((thread: Thread) => {
+    setShowSettings(false);
+    setQuickStartOpen(false);
+    setSearchOpen(false);
+    setPromptHistoryOpen(false);
+    setExpandedWorkspaces((current) => (current.has(thread.cwd) ? current : new Set(current).add(thread.cwd)));
+    // A starred section lives only in the starred list, so folding that list
+    // away hides its row entirely — unfold it too, or the jump scrolls to
+    // nothing.
+    if (thread.starred) {
+      setStarredCollapsed(false);
+    }
+    if (thread.parentId) {
+      const parentId = thread.parentId;
+      setCollapsedSubthreads((current) => {
+        if (!current.has(parentId)) return current;
+        const next = new Set(current);
+        next.delete(parentId);
+        return next;
+      });
+    }
+    setActiveThreadId(thread.id);
+    setAttentionThreadIds((current) => {
+      if (!current.has(thread.id)) return current;
+      const next = new Set(current);
+      next.delete(thread.id);
+      return next;
+    });
+    pendingScrollThreadIdRef.current = thread.id;
+  }, []);
+
+  const markAttentionThreadsRead = useCallback((ids: Iterable<string>): void => {
+    const readIds = new Set(ids);
+    if (readIds.size === 0) return;
+    setAttentionThreadIds((current) => {
+      if (!Array.from(readIds).some((id) => current.has(id))) return current;
+      const next = new Set(current);
+      for (const id of readIds) next.delete(id);
+      return next;
+    });
+  }, []);
+
+  const dismissAttention = useCallback((id: string): void => {
+    setAttentionQueue((current) => current.filter((event) => event.id !== id));
+    setMinimizedAttentionIds((current) => {
+      if (!current.has(id)) return current;
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+
+  const openAttentionThread = useCallback((event: AgentAttentionEvent): void => {
+    const thread = threadsRef.current.find((candidate) => candidate.id === event.threadId);
+    if (thread) jumpToThread(thread);
+    dismissAttention(event.id);
+    focusComposerSoon();
+  }, [dismissAttention, focusComposerSoon, jumpToThread]);
+
+  const answerAttention = useCallback((event: AgentAttentionEvent, response: string): void => {
+    void desktopApi.sendInput({ id: event.threadId, data: response }).then((result) => {
+      if (!result.ok) return;
+      dismissAttention(event.id);
+      const thread = threadsRef.current.find((candidate) => candidate.id === event.threadId);
+      if (thread) jumpToThread(thread);
+    });
+  }, [desktopApi, dismissAttention, jumpToThread]);
+
+  const notifyThreadDone = useCallback(
+    (thread: Thread) => {
+      if (preferences.notificationsPaused || typeof Notification === "undefined" || Notification.permission !== "granted") {
+        return;
+      }
+
+      const needsAction = thread.agentState === "needs_action";
+      const notification = new Notification(thread.title?.trim() || "Panda Code", {
+        body: needsAction ? "Needs your input" : "Finished — ready for your next prompt",
+        tag: `panda-code:${thread.id}`,
+      });
+      notification.onclick = () => {
+        notification.close();
+        jumpToThread(thread);
+        void desktopApi.focusWindow().then(focusComposerSoon);
+      };
+    },
+    [desktopApi, focusComposerSoon, jumpToThread, preferences.notificationsPaused],
+  );
+
+  const toggleSubthreads = useCallback((parentId: string): void => {
+    setCollapsedSubthreads((current) => {
+      const next = new Set(current);
+      if (!next.delete(parentId)) next.add(parentId);
+      return next;
+    });
+  }, []);
+
+  const activeParentThread = useMemo<Thread | undefined>(
+    () => threads.find((thread) => thread.id === activeThread?.parentId),
+    [threads, activeThread?.parentId],
+  );
+  const activeSubthreads = subthreadsByParent.get(activeThread?.id ?? "") ?? [];
 
   const starredThreads = useMemo<Thread[]>(
     () =>
@@ -3545,11 +5542,31 @@ export default function App(): React.ReactElement {
       groups.set(scratchCwd, []);
     }
 
-    const built = Array.from(groups, ([cwd, groupThreads]) => ({
-      cwd,
-      threads: groupThreads.sort((first, second) =>
+    // Which sections exist in each workspace at all — starred ones included.
+    // A sub-thread follows its parent WHEREVER that parent renders, so a child
+    // of a starred section is not a root here: it appears under it in the
+    // starred list. Rendering it in both places is the one outcome to avoid,
+    // since the two copies then disagree about which is selected.
+    const byCwd = new Map<string, Thread[]>();
+    for (const thread of threads) {
+      if (thread.draft) continue;
+      byCwd.set(thread.cwd, [...(byCwd.get(thread.cwd) ?? []), thread]);
+    }
+    // Resolved against every section in the workspace — starred ones included —
+    // so a child of a starred parent is not counted as a root here, and a
+    // broken or looping link still renders somewhere rather than nowhere.
+    const rootIdsByCwd = new Map(
+      Array.from(byCwd, ([cwd, all]) => [cwd, new Set(topLevelThreads(all).map((thread) => thread.id))] as const),
+    );
+
+    const built = Array.from(groups, ([cwd, groupThreads]) => {
+      const byRecency = groupThreads.sort((first, second) =>
         threadOrderKey(second).localeCompare(threadOrderKey(first)),
-      ),
+      );
+      const roots = rootIdsByCwd.get(cwd) ?? new Set<string>();
+      return {
+      cwd,
+      threads: byRecency.filter((thread) => roots.has(thread.id)),
       // Group's representative sort value: the newest stable order key across
       // its threads (prompt time, createdAt fallback — never the churny
       // lastActiveAt), so a reload's replay can't reshuffle workspace order.
@@ -3560,7 +5577,8 @@ export default function App(): React.ReactElement {
         },
         groupThreads[0] ? threadOrderKey(groupThreads[0]) : "",
       ),
-    }));
+      };
+    });
 
     // Order by the persisted manual order so workspaces stay put across new
     // events. Freshly created workspaces (not yet tracked) sort to the front,
@@ -3698,6 +5716,17 @@ export default function App(): React.ReactElement {
     endWorkspaceDrag();
   }, [draggingWorkspace, workspaceDropIndex, previewWorkspaceGroups, endWorkspaceDrag]);
 
+  // Session archiving is a device-local view toggle (see ARCHIVED_THREADS_KEY):
+  // it hides a workspace group's row from the default view without touching
+  // the session itself. Shared by the Cmd+1-9 jump list below and the sidebar
+  // render further down so both agree on what is actually on screen.
+  const getDisplayedGroupThreads = (group: WorkspaceGroup): Thread[] => {
+    if (showArchivedByCwd[group.cwd]) {
+      return group.threads;
+    }
+    return group.threads.filter((thread) => !archivedThreadIds.has(thread.id));
+  };
+
   // Flat list of threads in the exact order they appear in the sidebar
   // (starred first, then each workspace group). Drives the Cmd+1-9 shortcuts
   // so pressing a number jumps to the Nth session as it reads top to bottom.
@@ -3706,17 +5735,37 @@ export default function App(): React.ReactElement {
   // slice — otherwise the numbers drift off what the user is looking at.
   const sidebarOrderedThreads = useMemo<Thread[]>(
     () => [
-      ...starredThreads,
+      ...(starredCollapsed
+        ? []
+        : starredThreads.flatMap((thread) =>
+            flattenThreadTree(thread, subthreadsByParent, collapsedSubthreads, visibleSubthreadCounts),
+          )),
       ...workspaceGroups.flatMap((group) => {
         if (!expandedWorkspaces.has(group.cwd)) return [];
+        const displayedThreads = getDisplayedGroupThreads(group);
         const visibleCount = Math.min(
           visibleSessionCounts[group.cwd] ?? INITIAL_VISIBLE_SESSIONS,
-          group.threads.length,
+          displayedThreads.length,
         );
-        return group.threads.slice(0, visibleCount);
+        return displayedThreads
+          .slice(0, visibleCount)
+          .flatMap((thread) =>
+            flattenThreadTree(thread, subthreadsByParent, collapsedSubthreads, visibleSubthreadCounts),
+          );
       }),
     ],
-    [starredThreads, workspaceGroups, expandedWorkspaces, visibleSessionCounts],
+    [
+      starredThreads,
+      starredCollapsed,
+      workspaceGroups,
+      expandedWorkspaces,
+      visibleSessionCounts,
+      subthreadsByParent,
+      collapsedSubthreads,
+      visibleSubthreadCounts,
+      archivedThreadIds,
+      showArchivedByCwd,
+    ],
   );
   const sidebarOrderedThreadsRef = useRef(sidebarOrderedThreads);
   sidebarOrderedThreadsRef.current = sidebarOrderedThreads;
@@ -3748,12 +5797,38 @@ export default function App(): React.ReactElement {
     return list;
   }, [activeThread?.cwd, workspaceGroups, threads, quickStartCwd, scratchCwd]);
 
+  // Runtime ticks (onSessionRuntime) call this on every streamed token from
+  // every running section, almost always with a patch identical to what's
+  // already there (agentState stays "working" for the whole turn). Without a
+  // dirty-check this stamped a fresh array + a fresh lastActiveAt on every
+  // tick, which — since the sidebar has no per-row memoization boundary —
+  // forced the whole thread list to re-render dozens of times a second per
+  // running section. Skip the update (same array reference) when nothing in
+  // the patch actually differs, so setState is a true no-op.
   const updateThread = useCallback((id: string, patch: Partial<Thread>) => {
-    setThreads((current) =>
-      current.map((thread) =>
-        thread.id === id ? { ...thread, ...patch, lastActiveAt: new Date().toISOString() } : thread,
-      ),
-    );
+    setThreads((current) => {
+      let changed = false;
+      const next = current.map((thread) => {
+        if (thread.id !== id) return thread;
+        const dirty = (Object.keys(patch) as (keyof Thread)[]).some((key) => thread[key] !== patch[key]);
+        if (!dirty) return thread;
+        changed = true;
+        return { ...thread, ...patch, lastActiveAt: new Date().toISOString() };
+      });
+      return changed ? next : current;
+    });
+  }, []);
+
+  const rememberPrompt = useCallback((threadId: string, entry: SessionPromptHistoryEntry): void => {
+    setThreads((current) => {
+      let changed = false;
+      const next = current.map((thread) => {
+        if (thread.id !== threadId || thread.promptHistory?.some((saved) => saved.id === entry.id)) return thread;
+        changed = true;
+        return { ...thread, promptHistory: [...(thread.promptHistory ?? []), entry] };
+      });
+      return changed ? next : current;
+    });
   }, []);
 
   const markRuntimeActivity = useCallback((id: string, source: RuntimeActivity["source"], detail: string) => {
@@ -3916,11 +5991,74 @@ export default function App(): React.ReactElement {
     // The draft is renderer-only state: it must never reach localStorage or
     // threads.json, or an abandoned composer would come back as a real section.
     const persisted = persistableThreads(threads);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persisted));
-    if (hasLoadedStoredThreadsRef.current) {
-      void desktopApi.saveThreads(persisted);
-    }
+    const flush = (): void => {
+      // Clear first: whoever calls this has taken responsibility for the write,
+      // and the teardown flush must not repeat one the timer already did.
+      pendingThreadsWriteRef.current = null;
+      const started = performance.now();
+      const serialized = JSON.stringify(persisted);
+      localStorage.setItem(STORAGE_KEY, serialized);
+      // Recorded with its size: this write is synchronous and grew with the
+      // store, so knowing the bytes is what makes a regression here legible.
+      recordRendererPerf("renderer:persist-threads", performance.now() - started, serialized.length);
+      if (hasLoadedStoredThreadsRef.current) {
+        void desktopApi.saveThreads(persisted);
+      }
+    };
+
+    pendingThreadsWriteRef.current = flush;
+    const timer = window.setTimeout(flush, THREADS_PERSIST_DEBOUNCE_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
   }, [desktopApi, threads]);
+
+  // The debounce above is only safe because of this: a section renamed or
+  // started in the last half-second would otherwise be lost when the window
+  // goes away. Cleanups run in declaration order, so the timer is already
+  // cancelled by the time this flushes the value it was going to write.
+  useEffect(() => {
+    const flushPending = (): void => pendingThreadsWriteRef.current?.();
+    window.addEventListener("pagehide", flushPending);
+    return () => {
+      window.removeEventListener("pagehide", flushPending);
+      flushPending();
+    };
+  }, []);
+
+  useEffect(() => startRendererPerf(desktopApi), [desktopApi]);
+
+  // Import prompts from transcripts created before the durable index existed.
+  // This is deliberately incremental: once imported, clearing or windowing the
+  // transcript can no longer make them disappear from /prompts.
+  useEffect(() => {
+    setThreads((current) => {
+      let changed = false;
+      const next = current.map((thread) => {
+        const saved = thread.promptHistory ?? [];
+        const known = new Set(saved.map((entry) => promptHistorySignature(entry.text, entry.timestamp)));
+        const additions = (conversationItems[thread.id] ?? [])
+          .filter((item) => item.kind === "user" && item.body.trim().length > 0)
+          .map((item) => ({
+            id: item.id,
+            text: promptHistoryText(item.body),
+            attachments: attachedImagePathsFromBody(item.body).length,
+            timestamp: item.timestamp ?? "",
+            conversationItemId: item.id,
+          }))
+          .filter((entry) => {
+            const signature = promptHistorySignature(entry.text, entry.timestamp);
+            if (known.has(signature)) return false;
+            known.add(signature);
+            return true;
+          });
+        if (additions.length === 0) return thread;
+        changed = true;
+        return { ...thread, promptHistory: [...saved, ...additions] };
+      });
+      return changed ? next : current;
+    });
+  }, [conversationItems]);
 
   useEffect(() => {
     localStorage.setItem(DEFAULT_COMMAND_KEY, defaultCommand.trim() || DEFAULT_COMMAND);
@@ -3955,16 +6093,48 @@ export default function App(): React.ReactElement {
   }, [defaultCodexSandbox]);
 
   useEffect(() => {
+    localStorage.setItem(DEFAULT_GROQ_MODEL_KEY, defaultGroqModel.trim());
+  }, [defaultGroqModel]);
+
+  useEffect(() => {
     localStorage.setItem(EXPANDED_WORKSPACES_KEY, JSON.stringify(Array.from(expandedWorkspaces)));
   }, [expandedWorkspaces]);
+
+  useEffect(() => {
+    localStorage.setItem(STARRED_COLLAPSED_KEY, starredCollapsed ? "true" : "false");
+  }, [starredCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem(ARCHIVED_THREADS_KEY, JSON.stringify(Array.from(archivedThreadIds)));
+  }, [archivedThreadIds]);
 
   useEffect(() => {
     localStorage.setItem(WORKSPACE_ORDER_KEY, JSON.stringify(workspaceOrder));
   }, [workspaceOrder]);
 
   useEffect(() => {
-    localStorage.setItem(NOTIFICATIONS_KEY, notificationsEnabled ? "on" : "off");
-  }, [notificationsEnabled]);
+    if (!contextMenu) {
+      setContextMobileNotifications(null);
+      return;
+    }
+    let cancelled = false;
+    setContextMobileNotifications(null);
+    const timeout = window.setTimeout(() => {
+      if (!cancelled) setContextMobileNotifications({ available: false, phoneCount: 0, subscribedPhones: 0 });
+    }, 3_500);
+    void desktopApi.getSessionMobileNotifications(contextMenu.threadId).then((status) => {
+      if (!cancelled) {
+        window.clearTimeout(timeout);
+        setContextMobileNotifications(status);
+      }
+    }).catch(() => {
+      if (!cancelled) setContextMobileNotifications({ available: false, phoneCount: 0, subscribedPhones: 0 });
+    });
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [contextMenu?.threadId, desktopApi]);
 
   useEffect(() => {
     localStorage.setItem(FOCUS_MODE_KEY, focusMode ? "on" : "off");
@@ -3973,6 +6143,28 @@ export default function App(): React.ReactElement {
   useEffect(() => {
     localStorage.setItem(TERMINAL_TABS_KEY, JSON.stringify(terminalTabsByThread));
   }, [terminalTabsByThread]);
+
+  // The sidebar's browser mark. See `browserMarksByThread`: this reduces the
+  // firehose to one small object per section and keeps the old one when nothing
+  // visible changed, so a page loading somewhere does not re-render the app.
+  useEffect(() => {
+    const apply = (state: BrowserState): void => {
+      const next: Record<string, { tabs: number; note: boolean }> = {};
+      for (const tab of state.tabs) {
+        const current = next[tab.threadId] ?? { tabs: 0, note: false };
+        next[tab.threadId] = { tabs: current.tabs + 1, note: current.note || Boolean(tab.note) };
+      }
+      setBrowserMarksByThread((previous) => {
+        const keys = Object.keys(next);
+        const same =
+          keys.length === Object.keys(previous).length &&
+          keys.every((key) => previous[key]?.tabs === next[key]?.tabs && previous[key]?.note === next[key]?.note);
+        return same ? previous : next;
+      });
+    };
+    void desktopApi.browserState().then(apply);
+    return desktopApi.onBrowserState(apply);
+  }, [desktopApi]);
 
   // Reconcile persisted terminal tabs against the ptys main actually holds.
   // Tabs survive a renderer reload (main owns the ptys), but an app restart
@@ -4078,14 +6270,160 @@ export default function App(): React.ReactElement {
     [btwWidth],
   );
 
+  const browserPanelOpen = Boolean(activeThread && openBrowserThreadIds.has(activeThread.id));
+  const browserPresentation: BrowserPresentation =
+    (activeThread && browserPresentationByThread[activeThread.id]) || "docked";
+
+  const toggleBrowserPanel = useCallback((): void => {
+    const threadId = activeThread?.id;
+    if (!threadId) return;
+    setOpenBrowserThreadIds((current) => {
+      const next = new Set(current);
+      if (next.has(threadId)) next.delete(threadId);
+      else next.add(threadId);
+      return next;
+    });
+  }, [activeThread?.id]);
+
+  // The shortcut handler is registered once, so it reads the latest toggle
+  // through a ref rather than re-binding on every section switch.
+  const toggleBrowserPanelRef = useRef(toggleBrowserPanel);
+  toggleBrowserPanelRef.current = toggleBrowserPanel;
+
+  // The floating window asking the app to come to a section — the way back from
+  // a page to the conversation that opened it.
   useEffect(() => {
-    void desktopApi.loadPreferences().then(setPreferences);
+    return desktopApi.onBrowserFocusThread(({ threadId }) => {
+      if (threadId) setActiveThreadId(threadId);
+    });
+  }, [desktopApi]);
+
+  /**
+   * Tell main whether this section's browser is really on screen.
+   *
+   * Agents ask "can the user see this page", and the only honest answer comes
+   * from here: the panel has to be open, this has to be the section in view, and
+   * the window has to not be minimised or behind something.
+   */
+  useEffect(() => {
+    const threadId = activeThread?.id;
+    if (!threadId) return;
+
+    const report = (): void => {
+      void desktopApi.browserSetPanelVisible({
+        threadId,
+        visible: browserPanelOpen && !document.hidden && document.hasFocus(),
+      });
+    };
+    report();
+    window.addEventListener("focus", report);
+    window.addEventListener("blur", report);
+    document.addEventListener("visibilitychange", report);
+    return () => {
+      // Leaving a section, or closing the panel, means it is no longer showing.
+      void desktopApi.browserSetPanelVisible({ threadId, visible: false });
+      window.removeEventListener("focus", report);
+      window.removeEventListener("blur", report);
+      document.removeEventListener("visibilitychange", report);
+    };
+  }, [activeThread?.id, browserPanelOpen, desktopApi]);
+
+  // A shell caller (`panda-peers browser …`) has no section of its own, so main
+  // acts on the one in front of the user. It only knows that if we say so.
+  useEffect(() => {
+    void desktopApi.browserSetActiveThread(activeThread?.id ?? "");
+  }, [activeThread?.id, desktopApi]);
+
+  /**
+   * The grip on the browser dock's left edge.
+   *
+   * Two things this needs that /btw's does not, both because the thing being
+   * resized is a live web page rather than DOM:
+   *
+   * 1. Pointer capture. A `<webview>` is its own compositing layer and eats
+   *    mouse events, so the moment the pointer crossed the page the drag died
+   *    mid-gesture. `setPointerCapture` keeps every move coming here — and the
+   *    CSS turns off hit-testing on the guests for the duration as a belt to
+   *    that brace.
+   * 2. Frame coalescing. A mousemove can arrive several times per frame, and
+   *    each one relaid out a full page; on a heavy page that stutters badly.
+   *    One width change per frame is all a screen can show anyway.
+   */
+  const startBrowserResize = useCallback(
+    (event: React.PointerEvent) => {
+      event.preventDefault();
+      const grip = event.currentTarget;
+      grip.setPointerCapture(event.pointerId);
+      setResizingBrowser(true);
+
+      const startX = event.clientX;
+      const startWidth = browserWidth;
+      let frame = 0;
+      let pending = startWidth;
+
+      const onMove = (moveEvent: Event) => {
+        const point = moveEvent as PointerEvent;
+        pending = clampBrowserWidth(startWidth - (point.clientX - startX));
+        if (frame) return;
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          setBrowserWidth(pending);
+        });
+      };
+      const onUp = () => {
+        cancelAnimationFrame(frame);
+        setBrowserWidth(pending);
+        setResizingBrowser(false);
+        grip.releasePointerCapture(event.pointerId);
+        grip.removeEventListener("pointermove", onMove);
+        grip.removeEventListener("pointerup", onUp);
+        grip.removeEventListener("pointercancel", onUp);
+      };
+      grip.addEventListener("pointermove", onMove);
+      grip.addEventListener("pointerup", onUp);
+      grip.addEventListener("pointercancel", onUp);
+    },
+    [browserWidth],
+  );
+
+  // A window that shrinks must not leave the browser wider than it can afford.
+  useEffect(() => {
+    const onResize = (): void => setBrowserWidth((current) => clampBrowserWidth(current));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(BROWSER_WIDTH_KEY, String(browserWidth));
+  }, [browserWidth]);
+
+  useEffect(() => {
+    void desktopApi.loadPreferences().then(async (loaded) => {
+      if (!loaded.notificationChannels) {
+        loaded = await desktopApi.savePreferences({ notificationChannels: normalizeNotificationChannels({
+          desktop: storedNotificationsEnabled(), agent: storedAgentNotificationsEnabled(), sessions: storedSessionNotificationOverrides(),
+        }) });
+      }
+      setPreferences(loaded);
+    });
     return desktopApi.onPreferencesChanged(setPreferences);
   }, [desktopApi]);
+
+  useEffect(() => {
+    setRelayUrlDraft(preferences.relayUrl);
+  }, [preferences.relayUrl]);
 
   const refreshRemoteDevices = useCallback(() => {
     void desktopApi.listRemotePairedDevices().then(setRemoteDevices).catch(() => setRemoteDevices([]));
   }, [desktopApi]);
+
+  useEffect(() => {
+    if (!preferences.relayUrl) {
+      setRemoteDevices([]);
+    } else if (showSettings && (settingsTab === "phone" || settingsTab === "notifications")) {
+      refreshRemoteDevices();
+    }
+  }, [preferences.relayUrl, refreshRemoteDevices, settingsTab, showSettings]);
 
   useEffect(() => {
     if (showSettings) {
@@ -4096,7 +6434,7 @@ export default function App(): React.ReactElement {
   useEffect(() => {
     return desktopApi.onQuickStart(() => {
       const defaults = defaultLaunchSettingsRef.current;
-      setQuickStartDraft("");
+      applyQuickStartDraft("");
       // Default the target project to whatever a new section would use now.
       setQuickStartCwd(activeCwdRef.current);
       setQuickStartRuntime(defaults.runtime);
@@ -4113,6 +6451,22 @@ export default function App(): React.ReactElement {
       setQuickStartOpen(true);
     });
   }, [desktopApi]);
+
+  useEffect(() => {
+    return desktopApi.onAgentAttention((event) => {
+      setAttentionQueue((current) =>
+        current.some((candidate) => candidate.id === event.id)
+          ? current
+          : [...current.filter((candidate) => candidate.threadId !== event.threadId), event],
+      );
+    });
+  }, [desktopApi]);
+
+  useEffect(() => {
+    if (!activeAttention) return;
+    void desktopApi.focusWindow();
+    return playAgentNotificationSound();
+  }, [activeAttention?.id]);
 
   useEffect(() => {
     if (!searchOpen) {
@@ -4133,6 +6487,7 @@ export default function App(): React.ReactElement {
         id: thread.id,
         cwd: thread.cwd,
         claudeSessionId: thread.claudeSessionId,
+        codexThreadId: thread.codexThreadId,
         title: thread.title,
         workspaceName: workspaceLabel(thread.cwd),
       }));
@@ -4149,6 +6504,16 @@ export default function App(): React.ReactElement {
       window.clearTimeout(timer);
     };
   }, [desktopApi, searchOpen, searchQuery, workspaceLabel]);
+
+  useEffect(() => {
+    // An agent opening a tab or leaving a note asks for the panel. It is the
+    // one thing in the browser main pushes at the UI rather than answering:
+    // a note the user never sees is not a hand-off.
+    return desktopApi.onBrowserReveal(({ threadId }) => {
+      if (!threadId) return;
+      setOpenBrowserThreadIds((current) => new Set(current).add(threadId));
+    });
+  }, [desktopApi]);
 
   useEffect(() => {
     // A shell that exits (user typed `exit`, or it crashed) closes its tab.
@@ -4170,13 +6535,13 @@ export default function App(): React.ReactElement {
   }, [desktopApi]);
 
   useEffect(() => {
-    if (!notificationsEnabled || typeof Notification === "undefined") {
+    if (!anyDesktopNotificationsEnabled || typeof Notification === "undefined") {
       return;
     }
     if (Notification.permission === "default") {
       void Notification.requestPermission();
     }
-  }, [notificationsEnabled]);
+  }, [anyDesktopNotificationsEnabled]);
 
   // Fires once a section has been settled long enough to be a real finish
   // (see FINISH_SETTLE_MS). Reads live state via refs since it runs from a
@@ -4214,8 +6579,25 @@ export default function App(): React.ReactElement {
     }
 
     setAttentionThreadIds((current) => (current.has(threadId) ? current : new Set(current).add(threadId)));
-    if (notificationsEnabled) {
+    const channels = resolveNotificationChannels(notificationChannels, thread.id);
+    if (channels.desktop) {
       notifyThreadDone(thread);
+    }
+    if (agentAttentionAllowed(notificationChannels, thread.id, preferences.notificationsPaused, false)) {
+      const now = Date.now();
+      const needsAction = thread.agentState === "needs_action";
+      setAttentionQueue((current) => [
+        ...current.filter((event) => event.threadId !== thread.id),
+        {
+          id: `completion:${thread.id}:${now}`,
+          threadId: thread.id,
+          threadTitle: thread.title?.trim() || "Untitled section",
+          summary: needsAction ? "Needs your input" : "Finished — ready for your next prompt",
+          severity: needsAction ? "urgent" : "important",
+          choices: [],
+          createdAt: new Date(now).toISOString(),
+        },
+      ]);
     }
   };
 
@@ -4319,6 +6701,92 @@ export default function App(): React.ReactElement {
     void desktopApi.setBadgeCount(attentionThreadIds.size);
   }, [attentionThreadIds, desktopApi]);
 
+  /**
+   * Which attention threads have no row visible anywhere in the sidebar right
+   * now. A row with no DOM element at all (its workspace is collapsed, its
+   * parent is folded, it's paged behind "show more") is off screen by
+   * definition — no observer entry for it will ever arrive. A row that does
+   * exist gets watched against the scrollable list so scrolling it past the
+   * fold, or back into view, updates this live.
+   */
+  useEffect(() => {
+    // Sub-threads are deliberately left out: they finish constantly while their
+    // parent works, and a callout for each one is noise rather than a section
+    // the user lost track of. The parent's own row carries their busy count.
+    const parentIds = new Set(threads.map((thread) => thread.id));
+    const isSubthread = (id: string): boolean => {
+      const thread = threads.find((candidate) => candidate.id === id);
+      return Boolean(thread?.parentId && parentIds.has(thread.parentId));
+    };
+    const ids = Array.from(attentionThreadIds).filter((id) => id !== activeThreadId && !isSubthread(id));
+    const root = workspaceListRef.current;
+    if (!root || ids.length === 0) {
+      setOffscreenAttentionIds((current) => (current.size === 0 ? current : new Set()));
+      return;
+    }
+
+    // Reconcile rather than reset. This effect re-runs on every `threads`
+    // change — which is every streamed token from any running section — and
+    // dropping the observer's verdict here made the callout blink off and back
+    // on as the observer re-reported a moment later. A mounted row keeps
+    // whatever the observer last said about it until the observer says
+    // otherwise; only ids that left the attention set are forgotten.
+    setOffscreenAttentionIds((current) => {
+      const next = new Set<string>();
+      for (const id of ids) {
+        if (!threadRowRefs.current.has(id) || current.has(id)) {
+          next.add(id);
+        }
+      }
+      const unchanged = next.size === current.size && Array.from(current).every((id) => next.has(id));
+      return unchanged ? current : next;
+    });
+
+    const observed = ids.filter((id) => threadRowRefs.current.has(id));
+    if (observed.length === 0) {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        setOffscreenAttentionIds((current) => {
+          const next = new Set(current);
+          for (const entry of entries) {
+            const id = (entry.target as HTMLElement).dataset.threadId;
+            if (!id) continue;
+            if (entry.isIntersecting) {
+              next.delete(id);
+            } else {
+              next.add(id);
+            }
+          }
+          return next;
+        });
+      },
+      { root, threshold: 0.6 },
+    );
+    for (const id of observed) {
+      observer.observe(threadRowRefs.current.get(id)!);
+    }
+    return () => observer.disconnect();
+  }, [attentionThreadIds, activeThreadId, expandedWorkspaces, starredCollapsed, collapsedSubthreads, visibleSessionCounts, visibleSubthreadCounts, threads]);
+
+  // A jump from the notification click or the sidebar's off-screen callout
+  // asks for a thread whose row may not exist yet (its group was just
+  // expanded). Retries on every render this effect's deps touch, until the
+  // row mounts and can actually be scrolled to.
+  useEffect(() => {
+    const id = pendingScrollThreadIdRef.current;
+    if (!id || id !== activeThreadId) {
+      return;
+    }
+    const el = threadRowRefs.current.get(id);
+    if (el) {
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+      pendingScrollThreadIdRef.current = null;
+    }
+  }, [activeThreadId, expandedWorkspaces, starredCollapsed, collapsedSubthreads, threads]);
+
   useEffect(() => {
     const closeFloatingUi = () => {
       setContextMenu(null);
@@ -4362,10 +6830,10 @@ export default function App(): React.ReactElement {
 
   useEffect(() => {
     let isMounted = true;
-    const refreshUsage = () => {
+    const refreshUsage = (force = false) => {
       setUsageLoadingProvider(usageProvider);
       void desktopApi
-        .loadUsage(usageProvider)
+        .loadUsage(usageProvider, force)
         .then((snapshot) => {
           if (isMounted) {
             setUsageByProvider((current) => ({ ...current, [usageProvider]: snapshot }));
@@ -4431,6 +6899,71 @@ export default function App(): React.ReactElement {
   }, [conversationItems]);
 
   useEffect(() => {
+    activeThreadIdRef.current = activeThreadId;
+  }, [activeThreadId]);
+
+  useEffect(() => {
+    if (activeThreadId) {
+      transcriptViewedAtRef.current = { ...transcriptViewedAtRef.current, [activeThreadId]: Date.now() };
+    }
+  }, [activeThreadId]);
+
+  /**
+   * Release the transcripts of sections nobody is looking at.
+   *
+   * Hibernation already drops the transcript of a section whose process was
+   * reaped, but that only covers sections that HAD a process. A section you
+   * opened to read, or one whose agent exited on its own, kept its full history
+   * in this window for as long as the app ran. With hundreds of sections on
+   * disk and long ones costing tens of MB of heap apiece, browsing was its own
+   * slow leak. Dropped items come back from disk via the reload-on-activate
+   * effect above, which merges rather than blanks.
+   */
+  useEffect(() => {
+    const keep = preferences.retainedTranscripts;
+    const loadedIds = Object.keys(conversationItems);
+    if (keep <= 0 || loadedIds.length <= keep) {
+      return;
+    }
+    const drop = selectTranscriptsToDrop({
+      loaded: loadedIds.map((id) => ({
+        id,
+        viewedAt: transcriptViewedAtRef.current[id] ?? 0,
+        running: threadsRef.current.find((thread) => thread.id === id)?.status === "running",
+      })),
+      activeId: activeThreadId,
+      keep,
+    });
+    if (drop.length === 0) {
+      return;
+    }
+    logRenderer("transcripts:released", { count: drop.length, keep, loaded: loadedIds.length });
+    const dropped = new Set(drop);
+    setConversationItems((current) => {
+      const next: Record<string, ConversationItem[]> = {};
+      for (const [id, items] of Object.entries(current)) {
+        if (!dropped.has(id)) next[id] = items;
+      }
+      return next;
+    });
+    setRevealedTranscriptItems((current) => {
+      const next: Record<string, number> = {};
+      for (const [id, count] of Object.entries(current)) {
+        if (!dropped.has(id)) next[id] = count;
+      }
+      return next;
+    });
+    // A released transcript owes the loading surface again the next time it is
+    // opened. Without clearing this marker, a previously-loaded empty page can
+    // briefly masquerade as the final empty state while its reload starts.
+    setConversationLoadState((current) => {
+      const next = { ...current };
+      for (const id of dropped) delete next[id];
+      return next;
+    });
+  }, [conversationItems, activeThreadId, preferences.retainedTranscripts]);
+
+  useEffect(() => {
     let isMounted = true;
 
     void desktopApi.listSessions().then((sessionIds) => {
@@ -4479,6 +7012,20 @@ export default function App(): React.ReactElement {
       feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
     }
   }, [activeConversation.length, activeThread?.agentState, activeThread?.id]);
+
+  // /prompts can target an item outside the normal render window. Once its
+  // window has expanded and React has mounted the card, put it in reading
+  // position; keeping the pending id in a ref avoids a transient scroll to the
+  // tail between those two renders.
+  useLayoutEffect(() => {
+    const id = pendingPromptScrollItemIdRef.current;
+    const feed = conversationFeedRef.current;
+    if (!id || !feed) return;
+    const target = feed.querySelector<HTMLElement>(`[data-conversation-item-id="${id}"]`);
+    if (!target) return;
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+    pendingPromptScrollItemIdRef.current = null;
+  }, [activeThread?.id, windowedConversation]);
 
   // The /btw panel follows its own tail the same way the main feed does: snap on
   // open or a section switch, then stay pinned while the aside streams unless the
@@ -4547,6 +7094,45 @@ export default function App(): React.ReactElement {
       updateThread(id, { status: exitCode === 0 ? "exited" : "error", agentState: "exited" });
     });
 
+    const removeHibernatedListener = desktopApi.onSessionHibernated(({ id, reason }) => {
+      logRenderer("session:hibernated", { id, reason });
+      // The section did not end, but its PROCESS did — and `status: "running"`
+      // is a claim about the process, not about the section. Hibernation
+      // suppresses `session:exit` on purpose, so that a reap never reads as a
+      // crash, which leaves this as the ONLY place that claim gets retracted.
+      // Without it a reaped section keeps its live dot for the rest of the app's
+      // life: ten green dots in the sidebar over four real processes, and no way
+      // for the user to tell the reaper is working.
+      //
+      // "idle" rather than "exited": nothing failed and nothing ended, there is
+      // simply no process behind this section until its next prompt resumes one.
+      // That is also what makes it safe — an idle section takes the same restart
+      // path as one whose agent exited on its own, which already works.
+      //
+      // Above the active-section guard below, because the reaper does not exempt
+      // the section you happen to be looking at: only the transcript drop has to
+      // skip it, never the status correction.
+      updateThread(id, { status: "idle", agentState: "waiting" });
+      if (activeThreadIdRef.current === id) {
+        return;
+      }
+      // Marked before the transcript goes, so opening the section can never see
+      // "dropped but not flagged" and render the empty state over a real history.
+      droppedTranscriptThreadIdsRef.current.add(id);
+      setConversationItems((current) => {
+        if (!(id in current)) return current;
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+      setRevealedTranscriptItems((current) => {
+        if (!(id in current)) return current;
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+    });
+
     const removeClaudeSessionListener = desktopApi.onClaudeSession(({ id, claudeSessionId }) => {
       logRenderer("session:claude-session", { id, claudeSessionId });
       setThreads((current) =>
@@ -4567,11 +7153,13 @@ export default function App(): React.ReactElement {
     });
 
     const removeSessionTitleListener = desktopApi.onSessionTitle(({ id, title }) => {
-      logRenderer("session:title", { id, title });
+      const nextTitle = compactSectionTitle(title);
+      if (!nextTitle) return;
+      logRenderer("session:title", { id, title: nextTitle });
       setThreads((current) =>
         current.map((thread) =>
           thread.id === id && thread.titleSource !== "manual"
-            ? { ...thread, title, titleSource: "auto", lastActiveAt: new Date().toISOString() }
+            ? { ...thread, title: nextTitle, titleSource: "auto", lastActiveAt: new Date().toISOString() }
             : thread,
         ),
       );
@@ -4624,6 +7212,10 @@ export default function App(): React.ReactElement {
 
     const removeRuntimeListener = desktopApi.onSessionRuntime(({ id, tokenUsage, claudeSessionId, codexThreadId, ...runtimeStatus }) => {
       streamRuntimeThreadIdsRef.current.add(id);
+      // A snapshot means a live process again — but NOT that the dropped
+      // transcript is back. The stream only carries what happens from here on,
+      // so the flag stays set until the reload-on-activate effect has actually
+      // merged the history from disk.
       logRenderer("session:runtime", {
         id,
         agentState: runtimeStatus.agentState,
@@ -4646,19 +7238,32 @@ export default function App(): React.ReactElement {
       if (tokenUsage) {
         setTokenUsageByThread((current) => ({ ...current, [id]: tokenUsage }));
       }
+      // Once resolved, the runtime includes claudeSessionId/codexThreadId in
+      // EVERY subsequent snapshot (every streamed token), not just the tick it
+      // first appeared on — so without the `thread.claudeSessionId !== ...`
+      // guard this re-ran a full-array map + dedupe scan on every token of
+      // every running section for the rest of its life.
       if (claudeSessionId) {
-        setThreads((current) =>
-          dedupeThreadsByClaudeSession(
-            current.map((thread) => (thread.id === id ? { ...thread, claudeSessionId, lastActiveAt: new Date().toISOString() } : thread)),
-          ),
-        );
+        setThreads((current) => {
+          const thread = current.find((candidate) => candidate.id === id);
+          if (!thread || thread.claudeSessionId === claudeSessionId) return current;
+          return dedupeThreadsByClaudeSession(
+            current.map((candidate) =>
+              candidate.id === id ? { ...candidate, claudeSessionId, lastActiveAt: new Date().toISOString() } : candidate,
+            ),
+          );
+        });
       }
       if (codexThreadId) {
-        setThreads((current) =>
-          dedupeThreadsByClaudeSession(
-            current.map((thread) => (thread.id === id ? { ...thread, codexThreadId, lastActiveAt: new Date().toISOString() } : thread)),
-          ),
-        );
+        setThreads((current) => {
+          const thread = current.find((candidate) => candidate.id === id);
+          if (!thread || thread.codexThreadId === codexThreadId) return current;
+          return dedupeThreadsByClaudeSession(
+            current.map((candidate) =>
+              candidate.id === id ? { ...candidate, codexThreadId, lastActiveAt: new Date().toISOString() } : candidate,
+            ),
+          );
+        });
       }
       clearIdleTimer(id);
       updateThread(id, { agentState: runtimeStatus.agentState, status: runtimeStatus.agentState === "exited" ? "exited" : "running" });
@@ -4740,6 +7345,9 @@ export default function App(): React.ReactElement {
         agentState: runtimeStatusByThreadRef.current[request.id]?.agentState ?? "waiting",
         createdAt: now,
         lastActiveAt: now,
+        // Set when another section (or the phone) opened this one as a
+        // sub-thread; the sidebar nests it under that parent from first paint.
+        parentId: request.parentId,
       };
       setThreads((current) =>
         current.some((thread) => thread.id === request.id) ? current : [remoteThread, ...current],
@@ -4749,6 +7357,67 @@ export default function App(): React.ReactElement {
 
     const removeStarredListener = desktopApi.onSessionStarred(({ id, starred }) => {
       updateThread(id, { starred });
+    });
+
+    // Mirrors a phone's archive/unarchive back into the local view-filter set,
+    // the same way removeStarredListener mirrors a star flip into the thread.
+    const removeArchivedListener = desktopApi.onSessionArchived(({ id, archived }) => {
+      setArchivedThreadIds((current) => {
+        const has = current.has(id);
+        if (archived === has) return current;
+        const next = new Set(current);
+        if (archived) {
+          next.add(id);
+        } else {
+          next.delete(id);
+        }
+        return next;
+      });
+    });
+
+    // A prompt sent from the phone reaches the session inside the main process,
+    // so this window never had the text to draw. Without this the section simply
+    // starts working with nothing above it explaining why, until the transcript
+    // is re-read from disk. Same optimistic item the local submit path builds.
+    const removeRemotePromptListener = desktopApi.onSessionRemotePrompt(({ id, body, timestamp }) => {
+      const submittedAt = new Date(timestamp).toISOString();
+      const promptItemId = `remote-prompt:${id}:${timestamp}`;
+      logRenderer("prompt:remote-received", { threadId: id, promptLength: body.length });
+      setConversationItems((current) => {
+        const items = current[id] ?? [];
+        // The transcript reader will produce its own copy of this turn. Match on
+        // the text rather than the id — theirs is derived from the agent's own
+        // record — so a reload does not leave the prompt on screen twice.
+        if (items.some((item) => item.kind === "user" && item.body === body)) return current;
+        return {
+          ...current,
+          [id]: [
+            ...items,
+            { id: promptItemId, kind: "user" as const, body, timestamp: submittedAt },
+            ...(hasNearbyThinkingItem(items, submittedAt)
+              ? []
+              : [
+                  {
+                    id: `remote-thinking:${id}:${timestamp}`,
+                    kind: "assistant" as const,
+                    title: agentDisplayName(threadsRef.current.find((t) => t.id === id)?.runtime),
+                    body: "Thinking...",
+                    timestamp: thinkingTimestamp(submittedAt),
+                  },
+                ]),
+          ],
+        };
+      });
+      // /prompts is fed by this index, not by the transcript, so a phone-sent
+      // prompt has to be recorded here too or it is missing from the history.
+      rememberPrompt(id, {
+        id: promptItemId,
+        text: promptHistoryText(body),
+        attachments: 0,
+        timestamp: submittedAt,
+        conversationItemId: promptItemId,
+      });
+      updateThread(id, { agentState: "working", lastPromptAt: submittedAt, status: "running" });
     });
 
     const removeBtwListener = desktopApi.onBtwData((event) => {
@@ -4770,6 +7439,7 @@ export default function App(): React.ReactElement {
     return () => {
       removeDataListener();
       removeExitListener();
+      removeHibernatedListener();
       removeClaudeSessionListener();
       removeSessionTitleListener();
       removeConversationListener();
@@ -4777,6 +7447,8 @@ export default function App(): React.ReactElement {
       removePromptSubmittedListener();
       removeStartedListener();
       removeStarredListener();
+      removeArchivedListener();
+      removeRemotePromptListener();
       removeBtwListener();
     };
   }, [
@@ -4798,7 +7470,18 @@ export default function App(): React.ReactElement {
     // transcript and the live stream share one id scheme, so this MERGES into
     // whatever is already on screen — it must never blank the feed, or
     // just-sent prompts and streamed items would disappear.
-    if (!activeThread || activeThread.status === "running") {
+    //
+    // A hibernated section still reads as "running" (see the reaper: it parks
+    // the process without ending the section), but its transcript was dropped
+    // on the way out — so it is exactly the case that must re-read from disk,
+    // not the case to skip.
+    if (
+      !activeThread ||
+      !shouldReloadTranscript({
+        status: activeThread.status,
+        transcriptDropped: droppedTranscriptThreadIdsRef.current.has(activeThread.id),
+      })
+    ) {
       return;
     }
 
@@ -4812,13 +7495,35 @@ export default function App(): React.ReactElement {
 
     let isMounted = true;
     const { id, cwd, claudeSessionId, codexThreadId } = activeThread;
-    void desktopApi.loadConversation({ cwd, claudeSessionId, codexThreadId }).then(({ items, tokenUsage }) => {
-      if (!isMounted) {
-        return;
-      }
-      setConversationItems((current) => ({ ...current, [id]: mergeConversationItems(current[id] ?? [], items) }));
-      setTokenUsageByThread((current) => ({ ...current, [id]: tokenUsage }));
-    });
+    setConversationLoadState((current) =>
+      current[id] === "loading" ? current : { ...current, [id]: "loading" },
+    );
+    void desktopApi
+      .loadConversation({ cwd, claudeSessionId, codexThreadId })
+      .then(({ items, tokenUsage, beforeCursor, hasEarlier }) => {
+        if (!isMounted) {
+          return;
+        }
+        // Commit the page and loaded flag together. Collapsed work groups do
+        // not build their hidden Markdown trees, so this bounded render can be
+        // synchronous without leaving a transition vulnerable to starvation.
+        droppedTranscriptThreadIdsRef.current.delete(id);
+        setConversationItems((current) => ({
+          ...current,
+          [id]: mergeConversationItems(current[id] ?? [], items),
+        }));
+        setTokenUsageByThread((current) => ({ ...current, [id]: tokenUsage }));
+        setConversationPages((current) => ({
+          ...current,
+          [id]: { beforeCursor, hasEarlier: hasEarlier === true },
+        }));
+        setConversationLoadState((current) => ({ ...current, [id]: "loaded" }));
+      })
+      .catch(() => {
+        if (isMounted) {
+          setConversationLoadState((current) => ({ ...current, [id]: "error" }));
+        }
+      });
 
     return () => {
       isMounted = false;
@@ -4887,6 +7592,170 @@ export default function App(): React.ReactElement {
     setSearchOpen(true);
   }, []);
 
+  /**
+   * A card's linked section ids, as rows the task view can name and open.
+   *
+   * Cards outlive sections — a section is deleted, a card that mentions it is
+   * not — so a link that no longer resolves comes back marked rather than
+   * dropped: "the section that did this is gone" is worth seeing, and the row
+   * carries the unlink button that clears it.
+   */
+  const resolveSections = useCallback(
+    (ids: readonly string[]): LinkedSection[] =>
+      ids.map((id) => {
+        const thread = threadsRef.current.find((candidate) => candidate.id === id);
+        return { id, title: thread?.title ?? "Deleted section", present: Boolean(thread) };
+      }),
+    [],
+  );
+
+  /** Jump to a section from a card, closing whatever the card was open over. */
+  const openSectionFromTask = useCallback((sectionId: string): void => {
+    const thread = threadsRef.current.find((candidate) => candidate.id === sectionId);
+    if (!thread) {
+      return;
+    }
+    setTaskView(null);
+    setBacklogWorkspace(null);
+    setBacklogFocusId(null);
+    setExpandedWorkspaces((current) => new Set(current).add(thread.cwd));
+    setActiveThreadId(sectionId);
+  }, []);
+
+  /**
+   * Where Cmd+[ and Cmd+] walk: the sections visited, in the order they were
+   * visited, the way a browser remembers pages.
+   *
+   * Jumping somewhere new truncates whatever was ahead — the same rule a
+   * browser uses — and the stack is capped so a long day of hopping between
+   * sections doesn't grow it without bound.
+   */
+  const navHistoryRef = useRef<{ stack: string[]; index: number }>({ stack: [activeThreadId], index: 0 });
+  // Set while back/forward is what moved the selection, so the effect below
+  // records the jump as travel through history rather than a new entry.
+  const navigatingRef = useRef(false);
+
+  useEffect(() => {
+    const nav = navHistoryRef.current;
+    if (navigatingRef.current) {
+      navigatingRef.current = false;
+      return;
+    }
+    if (nav.stack[nav.index] === activeThreadId) {
+      return;
+    }
+    const stack = [...nav.stack.slice(0, nav.index + 1), activeThreadId].slice(-50);
+    nav.stack = stack;
+    nav.index = stack.length - 1;
+  }, [activeThreadId]);
+
+  /**
+   * Step through the visit history, skipping entries whose section has since
+   * been deleted — a closed section shouldn't leave a dead stop in the walk.
+   */
+  const navigateHistory = useCallback((direction: -1 | 1): void => {
+    const nav = navHistoryRef.current;
+    for (let index = nav.index + direction; index >= 0 && index < nav.stack.length; index += direction) {
+      const id = nav.stack[index];
+      if (!id) {
+        continue;
+      }
+      if (id !== DRAFT_THREAD_ID && !threadsRef.current.some((thread) => thread.id === id)) {
+        continue;
+      }
+      nav.index = index;
+      navigatingRef.current = true;
+      setActiveThreadId(id);
+      return;
+    }
+  }, []);
+
+  const openBacklogForActiveSession = useCallback((): void => {
+    // The board is per workspace, and the workspace is whichever one the
+    // section on screen runs in — the same board the agent in it writes to.
+    setBacklogWorkspace(activeCwdRef.current);
+    setBacklogFocusId(null);
+  }, []);
+
+  /**
+   * Push to talk.
+   *
+   * Held rather than tapped, so a quick aside never leaves the microphone open.
+   * Option+Space is deliberately not a Command chord: the app shortcut handler
+   * below bails on `altKey`, and macOS has nothing bound to it. It does insert a
+   * non-breaking space in a text field, hence the `preventDefault`.
+   *
+   * `repeat` is the load-bearing guard — holding a key fires keydown at the
+   * system repeat rate, and each one would restart the recogniser mid-word.
+   */
+  /**
+   * Is something on screen that Escape means "close" for?
+   *
+   * Filled in further down, once the side chat's dictation target exists; read
+   * through a ref so the shortcut handler below never re-registers.
+   */
+  const escapeSurfaceOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (!dictation.available) return;
+
+    const isPushKey = (event: KeyboardEvent): boolean =>
+      event.code === "Space" && event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey;
+
+    const onKeyDown = (event: KeyboardEvent): void => {
+      // Escape throws the recording away. Captured before anything else can act
+      // on it so it does not also close a panel behind the composer — while the
+      // microphone is open, Escape means "not that".
+      //
+      // Unless something is open that Escape is obviously for. Opening an image
+      // preview mid-sentence and pressing Escape to close it used to leave the
+      // preview up and silently wipe the whole dictated message: this handler
+      // saw the key first and swallowed it. With a surface up, Escape belongs to
+      // the surface and the microphone keeps listening.
+      if (event.key === "Escape" && dictation.listening && !escapeSurfaceOpenRef.current) {
+        event.preventDefault();
+        // Immediate, because the other Escape handlers are on this same target
+        // and plain `stopPropagation` would not reach them.
+        event.stopImmediatePropagation();
+        dictation.discard();
+        return;
+      }
+      if (!isPushKey(event)) return;
+      // Suppress the key BEFORE the repeat check, not after. Holding a key
+      // fires keydown at the system repeat rate, and letting those through
+      // typed a non-breaking space into the composer many times a second —
+      // each one an edit that rebased the transcript and restarted the
+      // recogniser, so it never lived long enough to return a word. The
+      // symptom was "spaces pile up and no text ever appears"; the cause was
+      // this one early return.
+      event.preventDefault();
+      if (event.repeat) return;
+      dictation.press();
+    };
+
+    // Keyed off the code, not the modifier: releasing Option before Space (the
+    // usual way a chord is let go) would otherwise never stop the recording.
+    const onKeyUp = (event: KeyboardEvent): void => {
+      if (event.code !== "Space") return;
+      dictation.release();
+    };
+
+    // A window that loses focus stops delivering keyup, so the key can be
+    // "held" forever with the microphone open.
+    const onBlur = (): void => dictation.release();
+
+    // Capture phase: this has to run before the composer's own key handling and
+    // before the other Escape listeners further down the file.
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [dictation]);
+
   useEffect(() => {
     const handleAppShortcut = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.altKey) {
@@ -4894,9 +7763,56 @@ export default function App(): React.ReactElement {
       }
 
       const key = event.key.toLowerCase();
-      if (key === "j" && !event.shiftKey) {
+      if (key === "d" && event.shiftKey) {
+        // Hands-free: press once to start, again to stop. The counterpart to
+        // holding Option+Space, for dictating something longer than a breath.
+        event.preventDefault();
+        dictation.toggle();
+      } else if (key === "m" && event.shiftKey) {
+        // Read the section's last reply at document width. Shifted like the
+        // other surfaces, and unshifted Cmd+M stays macOS's minimise.
+        event.preventDefault();
+        const items = conversationItemsRef.current[activeThreadIdRef.current ?? ""] ?? [];
+        const last = [...items]
+          .reverse()
+          .find((entry) => entry.kind === "assistant" && !isThinkingItem(entry) && entry.body.trim().length > 0);
+        if (last) openDocument({ text: last.body, title: last.title ?? "Reply" });
+      } else if (key === "b" && !event.shiftKey) {
+        // Cmd+B is the sidebar toggle everywhere else (VS Code, Notion, Slack),
+        // so it is the sidebar's here too — the backlog moved to the shifted
+        // twin, the way the browser sits on Cmd+Shift+J beside the terminal.
+        event.preventDefault();
+        setSidebarOpen((open) => !open);
+      } else if (key === "b" && event.shiftKey) {
+        event.preventDefault();
+        openBacklogForActiveSession();
+      } else if (key === "p" && event.shiftKey) {
+        // The keyboard twin of typing `/prompts`: the section's prompt history,
+        // shifted like the other surfaces (⌘P stays macOS's print).
+        event.preventDefault();
+        setPromptHistoryOpen((open) => !open);
+      } else if (key === "j" && !event.shiftKey) {
         event.preventDefault();
         toggleTerminalPanel();
+      } else if (key === "j" && event.shiftKey) {
+        // The browser sits beside the terminal, on the shifted twin of its key:
+        // both are "the other thing this section can be working in".
+        event.preventDefault();
+        toggleBrowserPanelRef.current();
+      } else if (key === "g" && event.shiftKey) {
+        // Git status for the workspace on screen. Shifted like the other
+        // drawers, and unshifted ⌘G stays free for find-next.
+        event.preventDefault();
+        toggleWorkspaceGitRef.current();
+      } else if (key === "," && !event.shiftKey) {
+        event.preventDefault();
+        setShowSettings(true);
+      } else if (key === "[" && !event.shiftKey) {
+        event.preventDefault();
+        navigateHistory(-1);
+      } else if (key === "]" && !event.shiftKey) {
+        event.preventDefault();
+        navigateHistory(1);
       } else if (key === "f" && !event.shiftKey) {
         event.preventDefault();
         openSearch();
@@ -4915,11 +7831,11 @@ export default function App(): React.ReactElement {
 
     window.addEventListener("keydown", handleAppShortcut);
     return () => window.removeEventListener("keydown", handleAppShortcut);
-  }, [openSearch, toggleTerminalPanel]);
+  }, [dictation, navigateHistory, openBacklogForActiveSession, openSearch, toggleTerminalPanel]);
 
-  const addThread = (cwd = activeThread?.cwd, launchSettings?: LaunchSettings): Thread => {
+  const addThread = (cwd = activeThread?.cwd, launchSettings?: LaunchSettings, parentId?: string): Thread => {
     const runtime = launchSettings?.runtime ?? defaultRuntime;
-    const model = launchSettings?.model ?? (runtime === "codex" ? defaultCodexModel : defaultModel);
+    const model = launchSettings?.model ?? (runtime === "codex" ? defaultCodexModel : runtime === "groq" ? defaultGroqModel : launchDefaultModel);
     const effort = launchSettings?.effort ?? (runtime === "codex" ? defaultCodexEffort : defaultEffort);
     const permissionMode =
       launchSettings?.permissionMode ?? (runtime === "codex" ? defaultCodexSandbox : defaultPermissionMode);
@@ -4930,6 +7846,7 @@ export default function App(): React.ReactElement {
       effort: effort.trim() || undefined,
       permissionMode: permissionMode.trim() || undefined,
       scratch: isScratchCwd(base.cwd) || undefined,
+      parentId,
     };
     setThreads((current) => [nextThread, ...current]);
     setActiveThreadId(nextThread.id);
@@ -4939,14 +7856,67 @@ export default function App(): React.ReactElement {
   };
 
   /**
+   * Open a sub-thread of `parent` and select it.
+   *
+   * The human half of what `create_session` does for an agent: the same
+   * relationship, made from the sidebar, inheriting the parent's workspace and
+   * launch settings because a sub-thread that runs a different model in a
+   * different folder is a sibling wearing the wrong badge.
+   */
+  const addSubthread = (parent: Thread): void => {
+    const check = canAdopt(threads, parent.id, "new-subthread");
+    if (!check.ok) {
+      setNotice(check.reason);
+      return;
+    }
+
+    addThread(
+      parent.cwd,
+      {
+        runtime: parent.runtime ?? defaultRuntime,
+        model: parent.model ?? "",
+        effort: parent.effort ?? "",
+        permissionMode: parent.permissionMode ?? "",
+      },
+      parent.id,
+    );
+    // A parent whose sub-threads are folded away must not swallow the row that
+    // was just created — the selection would move to something invisible.
+    setCollapsedSubthreads((current) => {
+      if (!current.has(parent.id)) return current;
+      const next = new Set(current);
+      next.delete(parent.id);
+      return next;
+    });
+  };
+
+  /**
+   * Move a section in or out of a parent, and tell the relay so the phone's tree
+   * agrees with this one. `parentId: undefined` promotes it to top level.
+   */
+  const setThreadParent = (id: string, parentId: string | undefined): void => {
+    if (parentId) {
+      const check = canAdopt(threads, parentId, id);
+      if (!check.ok) {
+        setNotice(check.reason);
+        return;
+      }
+    }
+    setThreads((current) => current.map((thread) => (thread.id === id ? { ...thread, parentId } : thread)));
+    void desktopApi.setSessionParent({ id, parentId });
+    logRenderer("thread:parent-changed", { id, parentId });
+  };
+
+  /**
    * Go to the New Session route, optionally re-pointing it at a workspace or a
    * set of launch settings. This is what "+" and Cmd+N do now: they navigate,
    * they don't create. Nothing is started, persisted or mirrored until the first
    * prompt is sent from there.
    */
   const goToNewSession = (cwd?: string, launchSettings?: LaunchSettings): void => {
+    pendingTaskLinksRef.current = null;
     const runtime = launchSettings?.runtime ?? defaultRuntime;
-    const model = launchSettings?.model ?? (runtime === "codex" ? defaultCodexModel : defaultModel);
+    const model = launchSettings?.model ?? (runtime === "codex" ? defaultCodexModel : runtime === "groq" ? defaultGroqModel : launchDefaultModel);
     const effort = launchSettings?.effort ?? (runtime === "codex" ? defaultCodexEffort : defaultEffort);
     const permissionMode =
       launchSettings?.permissionMode ?? (runtime === "codex" ? defaultCodexSandbox : defaultPermissionMode);
@@ -4969,6 +7939,32 @@ export default function App(): React.ReactElement {
     );
     setActiveThreadId(DRAFT_THREAD_ID);
     setNotice(null);
+  };
+
+  /**
+   * The backlog board's "Start session" action: close the board, go to the New
+   * Session route for that workspace, and seed the composer with the cards'
+   * titles and descriptions — ready to edit and send, nothing sent
+   * automatically. Takes a list because the board can hand over a multi-select.
+   */
+  const createSessionFromBacklogItems = (
+    cwd: string,
+    items: ReadonlyArray<{ id?: string; title: string; description: string }>,
+  ): void => {
+    if (items.length === 0) {
+      return;
+    }
+    setBacklogWorkspace(null);
+    setBacklogFocusId(null);
+    setTaskView(null);
+    goToNewSession(cwd);
+    // Held until the draft becomes a real section, which is the first moment
+    // there is an id to link the cards to. Set after the navigation, which
+    // clears it — going to the New Session route any other way means these
+    // cards are not what the next section is about.
+    pendingTaskLinksRef.current = { cwd, ids: items.map((item) => item.id).filter((id): id is string => Boolean(id)) };
+    commitComposerDraft(DRAFT_THREAD_ID, backlogSessionPrompt(items));
+    focusComposerSoon();
   };
 
   /**
@@ -5013,6 +8009,14 @@ export default function App(): React.ReactElement {
     // `rollbackDraftPromotion` settle it either way.
     setActiveThreadId(promoted.id);
     setExpandedWorkspaces((current) => new Set(current).add(promoted.cwd));
+    // The cards this section was started from now have a section to point at.
+    const pendingLinks = pendingTaskLinksRef.current;
+    pendingTaskLinksRef.current = null;
+    if (pendingLinks && pendingLinks.cwd === promoted.cwd) {
+      for (const id of pendingLinks.ids) {
+        void desktopApi.mutateBacklog({ op: "link", cwd: promoted.cwd, id, sectionId: promoted.id });
+      }
+    }
     logRenderer("draft:promoted", { id: promoted.id, cwd: promoted.cwd, runtime: promoted.runtime });
     return promoted;
   };
@@ -5041,8 +8045,13 @@ export default function App(): React.ReactElement {
 
   addThreadRef.current = () => goToNewSession();
 
-  const submitQuickStart = (): void => {
-    const prompt = quickStartDraft.trim();
+  const submitQuickStart = async (): Promise<void> => {
+    // Close the microphone before the overlay is cleared — see `submitPrompt`.
+    await dictation.settle();
+    // Read through the ref, not the render-time copy: `settle()` above is where
+    // dictation's last words land, and a value captured before that await would
+    // send the prompt as it read a moment before the user stopped speaking.
+    const prompt = quickStartDraftRef.current.trim();
     const attachments = quickStartAttachments;
     const launchSettings: LaunchSettings = {
       runtime: quickStartRuntime,
@@ -5052,7 +8061,7 @@ export default function App(): React.ReactElement {
     };
     setQuickStartOpen(false);
     setQuickStartSelectorOpen(false);
-    setQuickStartDraft("");
+    applyQuickStartDraft("");
     setQuickStartAttachments([]);
     // Start in the project chosen in the picker (defaults to the current one).
     const created = addThread(quickStartCwd || DEFAULT_WORKSPACE, launchSettings);
@@ -5148,6 +8157,46 @@ export default function App(): React.ReactElement {
     setVisibleSessionCounts((current) => ({ ...current, [cwd]: INITIAL_VISIBLE_SESSIONS }));
   };
 
+  const toggleArchivedVisible = (cwd: string): void => {
+    setShowArchivedByCwd((current) => ({ ...current, [cwd]: !current[cwd] }));
+  };
+
+  // useCallback (rather than a plain closure, like their sibling
+  // showMore/LessSessions) because these are passed down into the memoized
+  // ThreadRow tree — a fresh function identity every App render would defeat
+  // that memoization for every row.
+  const showMoreSubthreads = useCallback((parentId: string, total: number): void => {
+    setVisibleSubthreadCounts((current) => ({
+      ...current,
+      [parentId]: Math.min((current[parentId] ?? INITIAL_VISIBLE_SESSIONS) + VISIBLE_SESSIONS_STEP, total),
+    }));
+  }, []);
+
+  const showLessSubthreads = useCallback((parentId: string): void => {
+    setVisibleSubthreadCounts((current) => ({ ...current, [parentId]: INITIAL_VISIBLE_SESSIONS }));
+  }, []);
+
+  // The sidebar's stop shortcut: same effect as the composer's Stop button, but
+  // for any row, not just the active one. The double-click confirmation lives in
+  // ThreadRow. Must stay referentially stable — it is a memoized ThreadRow prop.
+  const stopThreadSession = useCallback(
+    (threadId: string): void => {
+      logRenderer("session:stop-request", { id: threadId, from: "sidebar" });
+      void desktopApi.stopSession({ id: threadId });
+      clearIdleTimer(threadId);
+      // A stopped section gets no exit event and no further snapshots, so
+      // nothing else would ever retire the optimistic "Thinking..." card.
+      clearThinkingItems(threadId);
+      if (pendingPromptRef.current?.threadId === threadId) {
+        window.clearTimeout(pendingPromptRef.current.timeoutId);
+        pendingPromptRef.current = null;
+        finishSendingPrompt();
+      }
+      updateThread(threadId, { agentState: "exited", status: "exited" });
+    },
+    [clearIdleTimer, clearThinkingItems, finishSendingPrompt, updateThread],
+  );
+
   const requestDeleteThread = (threadId = activeThread?.id): void => {
     // Nothing to delete on the New Session route — walking away from a draft is
     // the delete. Real sections are always deletable now that the permanent draft
@@ -5196,7 +8245,20 @@ export default function App(): React.ReactElement {
       const { [threadId]: removed, ...rest } = current;
       return removed ? rest : current;
     });
-    setThreads((current) => current.filter((thread) => thread.id !== threadId));
+    setThreads((current) => {
+      // Deleting a parent must not strand its sub-threads. They are promoted to
+      // wherever the deleted section sat (its own parent, or the top level)
+      // rather than deleted with it: they are separate agent processes with
+      // separate transcripts, and taking three of those away silently because
+      // one row was removed is not something a delete dialog can honestly imply.
+      const removed = current.find((thread) => thread.id === threadId);
+      return current
+        .filter((thread) => thread.id !== threadId)
+        .map((thread) => (thread.parentId === threadId ? { ...thread, parentId: removed?.parentId } : thread));
+    });
+    for (const child of subthreadsByParent.get(threadId) ?? []) {
+      void desktopApi.setSessionParent({ id: child.id, parentId: pendingDeleteThread?.parentId });
+    }
     if (activeThreadId === threadId) {
       // Prefer another real section; the New Session route is the floor.
       const fallback = threads.find((thread) => thread.id !== threadId && !thread.draft);
@@ -5217,6 +8279,51 @@ export default function App(): React.ReactElement {
     setContextMenu(null);
   };
 
+  // View toggle that never touches the session itself (no stop, no delete) —
+  // it only hides the row from its workspace group's default view. Mirrored to
+  // the relay (see setSessionArchived) so a paired phone's list agrees, the
+  // same contract mobile's own ArchiveStore now has.
+  const toggleArchiveThread = (threadId = activeThread?.id): void => {
+    if (!threadId) {
+      return;
+    }
+    let nextArchived = false;
+    setArchivedThreadIds((current) => {
+      const next = new Set(current);
+      if (next.has(threadId)) {
+        next.delete(threadId);
+      } else {
+        next.add(threadId);
+        nextArchived = true;
+      }
+      return next;
+    });
+    void desktopApi.setSessionArchived({ id: threadId, archived: nextArchived });
+    setContextMenu(null);
+  };
+
+  // Bulk version, from the workspace's right-click menu: every non-draft
+  // section in this cwd, including sub-threads (so a fully-cleared project
+  // stays fully cleared even if a subthread outlives its parent's view).
+  // Same relay-mirrored, non-destructive contract as the single-section toggle.
+  const archiveAllInWorkspace = (cwd: string): void => {
+    const newlyArchivedIds: string[] = [];
+    setArchivedThreadIds((current) => {
+      const next = new Set(current);
+      for (const thread of threads) {
+        if (!thread.draft && thread.cwd === cwd && !next.has(thread.id)) {
+          next.add(thread.id);
+          newlyArchivedIds.push(thread.id);
+        }
+      }
+      return next;
+    });
+    for (const id of newlyArchivedIds) {
+      void desktopApi.setSessionArchived({ id, archived: true });
+    }
+    setWorkspaceMenu(null);
+  };
+
   const toggleStar = (threadId = activeThread?.id): void => {
     const thread = threads.find((candidate) => candidate.id === threadId);
     if (!thread) {
@@ -5234,7 +8341,7 @@ export default function App(): React.ReactElement {
       return;
     }
 
-    const nextTitle = renameDraft.trim();
+    const nextTitle = compactSectionTitle(renameDraft);
     if (nextTitle && nextTitle !== activeThread.title) {
       updateThread(activeThread.id, { title: nextTitle, titleSource: "manual" });
       // The relay row carries the title the phone renders, and nothing else in
@@ -5306,7 +8413,10 @@ export default function App(): React.ReactElement {
 
     if (result.ok) {
       logRenderer("session:start-ok", { id: thread.id, launchCommand });
-      updateThread(thread.id, { agentState: "waiting", command, executionMode, status: "running" });
+      // A launch only ever happens to carry a prompt (see the sole caller), which
+      // already marked the section "working". Reporting "waiting" here dropped the
+      // spinner again for the rest of the cold start, so leave the state alone.
+      updateThread(thread.id, { command, executionMode, status: "running" });
       return true;
     }
 
@@ -5348,7 +8458,7 @@ export default function App(): React.ReactElement {
       return;
     }
 
-    const model = runtime === "codex" ? defaultCodexModel : defaultModel;
+    const model = runtime === "codex" ? defaultCodexModel : runtime === "groq" ? defaultGroqModel : launchDefaultModel;
     const effort = runtime === "codex" ? defaultCodexEffort : defaultEffort;
     const permissionMode = runtime === "codex" ? defaultCodexSandbox : defaultPermissionMode;
     const nextCommand = commandForRuntime(runtime);
@@ -5373,7 +8483,7 @@ export default function App(): React.ReactElement {
         handoffCreatedAt: new Date().toISOString(),
         handoffContext: handoffContext ?? undefined,
       },
-      `Runtime set to ${runtime === "codex" ? "Codex" : "Claude"}`,
+      `Runtime set to ${agentDisplayName(runtime)}`,
     );
   };
 
@@ -5382,7 +8492,25 @@ export default function App(): React.ReactElement {
       return;
     }
 
-    await applyLaunchSetting({ model: model || undefined }, `Model set to ${modelLabel(activeThread?.runtime ?? "claude", model)}`);
+    const runtime = activeThread?.runtime ?? "claude";
+    const currentEffort = activeThread?.effort ?? "";
+    const nextEffort = effortOptions(runtime, model, codexModels).some((option) => option.value === currentEffort)
+      ? currentEffort
+      : "";
+    const modelChange: SessionModelChange = {
+      at: new Date().toISOString(),
+      runtime,
+      fromModel: activeThread?.model,
+      toModel: model || undefined,
+    };
+    await applyLaunchSetting(
+      {
+        model: model || undefined,
+        effort: nextEffort || undefined,
+        modelChanges: [...(activeThread?.modelChanges ?? []), modelChange],
+      },
+      `Model set to ${modelLabel(runtime, model, codexModels)}`,
+    );
   };
 
   const selectEffort = async (effort: string): Promise<void> => {
@@ -5390,7 +8518,10 @@ export default function App(): React.ReactElement {
       return;
     }
 
-    await applyLaunchSetting({ effort: effort || undefined }, `Reasoning set to ${effortLabel(activeThread?.runtime ?? "claude", effort)}`);
+    await applyLaunchSetting(
+      { effort: effort || undefined },
+      `Reasoning set to ${effortLabel(activeThread?.runtime ?? "claude", effort, activeThread?.model ?? "", codexModels)}`,
+    );
   };
 
   const selectPermissionMode = async (permissionMode: string): Promise<void> => {
@@ -5410,9 +8541,23 @@ export default function App(): React.ReactElement {
     }
 
     setQuickStartRuntime(runtime);
-    setQuickStartModel(runtime === "codex" ? defaultCodexModel : defaultModel);
+    setQuickStartModel(runtime === "codex" ? defaultCodexModel : runtime === "groq" ? defaultGroqModel : launchDefaultModel);
     setQuickStartEffort(runtime === "codex" ? defaultCodexEffort : defaultEffort);
     setQuickStartPermissionMode(runtime === "codex" ? defaultCodexSandbox : defaultPermissionMode);
+  };
+
+  const selectQuickStartModel = (model: string): void => {
+    setQuickStartModel(model);
+    if (!effortOptions(quickStartRuntime, model, codexModels).some((option) => option.value === quickStartEffort)) {
+      setQuickStartEffort("");
+    }
+  };
+
+  const selectDefaultCodexModel = (model: string): void => {
+    setDefaultCodexModel(model);
+    if (!effortOptions("codex", model, codexModels).some((option) => option.value === defaultCodexEffort)) {
+      setDefaultCodexEffort("");
+    }
   };
 
   const stopSession = async (): Promise<void> => {
@@ -5484,7 +8629,7 @@ export default function App(): React.ReactElement {
       if (directPath) {
         attachments.push({
           id: String(crypto.randomUUID()),
-          name: file.name || imageAttachmentNameFromPath(directPath),
+          name: file.name || mediaFileName(directPath),
           path: directPath,
           previewUrl: URL.createObjectURL(file),
         });
@@ -5503,7 +8648,7 @@ export default function App(): React.ReactElement {
 
       attachments.push({
         id: String(crypto.randomUUID()),
-        name: file.name || imageAttachmentNameFromPath(result.path),
+        name: file.name || mediaFileName(result.path),
         path: result.path,
         previewUrl: URL.createObjectURL(file),
       });
@@ -5604,12 +8749,56 @@ export default function App(): React.ReactElement {
 
   // Core send used by the composer, the quick-start flow, and the queue
   // flush. Independent of which thread is active — it targets `thread`.
+  // Mirrors `btwDraftByThread` synchronously, for the same reason
+  // `quickStartDraftRef` mirrors the overlay's draft: dictation reads its target
+  // back between results within a single tick, and a `useState` map still reads
+  // pre-write there — which reads as a manual edit and restarts the recogniser.
+  const btwDraftByThreadRef = useRef<Record<string, string>>({});
   const setBtwDraft = useCallback(
     (value: string) => {
+      btwDraftByThreadRef.current = { ...btwDraftByThreadRef.current, [activeDraftKey]: value };
       setBtwDraftByThread((current) => ({ ...current, [activeDraftKey]: value }));
     },
     [activeDraftKey],
   );
+
+  // The side chat. Keyed by the section it belongs to, so closing the panel or
+  // switching sections releases the target and abandons any live utterance
+  // rather than typing it into whatever opens next.
+  const btwInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const btwDictation = useDictationTarget(
+    dictation,
+    `btw:${activeDraftKey}`,
+    () => btwDraftByThreadRef.current[activeDraftKey] ?? "",
+    setBtwDraft,
+    () => btwInputRef.current?.focus(),
+  );
+
+  // The surfaces that own Escape while they are up, for the dictation shortcut
+  // handler declared above. The two that are themselves dictated into are
+  // excluded while they hold the microphone: speaking into the quick-start box
+  // or the side chat, Escape still means "throw this utterance away".
+  escapeSurfaceOpenRef.current =
+    Boolean(contextMenu) ||
+    Boolean(workspaceMenu) ||
+    Boolean(pendingDeleteThreadId) ||
+    Boolean(previewImage) ||
+    readerOpen ||
+    Boolean(backlogWorkspace) ||
+    Boolean(taskView) ||
+    Boolean(scheduleWorkspace) ||
+    Boolean(gitWorkspace) ||
+    Boolean(filesThreadId) ||
+    showSettings ||
+    showSelector ||
+    showTokenInfo ||
+    searchOpen ||
+    promptHistoryOpen ||
+    newSectionChooserOpen ||
+    machineOpen ||
+    isRenaming ||
+    (quickStartOpen && !quickStartDictation.recording) ||
+    (activeBtw.open && !btwDictation.recording);
 
   const openBtwPanel = useCallback((threadId: string) => {
     // Reopening always lands at the tail, even if the last visit was scrolled up.
@@ -5713,17 +8902,21 @@ export default function App(): React.ReactElement {
     [desktopApi, logRenderer],
   );
 
-  const submitBtw = useCallback((): void => {
+  const submitBtw = useCallback(async (): Promise<void> => {
     if (!activeThread || activeBtw.running) {
       return;
     }
-    const question = (btwDraftByThread[activeDraftKey] ?? "").trim();
+    // Close the microphone before the box is cleared — see `submitPrompt`.
+    await dictation.settle();
+    // Through the ref: `settle()` above is where dictation's last words land, and
+    // the render-time map was captured before that await.
+    const question = (btwDraftByThreadRef.current[activeDraftKey] ?? "").trim();
     if (!question) {
       return;
     }
-    setBtwDraftByThread((current) => ({ ...current, [activeDraftKey]: "" }));
+    setBtwDraft("");
     void askBtw(activeThread.id, question);
-  }, [activeThread, activeBtw.running, btwDraftByThread, activeDraftKey, askBtw]);
+  }, [activeThread, activeBtw.running, setBtwDraft, activeDraftKey, askBtw, dictation]);
 
   // Intercepts a `/btw ...` line typed in the main composer so it opens the side
   // chat instead of ever reaching (and steering) the live session. Returns true
@@ -5829,35 +9022,36 @@ export default function App(): React.ReactElement {
     return true;
   }, [activeThread, clearComposer, desktopApi, logRenderer]);
 
-  // Prompt history rows. Only assembled while the dialog is open — the source
-  // conversation grows on every streamed item, and this list has no business
-  // re-deriving itself behind a closed dialog.
+  // Prompt history rows come from the durable per-section index, not just the
+  // visible transcript. A short fallback keeps the dialog useful while an
+  // older transcript is being imported for the first time.
   const promptHistorySent = useMemo<PromptHistoryRecord[]>(() => {
     if (!promptHistoryOpen || !activeThread) {
       return [];
     }
-    const normalize = (value: string): string => value.replace(/\s+/g, " ").trim();
-    // Newest first so the last prompt sits on top.
-    const newestFirst = (conversationItems[activeThread.id] ?? [])
+    const saved = activeThread.promptHistory ?? [];
+    const known = new Set(saved.map((entry) => promptHistorySignature(entry.text, entry.timestamp)));
+    const legacy = (conversationItems[activeThread.id] ?? [])
       .filter((item) => item.kind === "user" && item.body.trim().length > 0)
-      .reverse();
-    // Collapse the optimistic local echo against its server copy.
-    return newestFirst
-      .filter((item, index) => {
-        const prev = newestFirst[index - 1];
-        return !prev || normalize(prev.body) !== normalize(item.body);
-      })
       .map((item) => {
         const images = attachedImagePathsFromBody(item.body);
         return {
           id: item.id,
-          // The trailing "Attached image files:" list is plumbing, not prompt.
-          text: images.length > 0 ? bodyWithoutAttachedImageList(item.body) : item.body,
+          text: promptHistoryText(item.body),
           attachments: images.length,
           timestamp: item.timestamp,
           queued: false,
+          conversationItemId: item.id,
         };
+      })
+      .filter((record) => {
+        const signature = promptHistorySignature(record.text, record.timestamp);
+        if (known.has(signature)) return false;
+        known.add(signature);
+        return true;
       });
+    return [...saved.map((entry) => ({ ...entry, queued: false })), ...legacy]
+      .sort((first, second) => (second.timestamp ?? "").localeCompare(first.timestamp ?? ""));
   }, [promptHistoryOpen, activeThread, conversationItems]);
 
   const promptHistoryQueued = useMemo<PromptHistoryRecord[]>(() => {
@@ -5881,6 +9075,28 @@ export default function App(): React.ReactElement {
     }
   }, [activeThread, commitComposerDraft]);
 
+  const goToPrompt = useCallback((record: PromptHistoryRecord): void => {
+    if (!activeThread) return;
+    const items = conversationItems[activeThread.id] ?? [];
+    const target = items.find((item) =>
+      item.kind === "user" &&
+      (item.id === record.conversationItemId || promptHistorySignature(promptHistoryText(item.body), item.timestamp) === promptHistorySignature(record.text, record.timestamp)),
+    );
+    setPromptHistoryOpen(false);
+    if (!target) {
+      setNotice("This prompt is safely saved, but its transcript message is no longer available to jump to.");
+      return;
+    }
+    const targetIndex = items.indexOf(target);
+    const effectiveWindow = transcriptWindowSize > 0 ? transcriptWindowSize : items.length;
+    const requiredReveal = Math.max(0, items.length - effectiveWindow - targetIndex);
+    setRevealedTranscriptItems((current) => ({
+      ...current,
+      [activeThread.id]: Math.max(current[activeThread.id] ?? 0, requiredReveal),
+    }));
+    pendingPromptScrollItemIdRef.current = target.id;
+  }, [activeThread, conversationItems, transcriptWindowSize]);
+
   const sendPromptToThread = async (thread: Thread, prompt: string, attachedImagePaths: string[]): Promise<boolean> => {
     if (sendingPromptRef.current) {
       logRenderer("prompt:submit-blocked", { threadId: thread.id, sendingRef: sendingPromptRef.current });
@@ -5895,6 +9111,7 @@ export default function App(): React.ReactElement {
     sendingPromptRef.current = true;
     setIsSendingPrompt(true);
     const submittedAt = new Date().toISOString();
+    const promptItemId = `local:${thread.id}:${submittedAt}`;
     lastPromptAtRef.current.set(thread.id, submittedAt);
     markRuntimeActivity(thread.id, "prompt", "Prompt sent");
     const userPromptToDisplay = buildPromptWithImageAttachments(trimmed, attachedImagePaths);
@@ -5928,6 +9145,11 @@ export default function App(): React.ReactElement {
       handoffLength: runtimeHandoff?.length ?? 0,
       imageCount: attachedImagePaths.length,
     });
+    // Show the spinner before the launch, not after it: spawning the CLI (and
+    // probing for a resumable session first) takes seconds on a cold section,
+    // and the user has already pressed enter. `startThreadSession` reports its
+    // own failure as "exited", so an optimistic "working" can't get stuck.
+    updateThread(thread.id, { agentState: "working", lastPromptAt: submittedAt });
     const isReady = wasRunning || (await startThreadSession(launchThread));
     if (!isReady) {
       logRenderer("prompt:start-before-send-failed", { threadId: thread.id });
@@ -5935,6 +9157,17 @@ export default function App(): React.ReactElement {
       setIsSendingPrompt(false);
       return false;
     }
+
+    // Keep the user's exact prompt in the section metadata before the
+    // transcript changes. The transcript is intentionally disposable; this
+    // compact index is what makes /prompts reliable after it is cleared.
+    rememberPrompt(thread.id, {
+      id: promptItemId,
+      text: promptHistoryText(userPromptToDisplay),
+      attachments: attachedImagePaths.length,
+      timestamp: submittedAt,
+      conversationItemId: promptItemId,
+    });
 
     setConversationItems((current) => ({
       ...current,
@@ -5952,7 +9185,7 @@ export default function App(): React.ReactElement {
             ]
           : []),
         {
-          id: `local:${thread.id}:${submittedAt}`,
+          id: promptItemId,
           kind: "user",
           body: promptToSend,
           timestamp: submittedAt,
@@ -5994,6 +9227,12 @@ export default function App(): React.ReactElement {
     if (!thread) {
       return;
     }
+
+    // Close the microphone before the composer is read, and wait for the last
+    // words. Sending out from under a live recogniser clears the field while a
+    // task is still running, and its next partial — which carries the whole
+    // utterance, not just the new words — writes all of it straight back in.
+    await dictation.settle();
 
     if (handleBtwCommand()) {
       return;
@@ -6039,11 +9278,15 @@ export default function App(): React.ReactElement {
   // Hold a message until the section's current turn genuinely finishes, then
   // it is flushed by the settle handler. Ownership of the attachment preview
   // URLs transfers to the queue item.
-  const queuePrompt = (): void => {
+  const queuePrompt = async (): Promise<void> => {
     const thread = activeThread;
     if (!thread) {
       return;
     }
+    // Same reason as `submitPrompt`: queueing clears the composer, and doing
+    // that under a live recogniser lets its next partial — which carries the
+    // whole utterance — write everything straight back in.
+    await dictation.settle();
     // There is nothing to queue behind on the New Session route — no turn is in
     // flight because no session exists yet. Send instead of stashing a message
     // that would wait for a settle event that can never arrive.
@@ -6152,7 +9395,7 @@ export default function App(): React.ReactElement {
       }
     } else if (threadWorking && (text.trim() || imageAttachments.length > 0)) {
       // Plain Enter queues while Claude is working.
-      queuePrompt();
+      void queuePrompt();
     } else {
       void submitPrompt();
     }
@@ -6189,33 +9432,76 @@ export default function App(): React.ReactElement {
   }, []);
 
   const handlePreviewImage = useCallback((path: string): void => {
-    setPreviewImage({ path, url: localImageUrl(path) });
+    setPreviewImage({ path, url: localFileUrl(path), kind: "image" });
   }, []);
 
   const handlePreviewStagedAttachment = useCallback((attachment: ImageAttachment): void => {
-    setPreviewImage({ path: attachment.path, url: attachment.previewUrl });
+    setPreviewImage({ path: attachment.path, url: attachment.previewUrl, kind: "image" });
   }, []);
 
+  // A thumbnail an agent wrote into its own message (`inline.tsx`) is too deep
+  // in the render tree to be handed a callback, so it asks for the viewer the
+  // same way a `panda://backlog/` link asks for a card: a window event.
+  useEffect(() => {
+    const onPreviewRequest = (event: Event): void => {
+      const request = (event as CustomEvent<MediaPreviewRequest>).detail;
+      if (!request?.path) {
+        return;
+      }
+      setPreviewImage({ path: request.path, url: localFileUrl(request.path), kind: request.kind });
+    };
+    window.addEventListener(OPEN_MEDIA_PREVIEW_EVENT, onPreviewRequest);
+    return () => window.removeEventListener(OPEN_MEDIA_PREVIEW_EVENT, onPreviewRequest);
+  }, []);
+
+  // Same mechanism for the document reader: a Markdown link an agent wrote into
+  // its own message is as far from the root as a thumbnail is.
+  useEffect(() => {
+    const onDocumentRequest = (event: Event): void => {
+      const request = (event as CustomEvent<DocumentRequest>).detail;
+      if (request && (("path" in request && request.path) || ("text" in request && typeof request.text === "string"))) {
+        pushReaderDoc(request);
+      }
+    };
+    window.addEventListener(OPEN_DOCUMENT_EVENT, onDocumentRequest);
+    return () => window.removeEventListener(OPEN_DOCUMENT_EVENT, onDocumentRequest);
+  }, [pushReaderDoc]);
+
   const threadWorking = Boolean(activeThread && activeThread.status === "running" && activeThread.agentState === "working");
+  // Nothing to send — which is what decides whether the composer's button is a
+  // microphone or a send arrow.
+  const composerEmpty = !composerHasText && imageAttachments.length === 0;
 
   // Memoized so typing in the composer (which re-renders App on every
   // keystroke) does not rebuild the whole feed or re-parse every message's
   // markdown. Mid-turn flags are computed in one backward pass instead of the
   // O(n²) per-item scan.
-  const conversationFeed = useMemo(() => {
+  /**
+   * The feed's structure: what nests under which agent card, how quiet work
+   * groups in focus mode, and which assistant replies read as mid-turn.
+   *
+   * Deliberately independent of `threadWorking`. That flag flips at both ends of
+   * every turn, and it used to sit in the dependency list of the single memo
+   * that built the entire element tree — so a section with thousands of items
+   * rebuilt and re-reconciled all of them twice per turn, which is most of why a
+   * long section became slow to type into. It genuinely affects only the tail
+   * (one assistant reply, and the running spinner on the last work group), so
+   * the tail is rendered outside the memo and everything above it survives.
+   */
+  const conversationLayout = useMemo(() => {
     // Items a subagent produced are nested under their agent card, not shown at
     // the top level. Collect them by the owning agent's tool_use id (their
     // parentAgentId); an orphan whose agent card never arrived falls back to the
     // top level so nothing silently disappears.
     const agentToolUseIds = new Set<string>();
-    for (const item of activeConversation) {
+    for (const item of windowedConversation) {
       if (item.kind === "agent" && item.agent) {
         agentToolUseIds.add(item.agent.toolUseId);
       }
     }
     const childrenByAgent = new Map<string, ConversationItem[]>();
     const topLevel: ConversationItem[] = [];
-    for (const item of activeConversation) {
+    for (const item of windowedConversation) {
       const parent = item.parentAgentId;
       if (parent && agentToolUseIds.has(parent)) {
         const bucket = childrenByAgent.get(parent);
@@ -6227,6 +9513,10 @@ export default function App(): React.ReactElement {
     }
 
     const midTurnById = new Map<string, boolean>();
+    // The one assistant reply whose mid-turn reading is "is the section working
+    // right now". Held out of the map rather than baked into it, so the map and
+    // every element built from it survive a turn starting or ending.
+    let liveMidTurnItemId: string | null = null;
     let laterMeaningfulKind: ConversationItem["kind"] | null = null;
     for (let index = topLevel.length - 1; index >= 0; index--) {
       const item = topLevel[index];
@@ -6235,7 +9525,8 @@ export default function App(): React.ReactElement {
       }
       const thinking = isThinkingItem(item);
       if (item.kind === "assistant" && !thinking) {
-        midTurnById.set(item.id, laterMeaningfulKind === null ? threadWorking : laterMeaningfulKind !== "user");
+        if (laterMeaningfulKind === null) liveMidTurnItemId = item.id;
+        else midTurnById.set(item.id, laterMeaningfulKind !== "user");
       }
       // The turn-summary footer is a caption, not turn activity: it must not
       // flip the assistant reply it trails into a mid-turn passage.
@@ -6244,64 +9535,135 @@ export default function App(): React.ReactElement {
       }
     }
 
-    const renderItem = (item: ConversationItem): React.ReactElement => {
-      if (item.kind === "agent" && item.agent) {
-        // Agent cards default to expanded so the subagent's transcript stays
-        // visible instead of collapsing to a one-line header once its card
-        // arrives; for these ids presence in the set means the user collapsed
-        // it (the inverse of every other item, whose default is collapsed).
-        return (
-          <AgentCard
-            childItems={childrenByAgent.get(item.agent.toolUseId) ?? []}
-            expanded={!expandedConversationItems.has(item.id)}
-            expandedChildIds={expandedConversationItems}
-            item={item}
-            key={item.id}
-            onPreviewImage={handlePreviewImage}
-            onToggle={toggleConversationItem}
-            onToggleChild={toggleConversationItem}
-          />
-        );
-      }
-      const collapsedByDefault = isCollapsedByDefaultConversationItem(item);
-      return (
-        <ConversationCard
-          expanded={!collapsedByDefault || expandedConversationItems.has(item.id)}
-          item={item}
-          key={item.id}
-          midTurn={midTurnById.get(item.id) ?? false}
-          onPreviewImage={handlePreviewImage}
-          onToggle={toggleConversationItem}
-        />
-      );
-    };
-
-    if (!focusMode) {
-      return topLevel.map(renderItem);
-    }
-
     // Focus mode: keep the conversation itself — prompts, replies, the final
     // answer — and fold every run of work between them into one line.
-    const entries = groupQuietWork(topLevel, isQuietFeedItem);
-    return entries.map((entry, index) => {
-      if (entry.type === "item") {
-        return renderItem(entry.item);
-      }
+    const entries = focusMode ? groupQuietWork(topLevel, isQuietFeedItem) : null;
+    return { topLevel, childrenByAgent, midTurnById, liveMidTurnItemId, entries };
+  }, [windowedConversation, focusMode]);
 
-      return (
-        <WorkGroup
-          expanded={expandedConversationItems.has(entry.id)}
-          id={entry.id}
-          items={entry.items}
-          key={entry.id}
-          onToggle={toggleConversationItem}
-          running={threadWorking && index === entries.length - 1}
-        >
-          {entry.items.map(renderItem)}
-        </WorkGroup>
+  /** First entry that has to re-render when the section starts or stops working. */
+  const conversationTailStart = useMemo(() => {
+    const { topLevel, entries, liveMidTurnItemId } = conversationLayout;
+    if (!entries) {
+      if (!liveMidTurnItemId) return topLevel.length;
+      const index = topLevel.findIndex((item) => item.id === liveMidTurnItemId);
+      return index === -1 ? topLevel.length : index;
+    }
+    // The final group carries the running spinner, so it is always in the tail.
+    let start = Math.max(0, entries.length - 1);
+    if (liveMidTurnItemId) {
+      const index = entries.findIndex((entry) =>
+        entry.type === "item"
+          ? entry.item.id === liveMidTurnItemId
+          : entry.items.some((item) => item.id === liveMidTurnItemId),
       );
-    });
-  }, [activeConversation, expandedConversationItems, focusMode, threadWorking, handlePreviewImage, toggleConversationItem]);
+      if (index !== -1) start = Math.min(start, index);
+    }
+    return start;
+  }, [conversationLayout]);
+
+  const renderConversationItem = (item: ConversationItem, working: boolean): React.ReactElement => {
+    const { childrenByAgent, midTurnById, liveMidTurnItemId } = conversationLayout;
+    if (item.kind === "agent" && item.agent) {
+      // Agent cards default to collapsed, same as any other work item — a
+      // long-running subagent's transcript would otherwise flood the main
+      // narrative. The header shows a quick summary line so a collapsed card
+      // still says what it's doing.
+      return (
+        <AgentCard
+          childItems={childrenByAgent.get(item.agent.toolUseId) ?? []}
+          expanded={expandedConversationItems.has(item.id)}
+          expandedChildIds={expandedConversationItems}
+          item={item}
+          key={item.id}
+          killDisabled={findCommandPid(item) === undefined}
+          onKill={killAgentCommand}
+          onPreviewImage={handlePreviewImage}
+          onToggle={toggleConversationItem}
+          onToggleChild={toggleConversationItem}
+        />
+      );
+    }
+    const collapsedByDefault = isCollapsedByDefaultConversationItem(item);
+    return (
+      <ConversationCard
+        expanded={!collapsedByDefault || expandedConversationItems.has(item.id)}
+        item={item}
+        key={item.id}
+        midTurn={item.id === liveMidTurnItemId ? working : (midTurnById.get(item.id) ?? false)}
+        onPreviewImage={handlePreviewImage}
+        onToggle={toggleConversationItem}
+      />
+    );
+  };
+
+  const renderConversationEntry = (
+    entry: FocusedFeedEntry,
+    working: boolean,
+    isLast: boolean,
+  ): React.ReactElement => {
+    if (entry.type === "item") {
+      return renderConversationItem(entry.item, working);
+    }
+    return (
+      <WorkGroup
+        expanded={expandedConversationItems.has(entry.id)}
+        id={entry.id}
+        items={entry.items}
+        key={entry.id}
+        onToggle={toggleConversationItem}
+        running={working && isLast}
+      >
+        {expandedConversationItems.has(entry.id)
+          ? entry.items.map((item) => renderConversationItem(item, working))
+          : null}
+      </WorkGroup>
+    );
+  };
+
+  // Everything above the tail — the expensive part, and the part a turn boundary
+  // no longer touches.
+  const conversationHead = useMemo(() => {
+    const { topLevel, entries } = conversationLayout;
+    if (!entries) {
+      return topLevel.slice(0, conversationTailStart).map((item) => renderConversationItem(item, false));
+    }
+    return entries.slice(0, conversationTailStart).map((entry) => renderConversationEntry(entry, false, false));
+    // renderConversationItem/Entry close over exactly these.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationLayout, conversationTailStart, expandedConversationItems, handlePreviewImage, toggleConversationItem]);
+
+  const conversationTail = (() => {
+    const { topLevel, entries } = conversationLayout;
+    if (!entries) {
+      return topLevel.slice(conversationTailStart).map((item) => renderConversationItem(item, threadWorking));
+    }
+    return entries
+      .slice(conversationTailStart)
+      .map((entry, offset) =>
+        renderConversationEntry(entry, threadWorking, conversationTailStart + offset === entries.length - 1),
+      );
+  })();
+
+  const conversationFeed = (
+    <>
+      {hiddenTranscriptCount > 0 || (activeThread && conversationPages[activeThread.id]?.hasEarlier) ? (
+        <button className="quiet-action conversation-show-earlier" type="button" onClick={showEarlierTranscript}>
+          {hiddenTranscriptCount > 0
+            ? `Show ${Math.min(hiddenTranscriptCount, transcriptWindowSize || hiddenTranscriptCount).toLocaleString()} earlier${
+                hiddenTranscriptCount > (transcriptWindowSize || hiddenTranscriptCount)
+                  ? ` of ${hiddenTranscriptCount.toLocaleString()}`
+                  : ""
+              } items`
+            : conversationPages[activeThread!.id]?.loading
+              ? "Loading earlier history…"
+              : "Load earlier history"}
+        </button>
+      ) : null}
+      {conversationHead}
+      {conversationTail}
+    </>
+  );
 
   const scrollConversationToBottom = (): void => {
     const feed = conversationFeedRef.current;
@@ -6335,6 +9697,7 @@ export default function App(): React.ReactElement {
       } catch {
         setGitStatus({
           isRepo: false,
+          remotes: [],
           changes: [],
           stashes: [],
           worktrees: [],
@@ -6349,10 +9712,27 @@ export default function App(): React.ReactElement {
     [desktopApi],
   );
 
+  // A fetch is what makes "in sync?" trustworthy — the counts are all measured
+  // against remote-tracking refs, which only move when we talk to the remote.
+  const fetchGitRemotes = useCallback(
+    async (cwd: string): Promise<void> => {
+      setGitFetching(true);
+      try {
+        setGitStatus(await desktopApi.fetchWorkspaceGitRemotes({ cwd }));
+      } catch {
+        // Offline or auth-prompting remote: keep the last known status on screen.
+      } finally {
+        setGitFetching(false);
+      }
+    },
+    [desktopApi],
+  );
+
   const openWorkspaceGit = useCallback(
     (cwd: string): void => {
       setGitWorkspace(cwd);
       setGitStatus(null);
+      setGitTab("status");
       void fetchWorkspaceGit(cwd);
     },
     [fetchWorkspaceGit],
@@ -6363,6 +9743,29 @@ export default function App(): React.ReactElement {
     setGitStatus(null);
   }, []);
 
+  /**
+   * ⌘⇧G: the git drawer for the workspace the section on screen runs in.
+   *
+   * Pressing it again closes the drawer, and pressing it while another
+   * workspace's drawer is open re-points it at this one rather than closing —
+   * the same key always means "git for what I am looking at". A scratch section
+   * has no repo to report on, so the chord is a no-op there, matching the
+   * sidebar, which hides the button for those groups.
+   */
+  const toggleWorkspaceGit = useCallback((): void => {
+    const cwd = activeCwdRef.current;
+    if (isScratchCwd(cwd)) return;
+    if (gitWorkspace === cwd) {
+      closeWorkspaceGit();
+      return;
+    }
+    openWorkspaceGit(cwd);
+  }, [closeWorkspaceGit, gitWorkspace, isScratchCwd, openWorkspaceGit]);
+
+  // Declared after the shortcut handler that fires it, so it goes through a ref.
+  const toggleWorkspaceGitRef = useRef(toggleWorkspaceGit);
+  toggleWorkspaceGitRef.current = toggleWorkspaceGit;
+
   useEffect(() => {
     if (!gitWorkspace) return;
     const onKey = (event: KeyboardEvent): void => {
@@ -6371,6 +9774,88 @@ export default function App(): React.ReactElement {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [gitWorkspace, closeWorkspaceGit]);
+
+  // A running plain-command card's kill button needs a live pid to act on,
+  // so the probe must poll even with the drawer closed whenever one is
+  // visible — otherwise `machine.stats` stays null forever and the button
+  // is permanently (and misleadingly) disabled.
+  const hasRunningCommandCard = useMemo(
+    () =>
+      windowedConversation.some(
+        (item) => item.kind === "agent" && item.agent?.status === "running" && !item.agent.subagentType,
+      ),
+    [windowedConversation],
+  );
+
+  // Only polls while the drawer is open or a kill button needs fresh pids —
+  // a process table every four seconds is exactly the kind of background
+  // cost this drawer exists to warn about, so it stays off otherwise.
+
+  // A pid the probe attributed to a section is only useful with the section's
+  // name on it: "node — Fix the mobile sheet" is an answer, "node" is not.
+  const sectionTitles = useMemo(
+    () => Object.fromEntries(threads.map((thread) => [thread.id, thread.title])),
+    [threads],
+  );
+
+  // "Pause all" is the per-section Stop, applied to everything mid-turn: the
+  // conversations survive, so the next prompt to any of them carries on. Draft
+  // threads have no process and are skipped.
+  const workingThreadIds = useMemo(
+    () => threads.filter((thread) => !thread.draft && thread.agentState === "working").map((thread) => thread.id),
+    [threads],
+  );
+
+  const pauseAllSections = useCallback(() => {
+    for (const id of workingThreadIds) void desktopApi.stopSession({ id });
+    machine.refresh();
+  }, [workingThreadIds, desktopApi, machine]);
+
+  const killSectionCommands = useCallback(
+    (pids?: number[]) => {
+      void desktopApi.killSectionCommands({ ...(pids ? { pids } : {}) }).then(() => machine.refresh());
+    },
+    [desktopApi, machine],
+  );
+
+  // Resolves a command card to the single pid the machine probe attributes to
+  // it, or undefined if there is no confident match (already exited, or the
+  // probe just hasn't sampled it yet). Matched on section id + command text,
+  // with a startsWith fallback since a stored card title can be a normalized
+  // prefix of the full argv (e.g. shell redirection appended after capture).
+  function findCommandPid(item: ConversationItem): number | undefined {
+    const sectionId = activeThread?.id;
+    const commandText = item.title?.trim();
+    if (!sectionId || !commandText) return undefined;
+    const rows = machine.stats?.sectionCommands ?? [];
+    const match = rows.find((row) => {
+      if (row.sessionId !== sectionId) return false;
+      const rowCommand = row.command?.trim() ?? "";
+      return rowCommand === commandText || rowCommand.startsWith(commandText) || commandText.startsWith(rowCommand);
+    });
+    return match?.pid;
+  }
+
+  // Kill button on a single command card. Deliberately narrow: it must only
+  // ever resolve to the one pid the card represents and never fall back to
+  // `killSectionCommands()` with no pids, which kills every running command
+  // machine-wide, not just this section's. If the probe has no fresh match for
+  // this command, the card's kill button stays disabled rather than reaching
+  // for that bigger hammer.
+  function killAgentCommand(item: ConversationItem): void {
+    const pid = findCommandPid(item);
+    if (pid === undefined) return;
+    killSectionCommands([pid]);
+  }
+
+  useEffect(() => {
+    if (!machineOpen) return;
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setMachineOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [machineOpen]);
 
   const fetchSessionFiles = useCallback(
     async (thread: Thread): Promise<void> => {
@@ -6544,48 +10029,50 @@ export default function App(): React.ReactElement {
   }
 
   const activeId = activeThread.id;
-  const renderThreadItem = (thread: Thread): React.ReactElement => {
-    const terminalCount = terminalTabsByThread[thread.id]?.length ?? 0;
-
-    return (
-      <button
-        className={`thread-item ${thread.id === activeId ? "active" : ""} ${
-          attentionThreadIds.has(thread.id) ? "needs-attention" : ""
-        }`}
-        key={thread.id}
-        type="button"
-        onClick={() => setActiveThreadId(thread.id)}
-        onContextMenu={(event) => {
-          event.preventDefault();
-          setActiveThreadId(thread.id);
-          setContextMenu({ threadId: thread.id, x: event.clientX, y: event.clientY });
-        }}
-      >
-        <AgentBadge compact state={thread.agentState} />
-        <span className="thread-copy">
-          <strong>
-            {thread.starred ? <Star size={11} className="thread-star" aria-hidden="true" /> : null}
-            <span className="thread-title-text">{thread.title}</span>
-            {terminalCount > 0 ? (
-              <span
-                className="thread-terminal-count"
-                title={`${terminalCount} active terminal${terminalCount === 1 ? "" : "s"}`}
-                aria-label={`${terminalCount} active terminal${terminalCount === 1 ? "" : "s"}`}
-              >
-                <TerminalSquare size={11} aria-hidden="true" />
-                <span>{terminalCount}</span>
-              </span>
-            ) : null}
-          </strong>
-        </span>
-        <time title={thread.lastPromptAt ? `Last prompt ${formatTime(thread.lastPromptAt)}` : "No prompt submitted"}>
-          {relativeAge(thread.lastPromptAt)}
-        </time>
-      </button>
-    );
-  };
+  const offscreenAttentionThreads = threads
+    .filter((thread) => offscreenAttentionIds.has(thread.id))
+    .sort((a, b) => threadOrderKey(b).localeCompare(threadOrderKey(a)));
+  /**
+   * One sidebar row and, under it, the sub-threads it opened.
+   *
+   * The row and its children are siblings in the DOM rather than nested inside
+   * it — a `<button>` cannot contain buttons, and the expand chevron has to be
+   * clickable without selecting the parent. Indentation is a CSS custom property
+   * on the row so the depth cap (`MAX_SUBTHREAD_DEPTH`) is the only thing
+   * bounding how far right this can go.
+   */
+  // Thin wrapper so call sites are unchanged; the actual row tree lives in
+  // the memoized ThreadRow component above (see its comment for why).
+  const renderThreadItem = (thread: Thread, depth = 0): React.ReactElement => (
+    <ThreadRow
+      key={thread.id}
+      thread={thread}
+      depth={depth}
+      activeId={activeId}
+      attentionThreadIds={attentionThreadIds}
+      collapsedSubthreads={collapsedSubthreads}
+      subthreadsByParent={subthreadsByParent}
+      visibleSubthreadCounts={visibleSubthreadCounts}
+      archivedThreadIds={archivedThreadIds}
+      terminalTabsByThread={terminalTabsByThread}
+      browserMarksByThread={browserMarksByThread}
+      unsentDraftThreadIds={unsentDraftThreadIds}
+      registerThreadRow={registerThreadRow}
+      toggleSubthreads={toggleSubthreads}
+      setActiveThreadId={setActiveThreadId}
+      setContextMenu={setContextMenu}
+      showMoreSubthreads={showMoreSubthreads}
+      showLessSubthreads={showLessSubthreads}
+      stopThreadSession={stopThreadSession}
+      toggleArchiveThread={toggleArchiveThread}
+    />
+  );
 
   return (
+    // Everything that renders a message is under here, so a `#12` written by
+    // anyone — the agent, or the user who picked it out of the composer's menu —
+    // resolves against the board of the workspace it was written in.
+    <BacklogCardsContext.Provider value={backlogCards}>
     <main
       className={`app-shell ${sidebarOpen ? "with-sidebar" : "compact-sidebar"} ${resizingSidebar ? "resizing-sidebar" : ""}`}
       style={sidebarOpen ? { gridTemplateColumns: `${sidebarWidth}px 1fr` } : undefined}
@@ -6601,6 +10088,15 @@ export default function App(): React.ReactElement {
               title="Search conversations (⌘F)"
             >
               <Search size={16} aria-hidden="true" />
+            </button>
+            <button
+              className="sidebar-new-button"
+              type="button"
+              onClick={() => setMachineOpen(true)}
+              aria-label="This machine"
+              title="This machine — load, memory and the heaviest processes"
+            >
+              <Activity size={16} aria-hidden="true" />
             </button>
             <button
               className="sidebar-new-button"
@@ -6624,6 +10120,7 @@ export default function App(): React.ReactElement {
         </div>
 
         <div
+          ref={workspaceListRef}
           className={`workspace-list ${draggingWorkspace ? "reordering" : ""}`}
           // Drop handling lives on the whole list, not on each group: the
           // pointer is hit-tested against frozen midpoints, so the gaps between
@@ -6661,40 +10158,77 @@ export default function App(): React.ReactElement {
             <span className="thread-copy">
               <strong>
                 <span className="thread-title-text">New session</span>
-                {(terminalTabsByThread[DRAFT_THREAD_ID]?.length ?? 0) > 0 ? (
-                  <span
-                    className="thread-terminal-count"
-                    title={`${terminalTabsByThread[DRAFT_THREAD_ID]?.length} active terminal${
-                      terminalTabsByThread[DRAFT_THREAD_ID]?.length === 1 ? "" : "s"
-                    }`}
-                  >
-                    <TerminalSquare size={11} aria-hidden="true" />
-                    <span>{terminalTabsByThread[DRAFT_THREAD_ID]?.length}</span>
-                  </span>
-                ) : null}
+                <ThreadMarks
+                  marks={[
+                    (terminalTabsByThread[DRAFT_THREAD_ID]?.length ?? 0) > 0
+                      ? {
+                          key: "terminals",
+                          className: "thread-terminal-count",
+                          icon: <TerminalSquare size={11} aria-hidden="true" />,
+                          count: terminalTabsByThread[DRAFT_THREAD_ID]?.length ?? 0,
+                          label: `${terminalTabsByThread[DRAFT_THREAD_ID]?.length} active terminal${
+                            terminalTabsByThread[DRAFT_THREAD_ID]?.length === 1 ? "" : "s"
+                          }`,
+                        }
+                      : null,
+                    browserMarksByThread[DRAFT_THREAD_ID]
+                      ? {
+                          key: "browser",
+                          className: "thread-browser-count",
+                          icon: <Globe size={11} aria-hidden="true" />,
+                          count: browserMarksByThread[DRAFT_THREAD_ID]?.tabs ?? 0,
+                          label: `${browserMarksByThread[DRAFT_THREAD_ID]?.tabs} page${
+                            browserMarksByThread[DRAFT_THREAD_ID]?.tabs === 1 ? "" : "s"
+                          } open`,
+                        }
+                      : null,
+                  ]}
+                />
               </strong>
             </span>
-            {draftHasContent ? <span className="draft-dot" title="Unsent draft" aria-label="Unsent draft" /> : null}
+            {draftHasContent ? (
+              <span className="draft-mark" title="Unsent draft" aria-label="Unsent draft">
+                <Pencil size={9} aria-hidden="true" />
+              </span>
+            ) : null}
           </button>
           {starredThreads.length > 0 ? (
-            <section className="starred-group" aria-label="Starred sections">
-              <div className="starred-group-header">
+            <section
+              className={`starred-group ${starredCollapsed ? "collapsed" : "expanded"}`}
+              aria-label="Starred sections"
+            >
+              <button
+                className="starred-group-header"
+                type="button"
+                onClick={() => setStarredCollapsed((current) => !current)}
+                aria-expanded={!starredCollapsed}
+                title={starredCollapsed ? "Show starred sections" : "Hide starred sections"}
+              >
                 <Star size={13} className="thread-star" aria-hidden="true" />
                 <span>Starred</span>
-              </div>
-              <div className="thread-list starred-thread-list">
-                {starredThreads.map((thread) => renderThreadItem(thread))}
+                <span className="starred-group-count">{starredThreads.length}</span>
+                <span className="workspace-chevron">
+                  {starredCollapsed ? <ChevronRight size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}
+                </span>
+              </button>
+              <div className={`thread-list-shell ${starredCollapsed ? "collapsed" : "expanded"}`}>
+                <div className="thread-list starred-thread-list">
+                  {starredThreads.map((thread) => renderThreadItem(thread))}
+                </div>
               </div>
             </section>
           ) : null}
           {previewWorkspaceGroups.map((group) => {
             const expanded = expandedWorkspaces.has(group.cwd);
             const hasActiveThread = group.threads.some((thread) => thread.id === activeThread.id);
+            const archivedInGroup = group.threads.filter((thread) => archivedThreadIds.has(thread.id));
+            const showArchived = showArchivedByCwd[group.cwd] ?? false;
+            const displayedThreads = getDisplayedGroupThreads(group);
             const visibleCount = Math.min(
               visibleSessionCounts[group.cwd] ?? INITIAL_VISIBLE_SESSIONS,
-              group.threads.length,
+              displayedThreads.length,
             );
-            const canShowMore = visibleCount < group.threads.length;
+            const canShowMore = visibleCount < displayedThreads.length;
             const canShowLess = visibleCount > INITIAL_VISIBLE_SESSIONS;
             // The project-less group behaves like any other group (drag to
             // reorder, expand/collapse, "+" to start a section) minus the
@@ -6762,11 +10296,27 @@ export default function App(): React.ReactElement {
                     type="button"
                     onClick={() => openWorkspaceGit(group.cwd)}
                     aria-label={`Git status for ${groupLabel}`}
-                    title="Workspace git status"
+                    title="Workspace git status (⌘⇧G)"
                   >
                     <GitBranch size={14} aria-hidden="true" />
                   </button>
                 )}
+                {archivedInGroup.length > 0 ? (
+                  <button
+                    className={`group-archive-button ${showArchived ? "active" : ""}`}
+                    type="button"
+                    onClick={() => toggleArchivedVisible(group.cwd)}
+                    aria-pressed={showArchived}
+                    aria-label={
+                      showArchived
+                        ? `Hide archived sections in ${groupLabel}`
+                        : `Show ${archivedInGroup.length} archived section${archivedInGroup.length === 1 ? "" : "s"} in ${groupLabel}`
+                    }
+                    title={showArchived ? "Hide archived" : `Show archived (${archivedInGroup.length})`}
+                  >
+                    {showArchived ? <EyeOff size={14} aria-hidden="true" /> : <Eye size={14} aria-hidden="true" />}
+                  </button>
+                ) : null}
                 <button
                   className="group-new-button"
                   type="button"
@@ -6780,7 +10330,7 @@ export default function App(): React.ReactElement {
 
               <div className={`thread-list-shell ${expanded ? "expanded" : "collapsed"}`}>
                 <div className="thread-list">
-                  {group.threads.slice(0, visibleCount).map((thread) => renderThreadItem(thread))}
+                  {displayedThreads.slice(0, visibleCount).map((thread) => renderThreadItem(thread))}
                 </div>
                 {scratchGroup && group.threads.length === 0 ? (
                   <button className="workspace-empty-hint" type="button" onClick={() => void addScratchThread()}>
@@ -6788,16 +10338,26 @@ export default function App(): React.ReactElement {
                     Start a section with no project
                   </button>
                 ) : null}
-                {group.threads.length > INITIAL_VISIBLE_SESSIONS ? (
+                {group.threads.length > 0 && displayedThreads.length === 0 ? (
+                  <button
+                    className="workspace-empty-hint"
+                    type="button"
+                    onClick={() => toggleArchivedVisible(group.cwd)}
+                  >
+                    <Archive size={13} aria-hidden="true" />
+                    All {archivedInGroup.length} session{archivedInGroup.length === 1 ? "" : "s"} archived — show them
+                  </button>
+                ) : null}
+                {displayedThreads.length > INITIAL_VISIBLE_SESSIONS ? (
                   <div className="thread-list-more">
                     {canShowMore ? (
                       <button
                         className="thread-more-button"
                         type="button"
-                        onClick={() => showMoreSessions(group.cwd, group.threads.length)}
+                        onClick={() => showMoreSessions(group.cwd, displayedThreads.length)}
                       >
                         <ChevronDown size={13} aria-hidden="true" />
-                        Show {Math.min(VISIBLE_SESSIONS_STEP, group.threads.length - visibleCount)} more
+                        Show {Math.min(VISIBLE_SESSIONS_STEP, displayedThreads.length - visibleCount)} more
                       </button>
                     ) : null}
                     {canShowLess ? (
@@ -6814,6 +10374,58 @@ export default function App(): React.ReactElement {
           })}
         </div>
 
+        {/* A section that finished while its row was off screen — group
+            collapsed, folded under a parent, or just scrolled past — gets no
+            visible sign of it beyond the OS notification. This is that sign,
+            pinned below the scrollable list so it survives whatever is
+            hidden. Clicking a row unfolds it and scrolls it into view. */}
+        {offscreenAttentionThreads.length > 0 ? (
+          <section className="sidebar-attention-footer" aria-label="Unread finished sections">
+            <div className="sidebar-attention-footer-header">
+              <span className="sidebar-attention-footer-heading">
+                <Bell size={12} aria-hidden="true" />
+                <span>
+                  {offscreenAttentionThreads.length === 1
+                    ? "1 section finished off screen"
+                    : `${offscreenAttentionThreads.length} sections finished off screen`}
+                </span>
+              </span>
+              <button
+                type="button"
+                className="sidebar-attention-mark-all"
+                onClick={() => markAttentionThreadsRead(offscreenAttentionThreads.map((thread) => thread.id))}
+              >
+                Mark all read
+              </button>
+            </div>
+            <div className="sidebar-attention-footer-list">
+              {offscreenAttentionThreads.map((thread) => (
+                <div key={thread.id} className="sidebar-attention-footer-item">
+                  <button
+                    type="button"
+                    className="sidebar-attention-footer-open"
+                    onClick={() => jumpToThread(thread)}
+                    title={`Jump to ${thread.title?.trim() || "this section"}`}
+                  >
+                    <span className="sidebar-attention-footer-dot" aria-hidden="true" />
+                    <span className="sidebar-attention-footer-title">{thread.title?.trim() || "Untitled section"}</span>
+                    <span className="sidebar-attention-footer-workspace">{workspaceLabel(thread.cwd)}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="sidebar-attention-mark-read"
+                    onClick={() => markAttentionThreadsRead([thread.id])}
+                    title={`Mark ${thread.title?.trim() || "this section"} as read`}
+                    aria-label={`Mark ${thread.title?.trim() || "this section"} as read`}
+                  >
+                    <Check size={13} strokeWidth={2.4} aria-hidden="true" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
         <div className="usage-card" aria-label={`${agentDisplayName(usageProvider)} plan usage`}>
           <div className="usage-card-header">
             <span className="usage-card-title">
@@ -6822,7 +10434,7 @@ export default function App(): React.ReactElement {
             </span>
             <span className="usage-card-actions">
               <span className="usage-provider-toggle" role="group" aria-label="Usage provider">
-                {RUNTIME_OPTIONS.map((option) => (
+                {RUNTIME_OPTIONS.filter((option) => option.value !== "groq").map((option) => (
                   <button
                     key={option.value}
                     type="button"
@@ -6837,7 +10449,7 @@ export default function App(): React.ReactElement {
               <button
                 type="button"
                 className={`usage-refresh-button ${usageLoading ? "spinning" : ""}`}
-                onClick={() => refreshUsageRef.current()}
+                onClick={() => refreshUsageRef.current(true)}
                 disabled={usageLoading}
                 aria-label="Refresh plan usage"
                 title="Refresh plan usage"
@@ -6896,8 +10508,25 @@ export default function App(): React.ReactElement {
       ) : null}
 
       <section
-        className={`workspace ${activeBtw.open ? "with-btw" : ""} ${resizingBtw ? "resizing-btw" : ""}`}
-        style={activeBtw.open ? { gridTemplateColumns: `minmax(0, 1fr) ${btwWidth}px` } : undefined}
+        className={`workspace ${activeBtw.open ? "with-btw" : ""} ${resizingBtw ? "resizing-btw" : ""} ${
+          browserPanelOpen ? "with-browser" : ""
+        } ${resizingBrowser ? "resizing-browser" : ""} ${
+          browserPanelOpen && browserPresentation === "full" ? "browser-full" : ""
+        }`}
+        // Up to three columns: the conversation, then the browser, then /btw.
+        // Spelled out rather than left to the stylesheet because each column's
+        // width is a number the user dragged.
+        style={
+          browserPanelOpen && browserPresentation === "full"
+            ? { gridTemplateColumns: "minmax(0, 1fr)" }
+            : browserPanelOpen || activeBtw.open
+              ? {
+                  gridTemplateColumns: `minmax(0, 1fr)${browserPanelOpen ? ` ${browserWidth}px` : ""}${
+                    activeBtw.open ? ` ${btwWidth}px` : ""
+                  }`,
+                }
+              : undefined
+        }
       >
         <div className="workspace-top">
         <header className="topbar">
@@ -6907,7 +10536,7 @@ export default function App(): React.ReactElement {
               type="button"
               onClick={() => setSidebarOpen((open) => !open)}
               aria-label="Toggle sidebar"
-              title="Toggle sidebar"
+              title="Toggle sidebar (⌘B)"
             >
               <LayoutPanelLeft size={18} aria-hidden="true" />
             </button>
@@ -6917,6 +10546,7 @@ export default function App(): React.ReactElement {
                   autoFocus
                   className="title-input"
                   value={renameDraft}
+                  maxLength={SECTION_TITLE_CAP}
                   onChange={(event) => setRenameDraft(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
@@ -6937,7 +10567,30 @@ export default function App(): React.ReactElement {
               </div>
             ) : (
               <div className="title-display-row">
+                {/* Where this section sits in the tree, above its name: opened
+                    by another section is the single most useful thing to know
+                    about a transcript whose first prompt you did not write. */}
+                {activeParentThread ? (
+                  <button
+                    className="subthread-breadcrumb"
+                    type="button"
+                    onClick={() => setActiveThreadId(activeParentThread.id)}
+                    title={`Sub-thread of "${activeParentThread.title}" — open it`}
+                  >
+                    <CornerUpLeft size={12} aria-hidden="true" />
+                    <span>{activeParentThread.title}</span>
+                  </button>
+                ) : null}
                 <h1>{activeThread.title}</h1>
+                {activeSubthreads.length > 0 ? (
+                  <span
+                    className="subthread-header-count"
+                    title={`${activeSubthreads.length} sub-thread${activeSubthreads.length === 1 ? "" : "s"} opened from this section`}
+                  >
+                    <GitBranch size={12} aria-hidden="true" />
+                    <span>{activeSubthreads.length}</span>
+                  </span>
+                ) : null}
                 {/* A draft has no name worth keeping — it gets titled from its
                     first prompt once it becomes a section. */}
                 {onDraftRoute ? null : (
@@ -6955,6 +10608,8 @@ export default function App(): React.ReactElement {
               model={activeThread.model ?? ""}
               effort={activeThread.effort ?? ""}
               permissionMode={activeThread.permissionMode ?? ""}
+              codexModels={codexModels}
+              groqModels={groqModels}
               open={showSelector}
               onToggle={(open) => {
                 setShowTokenInfo(false);
@@ -6965,6 +10620,17 @@ export default function App(): React.ReactElement {
               onSelectEffort={(value) => void selectEffort(value)}
               onSelectPermission={(value) => void selectPermissionMode(value)}
             />
+            {/* What this section is for, as the board sees it. Not on the New
+                Session route (there is no section to link to yet) and not in
+                the scratch workspace (which has no board). */}
+            {onDraftRoute || activeThread.scratch || isScratchCwd(activeThread.cwd) ? null : (
+              <SectionTasks
+                cwd={activeThread.cwd}
+                sectionId={activeThread.id}
+                desktopApi={desktopApi}
+                onOpenTask={(itemId) => setTaskView({ cwd: activeThread.cwd, itemId })}
+              />
+            )}
             {activeArtifacts.length > 0 ? (
               <button
                 className="quiet-action artifacts-button"
@@ -7060,8 +10726,29 @@ export default function App(): React.ReactElement {
               setShowScrollToBottom(!nearBottom);
             }}
           >
-            {activeConversation.length > 0 ? (
-              conversationFeed
+            {conversationHydrating ? (
+              <div className="conversation-loading" role="status" aria-live="polite">
+                <div className="conversation-loading-copy">
+                  <span className="conversation-loading-spinner" aria-hidden="true" />
+                  <div>
+                    <strong>Loading conversation</strong>
+                    <span>Preparing the latest messages…</span>
+                  </div>
+                </div>
+                <div className="conversation-loading-card" aria-hidden="true">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+                <div className="conversation-loading-card short" aria-hidden="true">
+                  <span />
+                  <span />
+                </div>
+              </div>
+            ) : activeConversation.length > 0 ? (
+              <div className="conversation-feed-content" key={activeThread.id}>
+                {conversationFeed}
+              </div>
             ) : onDraftRoute ? (
               // The draft route's own empty state. Says what is actually true —
               // nothing has started — instead of the section empty state's
@@ -7196,7 +10883,18 @@ export default function App(): React.ReactElement {
 
           <WorkingStatusBar
             state={activeThread.agentState}
-            detail={activeThread.agentState === "working" ? compactLine(activeRuntimeStatus?.latestCommand ?? activeRuntimeStatus?.latestTool ?? "") || undefined : undefined}
+            workingLabel={
+              activeThread.agentState === "working" && activeRuntimeStatus?.currentEventType === "contextCompaction:started"
+                ? "Compacting context…"
+                : undefined
+            }
+            detail={
+              activeThread.agentState === "working" && activeRuntimeStatus?.currentEventType === "contextCompaction:started"
+                ? "Reducing conversation history so Codex can continue"
+                : activeThread.agentState === "working"
+                  ? compactLine(activeRuntimeStatus?.latestCommand ?? activeRuntimeStatus?.latestTool ?? "") || undefined
+                  : undefined
+            }
           />
 
           {activePendingApproval ? (
@@ -7271,6 +10969,19 @@ export default function App(): React.ReactElement {
                 ))}
               </div>
             ) : null}
+            <DictationBar dictation={dictation} recording={mainDictation.recording} undoable={mainDictation.undoable} />
+            {dictation.error ? (
+              // Permission failures are the common case, and a dead microphone
+              // with no explanation is the thing this avoids — the message names
+              // the System Settings pane to open.
+              <div className="composer-dictation-error" role="status">
+                <Mic size={12} aria-hidden="true" />
+                <span>{dictation.error}</span>
+                <button type="button" onClick={dictation.dismissError} aria-label="Dismiss">
+                  <X size={12} aria-hidden="true" />
+                </button>
+              </div>
+            ) : null}
             <div className="composer-input-row">
             <ComposerField
               key={activeThread.id}
@@ -7288,17 +10999,31 @@ export default function App(): React.ReactElement {
                       : "Type to start this section and send"
               }
               slashCommands={COMPOSER_SLASH_COMMANDS}
+              cards={composerCards}
               shortcutHints={COMPOSER_SHORTCUT_HINTS}
               textRef={composerTextRef}
               onHasTextChange={setComposerHasText}
+              onFieldFocus={mainDictation.onFocus}
               onEnter={onComposerEnter}
               onPaste={onComposerPaste}
               onCommit={commitComposerDraft}
             />
+            {/* The secondary slot, left of the main button.
+                While recording it holds the microphone — so send keeps its
+                usual place and stays reachable mid-sentence, the way it does on
+                the phone. Otherwise it offers the microphone only when the main
+                slot is taken by stop (agent working, nothing typed yet). */}
+            {mainDictation.recording || (composerEmpty && threadWorking) ? (
+              <DictationMicButton
+                dictation={dictation}
+                recording={mainDictation.recording}
+                className="composer-fab--beside"
+              />
+            ) : null}
             {/* Stop is offered while the agent is actually WORKING. Keying it off
                 `status === "running"` (the process being alive) put a stop button
                 next to a "Ready" badge, with nothing to stop and no send button. */}
-            {threadWorking && !composerHasText && imageAttachments.length === 0 ? (
+            {threadWorking && composerEmpty && !mainDictation.recording ? (
               <button
                 className="composer-fab composer-fab--stop"
                 type="button"
@@ -7308,11 +11033,13 @@ export default function App(): React.ReactElement {
               >
                 <span className="stop-glyph" aria-hidden="true" />
               </button>
-            ) : threadWorking && (composerHasText || imageAttachments.length > 0) ? (
+            ) : dictation.available && composerEmpty && !mainDictation.recording ? (
+              <DictationMicButton dictation={dictation} recording={false} />
+            ) : threadWorking && !composerEmpty ? (
               <button
                 className="composer-fab composer-fab--queue"
                 type="button"
-                onClick={queuePrompt}
+                onClick={() => void queuePrompt()}
                 disabled={isSendingPrompt}
                 aria-label="Queue this message"
                 title="Queue this message (Enter) · ⌘Enter to send now"
@@ -7334,6 +11061,37 @@ export default function App(): React.ReactElement {
             </div>
           </form>
         </div>
+
+        {/* Always mounted, and hidden by being moved off-screen rather than with
+            `display: none`: a `<webview>` whose ancestor is display:none loses its
+            compositing surface and comes back blank, which silently kills every
+            tab an agent is working in. */}
+        <aside
+          className={`browser-dock ${browserPanelOpen ? "" : "hidden"} ${browserPresentation === "full" ? "full" : ""}`}
+          aria-label="Browser"
+          aria-hidden={!browserPanelOpen}
+        >
+          {browserPanelOpen && browserPresentation !== "full" ? (
+            <div
+              className="browser-resizer"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize browser"
+              onPointerDown={startBrowserResize}
+              onDoubleClick={() => setBrowserWidth(BROWSER_DEFAULT_WIDTH)}
+              title="Drag to resize · double-click to reset"
+            />
+          ) : null}
+          <BrowserPanel
+            desktopApi={desktopApi}
+            threadId={activeThread.id}
+            presentation={browserPresentation}
+            onHide={toggleBrowserPanel}
+            onPresentationChange={(next) =>
+              setBrowserPresentationByThread((current) => ({ ...current, [activeThread.id]: next }))
+            }
+          />
+        </aside>
 
         {activeBtw.open ? (
           <aside className="btw-panel" role="complementary" aria-label="By the way — session side chat">
@@ -7407,14 +11165,22 @@ export default function App(): React.ReactElement {
               )}
               {activeBtw.error ? <div className="btw-error">{activeBtw.error}</div> : null}
             </div>
+            <DictationBar
+              dictation={dictation}
+              recording={btwDictation.recording}
+              undoable={btwDictation.undoable}
+              sendHint="Enter asks"
+            />
             <div className="btw-composer">
               <textarea
+                ref={btwInputRef}
                 value={btwDraft}
+                onFocus={btwDictation.onFocus}
                 onChange={(event) => setBtwDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
-                    submitBtw();
+                    void submitBtw();
                   } else if (event.key === "Escape") {
                     event.preventDefault();
                     closeBtwPanel(activeThread.id);
@@ -7425,16 +11191,20 @@ export default function App(): React.ReactElement {
                 rows={1}
                 autoFocus
               />
-              <button
-                type="button"
-                className="composer-fab composer-fab--send btw-send"
-                onClick={submitBtw}
-                disabled={activeBtw.running || !btwDraft.trim()}
-                aria-label="Ask"
-                title="Ask (Enter)"
-              >
-                <Send size={14} aria-hidden="true" />
-              </button>
+              {btwDictation.recording || !btwDraft.trim() ? (
+                <DictationMicButton dictation={dictation} recording={btwDictation.recording} className="btw-send" />
+              ) : (
+                <button
+                  type="button"
+                  className="composer-fab composer-fab--send btw-send"
+                  onClick={() => void submitBtw()}
+                  disabled={activeBtw.running || !btwDraft.trim()}
+                  aria-label="Ask"
+                  title="Ask (Enter)"
+                >
+                  <Send size={16} aria-hidden="true" />
+                </button>
+              )}
             </div>
           </aside>
         ) : null}
@@ -7443,7 +11213,7 @@ export default function App(): React.ReactElement {
       {contextMenu && contextThread ? (
         <div
           className="context-menu"
-          style={menuPosition(contextMenu.x, contextMenu.y, 4)}
+          style={menuPosition(contextMenu.x, contextMenu.y, 6)}
           onClick={(event) => event.stopPropagation()}
           role="menu"
         >
@@ -7455,6 +11225,136 @@ export default function App(): React.ReactElement {
             <Pencil size={14} aria-hidden="true" />
             Rename
           </button>
+          <div className={`notification-menu-item ${contextMenu.x < 430 ? "opens-right" : "opens-left"}`}>
+            <button type="button" role="menuitem" aria-haspopup="menu">
+              <Bell size={14} aria-hidden="true" />
+              Notifications
+              <ChevronRight className="context-menu-chevron" size={13} aria-hidden="true" />
+            </button>
+            <div className="notification-channel-card" role="menu" aria-label="Notifications for this section">
+              <div className="notification-channel-title">Notify on</div>
+              <button
+                type="button"
+                role="menuitemcheckbox"
+                aria-checked={Boolean(contextMobileNotifications?.phoneCount) && contextMobileNotifications!.subscribedPhones === contextMobileNotifications!.phoneCount}
+                disabled={contextMobileNotifications === null || !contextMobileNotifications.available || contextMobileNotifications.phoneCount === 0}
+                onClick={() => {
+                  if (!contextMobileNotifications?.available || !contextMobileNotifications.phoneCount) return;
+                  const subscribed = contextMobileNotifications.subscribedPhones !== contextMobileNotifications.phoneCount;
+                  void desktopApi.setSessionMobileNotifications(contextThread.id, subscribed).then(setContextMobileNotifications);
+                }}
+              >
+                {contextMobileNotifications?.phoneCount && contextMobileNotifications.subscribedPhones === contextMobileNotifications.phoneCount
+                  ? <Check size={14} aria-hidden="true" /> : <Smartphone size={14} aria-hidden="true" />}
+                {contextMobileNotifications === null
+                  ? "Loading mobile…"
+                  : !contextMobileNotifications.available
+                    ? "Mobile unavailable"
+                    : contextMobileNotifications.phoneCount === 0
+                      ? "Mobile (no paired phone)"
+                      : "Mobile"}
+              </button>
+              {(() => {
+                const desktopEnabled = sessionNotificationOverrides[contextThread.id]?.desktop ?? notificationsEnabled;
+                const notificatorEnabled = sessionNotificationOverrides[contextThread.id]?.agent ?? agentNotificationsEnabled;
+                return (
+                  <>
+                    <button
+                      type="button"
+                      role="menuitemcheckbox"
+                      aria-checked={desktopEnabled}
+                      onClick={() => { void desktopApi.setNotificationChannels(contextThread.id, { desktop: !desktopEnabled }).then(setPreferences); }}
+                    >
+                      {desktopEnabled ? <Check size={14} aria-hidden="true" /> : <Bell size={14} aria-hidden="true" />}
+                      Desktop
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitemcheckbox"
+                      aria-checked={notificatorEnabled}
+                      onClick={() => { void desktopApi.setNotificationChannels(contextThread.id, { agent: !notificatorEnabled }).then(setPreferences); }}
+                    >
+                      {notificatorEnabled ? <Check size={14} aria-hidden="true" /> : <Zap size={14} aria-hidden="true" />}
+                      Agent attention
+                    </button>
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => toggleArchiveThread(contextThread.id)}
+            disabled={contextThread.id === DRAFT_THREAD_ID}
+            title="Hides this section from its workspace's list — does not stop or delete it"
+          >
+            {archivedThreadIds.has(contextThread.id) ? (
+              <ArchiveRestore size={14} aria-hidden="true" />
+            ) : (
+              <Archive size={14} aria-hidden="true" />
+            )}
+            {archivedThreadIds.has(contextThread.id) ? "Unarchive" : "Archive"}
+          </button>
+          <div className="context-menu-separator" role="separator" />
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setContextMenu(null);
+              addSubthread(contextThread);
+            }}
+            disabled={contextThread.id === DRAFT_THREAD_ID}
+            title="Open a section nested under this one"
+          >
+            <GitBranch size={14} aria-hidden="true" />
+            New sub-thread
+          </button>
+          {contextThread.parentId ? (
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setContextMenu(null);
+                  if (contextThread.parentId) setActiveThreadId(contextThread.parentId);
+                }}
+              >
+                <CornerUpLeft size={14} aria-hidden="true" />
+                Go to parent
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setContextMenu(null);
+                  setThreadParent(contextThread.id, undefined);
+                }}
+                title="Move this section out to the top level of its workspace"
+              >
+                <Unlink size={14} aria-hidden="true" />
+                Detach from parent
+              </button>
+            </>
+          ) : activeThread.id !== contextThread.id && activeThread.cwd === contextThread.cwd && !activeThread.draft ? (
+            // Adopting is offered only from the section you are LOOKING at: the
+            // menu has no room for a picker, and "make this a sub-thread of the
+            // one I have open" is the move people actually make — tidying an
+            // errand they started separately into the work it belongs to.
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setContextMenu(null);
+                setThreadParent(contextThread.id, activeThread.id);
+              }}
+              title={`Nest this section under "${activeThread.title}"`}
+            >
+              <CornerDownRight size={14} aria-hidden="true" />
+              Make sub-thread of “{activeThread.title}”
+            </button>
+          ) : null}
+          <div className="context-menu-separator" role="separator" />
           <button
             type="button"
             role="menuitem"
@@ -7483,7 +11383,7 @@ export default function App(): React.ReactElement {
       {workspaceMenu ? (
         <div
           className="context-menu"
-          style={menuPosition(workspaceMenu.x, workspaceMenu.y, editors.length + 4)}
+          style={menuPosition(workspaceMenu.x, workspaceMenu.y, editors.length + 6)}
           onClick={(event) => event.stopPropagation()}
           role="menu"
         >
@@ -7511,8 +11411,45 @@ export default function App(): React.ReactElement {
             <Plus size={14} aria-hidden="true" />
             New section
           </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => archiveAllInWorkspace(workspaceMenu.cwd)}
+            disabled={!threads.some(
+              (thread) =>
+                !thread.draft && thread.cwd === workspaceMenu.cwd && !archivedThreadIds.has(thread.id),
+            )}
+            title="Hides every section in this workspace from its default view — does not stop or delete any of them"
+          >
+            <Archive size={14} aria-hidden="true" />
+            Archive all sessions
+          </button>
           {isScratchCwd(workspaceMenu.cwd) ? null : (
             <>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  const { cwd } = workspaceMenu;
+                  setWorkspaceMenu(null);
+                  setBacklogWorkspace(cwd);
+                }}
+              >
+                <Kanban size={14} aria-hidden="true" />
+                Backlog
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  const { cwd } = workspaceMenu;
+                  setWorkspaceMenu(null);
+                  setScheduleWorkspace(cwd);
+                }}
+              >
+                <Clock size={14} aria-hidden="true" />
+                Scheduled tasks
+              </button>
               <button
                 type="button"
                 role="menuitem"
@@ -7582,21 +11519,42 @@ export default function App(): React.ReactElement {
             className="image-preview-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label={imageAttachmentNameFromPath(previewImage.path)}
+            aria-label={mediaFileName(previewImage.path)}
             onClick={(event) => event.stopPropagation()}
           >
             <div className="image-preview-toolbar">
               <div>
-                <strong>{imageAttachmentNameFromPath(previewImage.path)}</strong>
+                <strong>{mediaFileName(previewImage.path)}</strong>
                 <span>{previewImage.path}</span>
               </div>
               <button className="ghost-icon-button" type="button" onClick={() => setPreviewImage(null)} aria-label="Close image preview">
                 <X size={16} aria-hidden="true" />
               </button>
             </div>
-            <img alt={imageAttachmentNameFromPath(previewImage.path)} src={previewImage.url} />
+            {previewImage.kind === "video" ? (
+              <VideoPlayer src={previewImage.url} label={mediaFileName(previewImage.path)} />
+            ) : (
+              <img alt={mediaFileName(previewImage.path)} src={previewImage.url} />
+            )}
           </div>
         </div>
+      ) : null}
+
+      {readerDoc ? (
+        <DocumentReader
+          path={isTextDocumentRequest(readerDoc) ? undefined : readerDoc.path}
+          text={isTextDocumentRequest(readerDoc) ? readerDoc.text : undefined}
+          title={isTextDocumentRequest(readerDoc) ? readerDoc.title : undefined}
+          desktopApi={desktopApi}
+          editorName={activeEditor?.name}
+          onOpenInEditor={(path) => openPathInEditor(path)}
+          onReveal={(path) => openPathInEditor(path, "finder")}
+          onBack={() => stepReader(-1)}
+          onForward={() => stepReader(1)}
+          canGoBack={canReaderGoBack}
+          canGoForward={canReaderGoForward}
+          onClose={closeReader}
+        />
       ) : null}
 
       {promptHistoryOpen ? (
@@ -7606,6 +11564,7 @@ export default function App(): React.ReactElement {
             queued={promptHistoryQueued}
             onClose={() => setPromptHistoryOpen(false)}
             onReuse={reuseComposerText}
+            onGoTo={goToPrompt}
           />
         </div>
       ) : null}
@@ -7738,6 +11697,52 @@ export default function App(): React.ReactElement {
         </div>
       ) : null}
 
+      {attentionQueue.length > 0 && !activeAttention ? (
+        <button className="agent-attention-minimized" type="button" onClick={() => setMinimizedAttentionIds(new Set())}>
+          <AlertTriangle size={15} aria-hidden="true" />
+          {attentionQueue.length === 1 ? "Agent needs attention" : `${attentionQueue.length} agent requests`}
+        </button>
+      ) : null}
+
+      {activeAttention ? (() => {
+        const attention = activeAttention;
+        return (
+          <div className="agent-attention-backdrop" role="presentation">
+            <section
+              className={`agent-attention-dialog ${attention.severity}`}
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="agent-attention-title"
+              aria-describedby="agent-attention-summary"
+            >
+              <div className="agent-attention-kicker">
+                <AlertTriangle size={17} aria-hidden="true" />
+                <span>{attention.severity === "urgent" ? "Urgent agent request" : "Agent needs attention"}</span>
+                {attentionQueue.length > 1 ? <small>{attentionQueue.length} waiting</small> : null}
+              </div>
+              <div className="agent-attention-source" id="agent-attention-title">{attention.threadTitle}</div>
+              <p className="agent-attention-summary" id="agent-attention-summary">{attention.summary}</p>
+              {attention.detail ? <p className="agent-attention-detail">{attention.detail}</p> : null}
+              <div className="agent-attention-actions">
+                {attention.choices.map((choice) => (
+                  <button key={`${choice.label}:${choice.response}`} type="button" className="primary" onClick={() => answerAttention(attention, choice.response)}>
+                    {choice.label}
+                  </button>
+                ))}
+                <button type="button" onClick={() => openAttentionThread(attention)}>Open section</button>
+                <button
+                  type="button"
+                  className="quiet"
+                  onClick={() => setMinimizedAttentionIds((current) => new Set(current).add(attention.id))}
+                >
+                  Later
+                </button>
+              </div>
+            </section>
+          </div>
+        );
+      })() : null}
+
       {quickStartOpen ? (
         <div className="quick-start-backdrop" role="presentation" onClick={() => setQuickStartOpen(false)}>
           <div
@@ -7788,10 +11793,12 @@ export default function App(): React.ReactElement {
                 model={quickStartModel}
                 effort={quickStartEffort}
                 permissionMode={quickStartPermissionMode}
+                codexModels={codexModels}
+                groqModels={groqModels}
                 open={quickStartSelectorOpen}
                 onToggle={setQuickStartSelectorOpen}
                 onSelectRuntime={selectQuickStartRuntime}
-                onSelectModel={setQuickStartModel}
+                onSelectModel={selectQuickStartModel}
                 onSelectEffort={setQuickStartEffort}
                 onSelectPermission={setQuickStartPermissionMode}
               />
@@ -7817,16 +11824,23 @@ export default function App(): React.ReactElement {
                 ))}
               </div>
             ) : null}
+            <DictationBar
+              dictation={dictation}
+              recording={quickStartDictation.recording}
+              undoable={quickStartDictation.undoable}
+            />
             <textarea
               autoFocus
+              ref={quickStartInputRef}
               className="quick-start-input"
               value={quickStartDraft}
-              onChange={(event) => setQuickStartDraft(event.target.value)}
+              onFocus={quickStartDictation.onFocus}
+              onChange={(event) => applyQuickStartDraft(event.target.value)}
               onPaste={handleQuickStartPaste}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
-                  submitQuickStart();
+                  void submitQuickStart();
                 }
                 if (event.key === "Escape") {
                   event.preventDefault();
@@ -7865,10 +11879,17 @@ export default function App(): React.ReactElement {
             />
             <div className="quick-start-foot">
               <span>Enter to start · Shift+Enter for a new line · ↑/↓ workspace · ←/→ provider · Esc to cancel</span>
+              {/* Inline rather than floating in the corner: this overlay's foot is a
+                  row, not the composer's absolute-positioned button well. */}
+              <DictationMicButton
+                dictation={dictation}
+                recording={quickStartDictation.recording}
+                className="quick-start-mic"
+              />
               <button
                 className="primary-action"
                 type="button"
-                onClick={submitQuickStart}
+                onClick={() => void submitQuickStart()}
                 disabled={!quickStartDraft.trim() && quickStartAttachments.length === 0}
               >
                 <Send size={14} aria-hidden="true" />
@@ -7877,6 +11898,66 @@ export default function App(): React.ReactElement {
             </div>
           </div>
         </div>
+      ) : null}
+
+      {backlogWorkspace ? (
+        <BacklogBoard
+          cwd={backlogWorkspace}
+          workspaceName={workspaceName(backlogWorkspace)}
+          desktopApi={desktopApi}
+          focusItemId={backlogFocusId}
+          resolveSections={resolveSections}
+          onOpenSection={openSectionFromTask}
+          onClose={() => {
+            setBacklogWorkspace(null);
+            setBacklogFocusId(null);
+          }}
+          onCreateSession={(items) => createSessionFromBacklogItems(backlogWorkspace, items)}
+        />
+      ) : null}
+
+      {/* One card, opened from a transcript link or a section's task list. It
+          offers a way through to the board, which the board's own copy of this
+          view does not: the door is only worth showing to someone outside. */}
+      {taskView ? (
+        <TaskOverlay
+          cwd={taskView.cwd}
+          workspaceName={workspaceName(taskView.cwd)}
+          itemId={taskView.itemId}
+          desktopApi={desktopApi}
+          resolveSections={resolveSections}
+          onClose={() => setTaskView(null)}
+          onOpenBoard={() => {
+            setBacklogWorkspace(taskView.cwd);
+            setBacklogFocusId(taskView.itemId);
+            setTaskView(null);
+          }}
+          onOpenSection={openSectionFromTask}
+          onCreateSession={(item) => createSessionFromBacklogItems(taskView.cwd, [item])}
+        />
+      ) : null}
+
+      {scheduleWorkspace ? (
+        <ScheduledTasksPanel
+          cwd={scheduleWorkspace}
+          workspaceName={workspaceName(scheduleWorkspace)}
+          desktopApi={desktopApi}
+          onClose={() => setScheduleWorkspace(null)}
+        />
+      ) : null}
+
+      {machineOpen ? (
+        <MachineDrawer
+          stats={machine.stats}
+          loading={machine.loading}
+          error={machine.error}
+          onRefresh={machine.refresh}
+          onClose={() => setMachineOpen(false)}
+          sectionTitles={sectionTitles}
+          workingCount={workingThreadIds.length}
+          onPauseAll={pauseAllSections}
+          onKillCommands={killSectionCommands}
+        />
       ) : null}
 
       {gitWorkspace ? (
@@ -7896,6 +11977,18 @@ export default function App(): React.ReactElement {
                 </div>
               </div>
               <div className="git-drawer-head-actions">
+                {gitStatus?.isRepo && gitStatus.remotes.length > 0 ? (
+                  <button
+                    className="ghost-icon-button"
+                    type="button"
+                    onClick={() => fetchGitRemotes(gitWorkspace)}
+                    aria-label="Fetch from remotes"
+                    title="git fetch --all --prune"
+                    disabled={gitFetching || gitLoading}
+                  >
+                    <CloudDownload size={15} aria-hidden="true" />
+                  </button>
+                ) : null}
                 <button
                   className={`ghost-icon-button ${gitLoading ? "spinning" : ""}`}
                   type="button"
@@ -7912,32 +12005,78 @@ export default function App(): React.ReactElement {
               </div>
             </header>
 
-            <div className="git-drawer-body">
-              {gitLoading && !gitStatus ? <div className="git-empty">Reading git status…</div> : null}
+            {/* Status / History / Actions / Files. The status read is the one that is
+                already loaded when the drawer opens; the other two fetch on
+                first visit and are cheap to come back to. */}
+            <div className="git-drawer-tabs" role="tablist" aria-label="Git views">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={gitTab === "status"}
+                className={`git-drawer-tab ${gitTab === "status" ? "active" : ""}`}
+                onClick={() => setGitTab("status")}
+              >
+                <GitBranch size={13} aria-hidden="true" />
+                Status
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={gitTab === "history"}
+                className={`git-drawer-tab ${gitTab === "history" ? "active" : ""}`}
+                onClick={() => setGitTab("history")}
+              >
+                <GitCommitHorizontal size={13} aria-hidden="true" />
+                History
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={gitTab === "actions"}
+                className={`git-drawer-tab ${gitTab === "actions" ? "active" : ""}`}
+                onClick={() => setGitTab("actions")}
+              >
+                <Activity size={13} aria-hidden="true" />
+                Actions
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={gitTab === "files"}
+                className={`git-drawer-tab ${gitTab === "files" ? "active" : ""}`}
+                onClick={() => setGitTab("files")}
+              >
+                <FolderOpen size={13} aria-hidden="true" />
+                Files
+              </button>
+            </div>
 
-              {gitStatus && !gitStatus.isRepo ? (
-                <>
-                  <div className="git-empty">{gitStatus.error ?? "Not a git repository."}</div>
-                  {gitStatus.folders.length > 0 ? (
-                    <section className="git-section">
-                      <div className="git-section-head">
-                        <span>Folders</span>
-                        <em>{gitStatus.folders.length}</em>
-                      </div>
-                      <ul className="git-list">
-                        {gitStatus.folders.map((folder) => (
-                          <li key={folder} className="git-row">
-                            <Folder size={13} aria-hidden="true" />
-                            <span>{folder}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </section>
-                  ) : null}
-                </>
+            <div className="git-drawer-body" role="tabpanel">
+              {/* Keyed by workspace: pointing the drawer at another repo starts
+                  its history back at the head rather than at whatever page the
+                  last one was on. */}
+              {gitTab === "history" ? <GitHistoryPanel key={gitWorkspace} cwd={gitWorkspace} desktopApi={desktopApi} /> : null}
+
+              {gitTab === "actions" ? <GitHubActionsPanel key={gitWorkspace} cwd={gitWorkspace} desktopApi={desktopApi} /> : null}
+
+              {gitTab === "files" ? (
+                <WorkspaceTreePanel
+                  key={gitWorkspace}
+                  cwd={gitWorkspace}
+                  desktopApi={desktopApi}
+                  editorName={activeEditor?.name}
+                  onOpen={(path) => openPathInEditor(path)}
+                  onReveal={(path) => openPathInEditor(path, "finder")}
+                />
               ) : null}
 
-              {gitStatus && gitStatus.isRepo ? (
+              {gitTab === "status" && gitLoading && !gitStatus ? <div className="git-empty">Reading git status…</div> : null}
+
+              {gitTab === "status" && gitStatus && !gitStatus.isRepo ? (
+                <div className="git-empty">{gitStatus.error ?? "Not a git repository."}</div>
+              ) : null}
+
+              {gitTab === "status" && gitStatus && gitStatus.isRepo ? (
                 <>
                   <section className="git-section">
                     <div className="git-branch-current">
@@ -7946,6 +12085,48 @@ export default function App(): React.ReactElement {
                       {gitStatus.ahead ? <span className="git-badge">↑{gitStatus.ahead}</span> : null}
                       {gitStatus.behind ? <span className="git-badge">↓{gitStatus.behind}</span> : null}
                     </div>
+                    {(() => {
+                      const sync = gitOverallSync(gitStatus);
+                      return (
+                        <div className={`git-sync git-sync-${sync.tone}`}>
+                          <span className="git-sync-dot" aria-hidden="true" />
+                          <span className="git-sync-label">{gitFetching ? "Fetching…" : sync.label}</span>
+                          <span className="git-sync-age">
+                            {gitStatus.lastFetchAt
+                              ? `fetched ${relativeAge(gitStatus.lastFetchAt) === "now" ? "just now" : `${relativeAge(gitStatus.lastFetchAt)} ago`}`
+                              : "never fetched"}
+                          </span>
+                        </div>
+                      );
+                    })()}
+                  </section>
+
+                  <section className="git-section">
+                    <div className="git-section-head">
+                      <span>Remotes</span>
+                      <em>{gitStatus.remotes.length}</em>
+                    </div>
+                    {gitStatus.remotes.length === 0 ? (
+                      <p className="git-note">No remotes — nothing to be in sync with.</p>
+                    ) : (
+                      <ul className="git-list">
+                        {gitStatus.remotes.map((remote) => {
+                          const sync = gitSyncSummary(remote);
+                          return (
+                            <li key={remote.name} className="git-row git-row-stack">
+                              <span className="git-remote-head">
+                                <span className="git-path">{remote.name}</span>
+                                {remote.upstream ? <span className="git-badge">upstream</span> : null}
+                                <span className={`git-sync-chip git-sync-${sync.tone}`}>{sync.label}</span>
+                              </span>
+                              <span className="git-sub" title={remote.url}>
+                                {remote.url ?? ""}
+                              </span>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
                   </section>
 
                   <section className="git-section">
@@ -8021,20 +12202,6 @@ export default function App(): React.ReactElement {
                     )}
                   </section>
 
-                  <section className="git-section">
-                    <div className="git-section-head">
-                      <span>Folders</span>
-                      <em>{gitStatus.folders.length}</em>
-                    </div>
-                    <ul className="git-list">
-                      {gitStatus.folders.map((folder) => (
-                        <li key={folder} className="git-row">
-                          <Folder size={13} aria-hidden="true" />
-                          <span>{folder}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </section>
                 </>
               ) : null}
             </div>
@@ -8207,6 +12374,16 @@ export default function App(): React.ReactElement {
                 <button
                   type="button"
                   role="tab"
+                  aria-selected={settingsTab === "performance"}
+                  className={`settings-tab ${settingsTab === "performance" ? "active" : ""}`}
+                  onClick={() => setSettingsTab("performance")}
+                >
+                  <Gauge size={14} aria-hidden="true" />
+                  Performance
+                </button>
+                <button
+                  type="button"
+                  role="tab"
                   aria-selected={settingsTab === "usage"}
                   className={`settings-tab ${settingsTab === "usage" ? "active" : ""}`}
                   onClick={() => setSettingsTab("usage")}
@@ -8238,6 +12415,41 @@ export default function App(): React.ReactElement {
             </div>
 
             <div className="settings-panel" role="tabpanel" hidden={settingsTab !== "phone"}>
+            <div className="settings-field">
+              <label htmlFor="settings-relay-url">Relay URL</label>
+              <div className="settings-inline-row">
+                <input
+                  id="settings-relay-url"
+                  type="url"
+                  value={relayUrlDraft}
+                  onChange={(event) => setRelayUrlDraft(event.target.value)}
+                  placeholder="https://your-deployment.convex.cloud"
+                  spellCheck={false}
+                  aria-label="Relay URL"
+                />
+                <button
+                  className="quiet-action"
+                  type="button"
+                  disabled={relayUrlDraft.trim().replace(/\/+$/, "") === preferences.relayUrl}
+                  onClick={() => void desktopApi.savePreferences({ relayUrl: relayUrlDraft }).then(setPreferences)}
+                >
+                  Apply
+                </button>
+                {preferences.relayUrl ? (
+                  <button
+                    className="ghost-icon-button"
+                    type="button"
+                    onClick={() => void desktopApi.savePreferences({ relayUrl: "" }).then(setPreferences)}
+                    aria-label="Turn off phone pairing"
+                    title="Turn off phone pairing"
+                  >
+                    <X size={15} aria-hidden="true" />
+                  </button>
+                ) : null}
+              </div>
+              <p>Leave empty for local-only mode. Use the Convex deployment URL from a relay you own.</p>
+            </div>
+
             <div className="settings-field remote-pairing-field">
               <span className="settings-field-label">Phone pairing</span>
               {remotePairing.status === "ready" ? (
@@ -8286,6 +12498,11 @@ export default function App(): React.ReactElement {
 
             <div className="settings-field">
               <span className="settings-field-label">Paired phones</span>
+              <label className="settings-field">
+                <span><input type="checkbox" checked={preferences.remoteAllowFullAccess === true}
+                  onChange={(event) => void desktopApi.savePreferences({ remoteAllowFullAccess: event.target.checked }).then(setPreferences)} /> Allow unrestricted agent control and approvals from phones</span>
+                <small>Off by default. Enabling this lets any paired phone run unrestricted agents and grant access on this Mac. Face ID on the phone cannot protect against copied pairing credentials.</small>
+              </label>
               <div className="remote-device-list">
                 {remoteDevices.length === 0 ? (
                   <p>No paired phones yet.</p>
@@ -8300,8 +12517,8 @@ export default function App(): React.ReactElement {
                         className="ghost-icon-button"
                         type="button"
                         onClick={() => void desktopApi.revokeRemotePairedDevice(device.mobileId).then(setRemoteDevices)}
-                        aria-label="Revoke phone"
-                        title="Revoke phone"
+                        aria-label="Reset phone access and encryption key"
+                        title="Reset access for all phones and replace encryption key"
                       >
                         <Trash2 size={15} aria-hidden="true" />
                       </button>
@@ -8321,9 +12538,72 @@ export default function App(): React.ReactElement {
                 accent="#7ab7ff"
                 options={RUNTIME_OPTIONS.map((option) => ({ value: option.value, label: option.label, hint: option.hint }))}
                 value={defaultRuntime}
-                onSelect={(value) => setDefaultRuntime(value === "codex" ? "codex" : "claude")}
+                onSelect={(value) => setDefaultRuntime(value === "codex" ? "codex" : value === "groq" ? "groq" : "claude")}
               />
               <p>New sections launch with this coding agent. Existing sections keep their own provider.</p>
+            </div>
+
+            <div className="model-settings-heading">
+              <h3>Models & reasoning</h3>
+              <p>Choose the starting configuration for new sections. Each provider keeps its own defaults.</p>
+            </div>
+            <div className="model-settings-tabs" role="tablist" aria-label="Provider defaults">
+              {RUNTIME_OPTIONS.map((option) => (
+                <button type="button" key={option.value} role="tab" id={`model-defaults-tab-${option.value}`}
+                  aria-controls={`model-defaults-panel-${option.value}`} aria-selected={settingsModelRuntime === option.value}
+                  tabIndex={settingsModelRuntime === option.value ? 0 : -1}
+                  onKeyDown={(event) => {
+                    const index = RUNTIME_OPTIONS.findIndex((entry) => entry.value === option.value);
+                    const next = event.key === "ArrowRight" ? (index + 1) % RUNTIME_OPTIONS.length
+                      : event.key === "ArrowLeft" ? (index - 1 + RUNTIME_OPTIONS.length) % RUNTIME_OPTIONS.length
+                      : event.key === "Home" ? 0 : event.key === "End" ? RUNTIME_OPTIONS.length - 1 : -1;
+                    const target = RUNTIME_OPTIONS[next];
+                    if (target) { event.preventDefault(); setSettingsModelRuntime(target.value); document.getElementById(`model-defaults-tab-${target.value}`)?.focus(); }
+                  }}
+                  onClick={() => setSettingsModelRuntime(option.value)}>{option.label}</button>
+              ))}
+            </div>
+            <div role="tabpanel" id="model-defaults-panel-claude" aria-labelledby="model-defaults-tab-claude" hidden={settingsModelRuntime !== "claude"}>
+            <RuntimeDefaults
+              runtime="claude"
+              isDefault={defaultRuntime === "claude"}
+              model={defaultModel}
+              effort={defaultEffort}
+              permissionMode={defaultPermissionMode}
+              codexModels={codexModels}
+              onSelectModel={setDefaultModel}
+              onSelectEffort={setDefaultEffort}
+              onSelectPermission={setDefaultPermissionMode}
+            />
+            </div>
+
+            <div role="tabpanel" id="model-defaults-panel-codex" aria-labelledby="model-defaults-tab-codex" hidden={settingsModelRuntime !== "codex"}>
+            <RuntimeDefaults
+              runtime="codex"
+              isDefault={defaultRuntime === "codex"}
+              model={defaultCodexModel}
+              effort={defaultCodexEffort}
+              permissionMode={defaultCodexSandbox}
+              codexModels={codexModels}
+              onSelectModel={selectDefaultCodexModel}
+              onSelectEffort={setDefaultCodexEffort}
+              onSelectPermission={setDefaultCodexSandbox}
+            />
+            </div>
+
+            <div role="tabpanel" id="model-defaults-panel-groq" aria-labelledby="model-defaults-tab-groq" hidden={settingsModelRuntime !== "groq"}>
+            <RuntimeDefaults
+              runtime="groq"
+              isDefault={defaultRuntime === "groq"}
+              model={defaultGroqModel}
+              effort=""
+              permissionMode=""
+              codexModels={[]}
+              groqModels={groqModels}
+              onSelectModel={setDefaultGroqModel}
+              onSelectEffort={() => undefined}
+              onSelectPermission={() => undefined}
+            />
             </div>
 
             <div className="settings-field">
@@ -8339,32 +12619,56 @@ export default function App(): React.ReactElement {
               <p>Leave this empty to launch each provider&apos;s own CLI. Existing sections keep their own command.</p>
             </div>
 
-            <p className="settings-section-note">
-              Each provider keeps its own model, effort, and permission defaults — switching the default provider
-              above never rewrites the other one&apos;s settings.
-            </p>
+            <div className="settings-field">
+              <label htmlFor="settings-dictation-locale">Dictation language</label>
+              <select
+                id="settings-dictation-locale"
+                value={preferences.dictationLocale}
+                onChange={(event) =>
+                  void desktopApi.savePreferences({ dictationLocale: event.target.value }).then(setPreferences)
+                }
+              >
+                {Object.entries(DICTATION_LOCALES).map(([id, label]) => (
+                  <option key={id} value={id}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+              {/* Its own setting rather than a read of the system language: the
+                  recogniser picks its acoustic model from this, so English
+                  spoken into a Mac set to Portuguese comes back as unrelated
+                  words for whole clauses, not as a few mangled nouns. */}
+              <p>
+                The language the microphone decodes speech as — independent of this Mac&apos;s language. Dictate with
+                ⌘⇧D, or hold ⌥Space to talk.
+              </p>
+            </div>
 
-            <RuntimeDefaults
-              runtime="claude"
-              isDefault={defaultRuntime === "claude"}
-              model={defaultModel}
-              effort={defaultEffort}
-              permissionMode={defaultPermissionMode}
-              onSelectModel={setDefaultModel}
-              onSelectEffort={setDefaultEffort}
-              onSelectPermission={setDefaultPermissionMode}
-            />
-
-            <RuntimeDefaults
-              runtime="codex"
-              isDefault={defaultRuntime === "codex"}
-              model={defaultCodexModel}
-              effort={defaultCodexEffort}
-              permissionMode={defaultCodexSandbox}
-              onSelectModel={setDefaultCodexModel}
-              onSelectEffort={setDefaultCodexEffort}
-              onSelectPermission={setDefaultCodexSandbox}
-            />
+            <div className="settings-field">
+              <label htmlFor="settings-groq-api-key">Groq API key</label>
+              <p>Using Groq sends prompts, workspace context, and requested file contents to Groq. Files excluded by .gitignore or .pandaignore and common credential files are blocked. Conversation history and search indexes are stored locally on this Mac.</p>
+              <input
+                id="settings-groq-api-key"
+                type="password"
+                value={groqKeyDraft}
+                onChange={(event) => setGroqKeyDraft(event.target.value)}
+                placeholder={groqKeyConfigured ? "Key configured" : "gsk_..."}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                onClick={() => void desktopApi.setGroqApiKey(groqKeyDraft).then((ok) => {
+                  if (ok) {
+                    setGroqKeyConfigured(Boolean(groqKeyDraft.trim()));
+                    setGroqKeyDraft("");
+                  }
+                })}
+              >
+                Save Groq key
+              </button>
+              <p>{groqKeyConfigured ? "Stored securely on this Mac." : "Required before starting a Groq section."}</p>
+            </div>
             </div>
 
             <div className="settings-panel" role="tabpanel" hidden={settingsTab !== "usage"}>
@@ -8430,6 +12734,28 @@ export default function App(): React.ReactElement {
             </div>
 
             <div className="settings-field">
+              <span className="settings-field-label">Quota</span>
+              <label className="settings-toggle">
+                <input
+                  type="checkbox"
+                  checked={preferences.conserveMode}
+                  onChange={(event) => void desktopApi.savePreferences({ conserveMode: event.target.checked }).then(setPreferences)}
+                />
+                <span>Conserve mode</span>
+              </label>
+              <p>
+                Stretches a nearly-spent Claude quota. New Claude sections start on <strong>Sonnet</strong> and hand
+                mechanical work to cheaper subagents, read narrowly, and answer briefly — you can still switch any
+                single section to a bigger model. It also tightens session hygiene, which is where the quota actually
+                goes: at most {CONSERVE_HYGIENE.maxLiveSessions} live sections, hibernation after{" "}
+                {CONSERVE_HYGIENE.idleSessionTimeoutMinutes} idle minutes, and a{" "}
+                {CONSERVE_HYGIENE.transcriptWindowSize}-message transcript window. Your own numbers below are kept, not
+                overwritten — Conserve only ever tightens them, and turning it off restores them. Model and prompt
+                changes apply to sections started after the toggle.
+              </p>
+            </div>
+
+            <div className="settings-field">
               <span className="settings-field-label">Menu bar</span>
               <label className="settings-toggle">
                 <input
@@ -8452,7 +12778,119 @@ export default function App(): React.ReactElement {
             </div>
             </div>
 
+            <div className="settings-panel" role="tabpanel" hidden={settingsTab !== "performance"}>
+            <div className="settings-field">
+              <span className="settings-field-label">Live sections</span>
+              <label htmlFor="settings-max-live-sessions">Live sections at once</label>
+              <select
+                id="settings-max-live-sessions"
+                value={String(preferences.maxLiveSessions)}
+                onChange={(event) =>
+                  void desktopApi.savePreferences({ maxLiveSessions: Number(event.target.value) }).then(setPreferences)
+                }
+                aria-label="Live sections at once"
+              >
+                {[3, 4, 6, 8, 12, 16, 24].map((count) => (
+                  <option key={count} value={String(count)}>
+                    {count} sections
+                  </option>
+                ))}
+                <option value="0">No limit</option>
+              </select>
+              <label htmlFor="settings-idle-session-timeout">Hibernate after</label>
+              <select
+                id="settings-idle-session-timeout"
+                value={String(preferences.idleSessionTimeoutMinutes)}
+                onChange={(event) =>
+                  void desktopApi
+                    .savePreferences({ idleSessionTimeoutMinutes: Number(event.target.value) })
+                    .then(setPreferences)
+                }
+                aria-label="Hibernate idle sections after"
+              >
+                {[10, 20, 30, 60, 120, 240].map((minutes) => (
+                  <option key={minutes} value={String(minutes)}>
+                    {minutes < 60 ? `${minutes} minutes` : `${minutes / 60} hour${minutes === 60 ? "" : "s"}`}
+                  </option>
+                ))}
+                <option value="0">Never</option>
+              </select>
+              <p>
+                Each live section holds an agent process costing roughly 215 MB, plus up to 175 MB more as its
+                conversation grows — so a day&apos;s work can fill a small Mac.
+                Passing the cap, or sitting idle this long, hibernates the section you prompted least recently — its
+                process is released and your next message picks the conversation up where it left off. Sections that are
+                working or waiting on you are never hibernated. Raise both on a machine with plenty of RAM.
+              </p>
+            </div>
+
+            <div className="settings-field">
+              <span className="settings-field-label">Transcript</span>
+              <label htmlFor="settings-transcript-window">Items kept on screen</label>
+              <select
+                id="settings-transcript-window"
+                value={String(preferences.transcriptWindowSize)}
+                onChange={(event) =>
+                  void desktopApi
+                    .savePreferences({ transcriptWindowSize: Number(event.target.value) })
+                    .then(setPreferences)
+                }
+                aria-label="Transcript items kept on screen"
+              >
+                {[500, 1000, 2000, 5000, 10000].map((count) => (
+                  <option key={count} value={String(count)}>
+                    {count.toLocaleString()} items
+                  </option>
+                ))}
+                <option value="0">No limit</option>
+              </select>
+              <p>
+                A very long section gets slow to scroll and to type into, because every item on screen is rebuilt when a
+                turn starts or ends. Beyond this many, the oldest fold behind a &ldquo;Show earlier&rdquo; control at the
+                top of the feed — nothing is deleted, and search, export and /btw still see the whole conversation. Most
+                sections never reach the default, so this is a safety valve rather than a budget.
+              </p>
+              <label htmlFor="settings-retained-transcripts">Transcripts kept in memory</label>
+              <select
+                id="settings-retained-transcripts"
+                value={String(preferences.retainedTranscripts)}
+                onChange={(event) =>
+                  void desktopApi
+                    .savePreferences({ retainedTranscripts: Number(event.target.value) })
+                    .then(setPreferences)
+                }
+                aria-label="Transcripts kept in memory"
+              >
+                {[5, 8, 12, 20, 40, 80].map((count) => (
+                  <option key={count} value={String(count)}>
+                    {count} sections
+                  </option>
+                ))}
+                <option value="0">Every section opened</option>
+              </select>
+              <p>
+                Reading a section loads its whole history into this window, and a long one is tens of megabytes. Past
+                this many, the transcripts you looked at least recently are released and re-read from disk next time you
+                open them. The section on screen and any section mid-turn are never released.
+              </p>
+            </div>
+            </div>
+
             <div className="settings-panel" role="tabpanel" hidden={settingsTab !== "notifications"}>
+            <div className="settings-field">
+              <span className="settings-field-label">Delivery channels</span>
+              <label className="settings-toggle">
+                <input
+                  type="checkbox"
+                  checked={mobileNotificationsEnabled}
+                  disabled={remoteDevices.length === 0}
+                  onChange={(event) => void desktopApi.setRemoteMobileNotifications(event.target.checked).then(setRemoteDevices)}
+                />
+                <span>Mobile push notifications</span>
+              </label>
+              <p>{remoteDevices.length === 0 ? "Pair a phone to enable mobile notifications." : "Subscribes or unsubscribes every paired phone. You can still choose which event types the phone receives in the mobile app."}</p>
+            </div>
+
             <div className="settings-field">
               <label className="settings-toggle">
                 <input
@@ -8460,9 +12898,21 @@ export default function App(): React.ReactElement {
                   checked={notificationsEnabled}
                   onChange={(event) => setNotificationsEnabled(event.target.checked)}
                 />
-                <span>Notify when a section finishes</span>
+                <span>Desktop notifications</span>
               </label>
-              <p>Shows a macOS notification and a dock badge when Claude finishes a turn while you are away from that section.</p>
+              <p>Shows a macOS notification and a dock badge when an agent finishes a turn while you are away from that section.</p>
+            </div>
+
+            <div className="settings-field">
+              <label className="settings-toggle">
+                <input
+                  type="checkbox"
+                  checked={agentNotificationsEnabled}
+                  onChange={(event) => setAgentNotificationsEnabled(event.target.checked)}
+                />
+                <span>Agent attention</span>
+              </label>
+              <p>Brings Panda Code forward with an attention dialog and a five-second sound. Independent of desktop banners. Explicit user requests for agent attention are always allowed.</p>
             </div>
 
             <div className="settings-field">
@@ -8481,5 +12931,6 @@ export default function App(): React.ReactElement {
         </div>
       ) : null}
     </main>
+    </BacklogCardsContext.Provider>
   );
 }

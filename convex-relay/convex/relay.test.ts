@@ -1,7 +1,8 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import {
   createRelayTest,
+  enrollDevice,
   pairMobile,
   registerDevice,
   relayFixture,
@@ -19,10 +20,15 @@ import {
   MAX_EVENT_PAYLOAD_BYTES,
   OFFLINE_AFTER_MS,
   PENDING_COMMAND_TTL_MS,
+  SESSION_LIST_LIMIT,
   WRITE_BUDGET_RETENTION_MS,
 } from "./lib/retention";
 
 describe("relay protocol", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   test("pairing handshake stores only hashed relay credentials", async () => {
     const t = createRelayTest();
     await registerDevice(t);
@@ -155,12 +161,23 @@ describe("relay protocol", () => {
       mobileId: relayFixture.mobileId,
       token: relayFixture.mobileToken,
     });
+    // The answer itself is NOT on the row `watchMine` re-ships on every
+    // transition — only the flag saying one is waiting.
     expect(mine[0]).toMatchObject({
       _id: commandId,
       type: "usage-cost",
       status: "done",
-      resultCipher: "cipher:report",
+      hasResult: true,
     });
+    expect(mine[0].resultCipher).toBeUndefined();
+
+    await expect(
+      t.query(api.commands.result, {
+        mobileId: relayFixture.mobileId,
+        token: relayFixture.mobileToken,
+        commandId,
+      }),
+    ).resolves.toEqual({ status: "done", resultCipher: "cipher:report" });
   });
 
   test("a session-files command carries its file list back in resultCipher", async () => {
@@ -175,6 +192,7 @@ describe("relay protocol", () => {
       token: relayFixture.mobileToken,
       sessionId: relayFixture.sessionId,
       type: "session-files",
+      payloadCipher: "cipher:authenticated-command-fixture",
     });
 
     const pending = await t.query(api.commands.pending, {
@@ -200,12 +218,23 @@ describe("relay protocol", () => {
       mobileId: relayFixture.mobileId,
       token: relayFixture.mobileToken,
     });
+    // The answer itself is NOT on the row `watchMine` re-ships on every
+    // transition — only the flag saying one is waiting.
     expect(mine[0]).toMatchObject({
       _id: commandId,
       type: "session-files",
       status: "done",
-      resultCipher: "cipher:changes",
+      hasResult: true,
     });
+    expect(mine[0].resultCipher).toBeUndefined();
+
+    await expect(
+      t.query(api.commands.result, {
+        mobileId: relayFixture.mobileId,
+        token: relayFixture.mobileToken,
+        commandId,
+      }),
+    ).resolves.toEqual({ status: "done", resultCipher: "cipher:changes" });
   });
 
   test("command enqueue, claim, and ack closes the loop", async () => {
@@ -259,11 +288,172 @@ describe("relay protocol", () => {
       mobileId: relayFixture.mobileId,
       token: relayFixture.mobileToken,
     });
-    expect(mine[0]).toMatchObject({
-      _id: commandId,
-      status: "done",
-      resultCipher: "cipher:result",
+    expect(mine[0]).toMatchObject({ _id: commandId, status: "done", hasResult: true });
+    await expect(
+      t.query(api.commands.result, {
+        mobileId: relayFixture.mobileId,
+        token: relayFixture.mobileToken,
+        commandId,
+      }),
+    ).resolves.toEqual({ status: "done", resultCipher: "cipher:result" });
+  });
+
+  test("a successful result rides in its own document; a failure stays inline", async () => {
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+
+    const answer = async (status: "done" | "error", resultCipher: string) => {
+      const commandId = await t.mutation(api.commands.enqueue, {
+        mobileId: relayFixture.mobileId,
+        token: relayFixture.mobileToken,
+        type: "backlog",
+      payloadCipher: "cipher:authenticated-command-fixture",
+      });
+      await t.mutation(api.commands.claim, {
+        deviceId: relayFixture.deviceId,
+        token: relayFixture.deviceToken,
+        commandId,
+      });
+      await t.mutation(api.commands.ack, {
+        deviceId: relayFixture.deviceId,
+        token: relayFixture.deviceToken,
+        commandId,
+        status,
+        resultCipher,
+      });
+      return commandId;
+    };
+
+    // A whole kanban board must not sit on the row `watchMine` re-ships on every
+    // transition of every command the phone has issued in the last ten minutes.
+    const okId = await answer("done", "cipher:board");
+    const okRow = await t.run((ctx) => ctx.db.get(okId));
+    expect(okRow).toMatchObject({ hasResult: true });
+    expect(okRow?.resultCipher).toBeUndefined();
+
+    // A failure message is one sentence, and explaining a rejected command is
+    // exactly what `watchMine` is for — so that one stays where the UI reads it.
+    const failId = await answer("error", "cipher:why-not");
+    expect(await t.run((ctx) => ctx.db.get(failId))).toMatchObject({
+      resultCipher: "cipher:why-not",
+      hasResult: false,
     });
+    await expect(
+      t.run((ctx) => ctx.db.query("commandResults").collect()),
+    ).resolves.toMatchObject([{ commandId: okId, resultCipher: "cipher:board" }]);
+
+    // The phone reads its answer once, then frees it: an unconsumed board would
+    // otherwise sit in the table for a week being re-read by the sweep.
+    await t.mutation(api.commands.consumeResult, {
+      mobileId: relayFixture.mobileId,
+      token: relayFixture.mobileToken,
+      commandId: okId,
+    });
+    expect(await t.run((ctx) => ctx.db.query("commandResults").collect())).toHaveLength(0);
+    expect(await t.run((ctx) => ctx.db.get(okId))).toMatchObject({ hasResult: false });
+  });
+
+  test("large encrypted backlog results round-trip in bounded pieces and are consumed", async () => {
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+    const commandId = await t.mutation(api.commands.enqueue, {
+      mobileId: relayFixture.mobileId, token: relayFixture.mobileToken, type: "backlog",
+      payloadCipher: "cipher:authenticated-command-fixture",
+    });
+    const credentials = { deviceId: relayFixture.deviceId, token: relayFixture.deviceToken, commandId };
+    const reader = { mobileId: relayFixture.mobileId, token: relayFixture.mobileToken, commandId };
+    await t.mutation(api.commands.claim, credentials);
+    const resultCipher = "cipher:" + "a".repeat(1200000);
+    await t.mutation(api.commands.ack, { ...credentials, status: "done", resultCipher });
+    const pieces = await t.run((ctx) => ctx.db.query("commandResults").collect());
+    expect(pieces.length).toBeGreaterThan(1);
+    for (const piece of pieces) {
+      expect(new TextEncoder().encode(JSON.stringify(piece)).length).toBeLessThan(1024 * 1024);
+    }
+    await expect(t.query(api.commands.result, reader)).resolves.toEqual({ status: "done", resultCipher });
+    await t.mutation(api.commands.consumeResult, reader);
+    expect(await t.run((ctx) => ctx.db.query("commandResults").collect())).toHaveLength(0);
+  });
+
+  test("result replacement clears all pieces and preserves legacy and Unicode results", async () => {
+    const { writeResultCipher, readResultCipher, deleteResult } = await import("./lib/commandResults");
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+    const commandId = await t.mutation(api.commands.enqueue, {
+      mobileId: relayFixture.mobileId, token: relayFixture.mobileToken, type: "backlog",
+      payloadCipher: "cipher:authenticated-command-fixture",
+    });
+    await t.run(async (ctx) => {
+      await ctx.db.insert("commandResults", { commandId, resultCipher: "legacy" });
+      const command = (await ctx.db.get(commandId))!;
+      expect(await readResultCipher(ctx, command)).toBe("legacy");
+      const unicode = "a".repeat(256 * 1024 - 1) + "🐼" + "界".repeat(300000);
+      await writeResultCipher(ctx, commandId, unicode);
+      expect(await readResultCipher(ctx, command)).toBe(unicode);
+      const pieces = await ctx.db.query("commandResults").collect();
+      for (const piece of pieces) {
+        expect(new TextDecoder("utf-8", { fatal: true }).decode(new TextEncoder().encode(piece.resultCipher))).toBe(piece.resultCipher);
+        expect(new TextEncoder().encode(JSON.stringify(piece)).length).toBeLessThan(1024 * 1024);
+      }
+      await writeResultCipher(ctx, commandId, "small");
+      expect(await ctx.db.query("commandResults").collect()).toHaveLength(1);
+      expect(await readResultCipher(ctx, command)).toBe("small");
+      await writeResultCipher(ctx, commandId, "");
+      expect(await readResultCipher(ctx, command)).toBe("");
+      await deleteResult(ctx, commandId);
+      expect(await readResultCipher(ctx, command)).toBeUndefined();
+      expect(await readResultCipher(ctx, { ...command, resultCipher: "inline" })).toBe("inline");
+    });
+  });
+
+  test("starredForDevice ships only what changed after the cursor", async () => {
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+    await upsertSession(t);
+
+    await t.mutation(api.sessions.setStarredByDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: relayFixture.sessionId,
+      starred: true,
+    });
+
+    // The desktop's startup read: everything, once.
+    const all = await t.query(api.sessions.starredForDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+    });
+    expect(all).toMatchObject([{ sessionId: relayFixture.sessionId, starred: true }]);
+
+    // The subscription it then holds open for the rest of the run reads the tail
+    // after that instant — empty until a star actually moves, which is the whole
+    // point: re-executing it must not re-ship all ~200 rows.
+    const since = all[0].updatedAt;
+    await expect(
+      t.query(api.sessions.starredForDevice, {
+        deviceId: relayFixture.deviceId,
+        token: relayFixture.deviceToken,
+        since,
+      }),
+    ).resolves.toEqual([]);
+
+    await t.mutation(api.sessions.setStarredByDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: relayFixture.sessionId,
+      starred: false,
+    });
+    await expect(
+      t.query(api.sessions.starredForDevice, {
+        deviceId: relayFixture.deviceId,
+        token: relayFixture.deviceToken,
+        since,
+      }),
+    ).resolves.toMatchObject([{ sessionId: relayFixture.sessionId, starred: false }]);
   });
 
   test("a command's payload rides in its own document and is freed on ack", async () => {
@@ -416,7 +606,7 @@ describe("relay protocol", () => {
       token: relayFixture.deviceToken,
     });
     expect(clients).toMatchObject([
-      { mobileId: relayFixture.mobileId, name: "Fixture Phone" },
+      { mobileId: relayFixture.mobileId, name: "Fixture Phone", notificationsEnabled: true },
     ]);
 
     await expect(
@@ -425,7 +615,12 @@ describe("relay protocol", () => {
         token: relayFixture.deviceToken,
         mobileId: relayFixture.mobileId,
       }),
-    ).resolves.toEqual([]);
+    ).rejects.toThrow("Update Panda Code");
+    let complete = false;
+    for (let i = 0; i < 30 && !complete; i++) {
+      ({ complete } = await t.mutation(api.pairing.resetPairing, {deviceId: relayFixture.deviceId, token: relayFixture.deviceToken, resetId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}));
+    }
+    expect(complete).toBe(true);
 
     await expect(
       t.query(api.commands.watchMine, {
@@ -433,6 +628,57 @@ describe("relay protocol", () => {
         token: relayFixture.mobileToken,
       }),
     ).rejects.toThrow("MOBILE_NOT_FOUND");
+  });
+
+  test("desktop can subscribe and unsubscribe all paired phones from notifications", async () => {
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+
+    const muted = await t.mutation(api.pairing.setMobileNotifications, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      enabled: false,
+    });
+    expect(muted).toMatchObject([{ mobileId: relayFixture.mobileId, notificationsEnabled: false }]);
+
+    const prefs = await t.query(internal.notifications.prefsForMobile, {
+      mobileId: relayFixture.mobileId,
+    });
+    expect(prefs.muted).toBe(true);
+
+    await expect(
+      t.mutation(api.pairing.setMobileNotifications, {
+        deviceId: relayFixture.deviceId,
+        token: "wrong-token",
+        enabled: true,
+      }),
+    ).rejects.toThrow("DEVICE_AUTH_FAILED");
+  });
+
+  test("desktop can control a session subscription for every paired phone", async () => {
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+
+    await expect(t.query(api.notifications.sessionSubscriptionForDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: relayFixture.sessionId,
+    })).resolves.toEqual({ available: true, phoneCount: 1, subscribedPhones: 0 });
+
+    await expect(t.mutation(api.notifications.setSessionSubscriptionByDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: relayFixture.sessionId,
+      subscribed: true,
+    })).resolves.toEqual({ available: true, phoneCount: 1, subscribedPhones: 1 });
+
+    await expect(t.query(api.notifications.sessionSubscriptionForDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: relayFixture.sessionId,
+    })).resolves.toEqual({ available: true, phoneCount: 1, subscribedPhones: 1 });
   });
 
   test("push token registration requires mobile auth and upserts per token", async () => {
@@ -591,6 +837,59 @@ describe("relay protocol", () => {
       sessionId: relayFixture.sessionId,
       starred: false,
     });
+  });
+
+  test("the session list windows on recent activity and never drops a pin", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+    const base = Date.now();
+    const touch = async (
+      sessionId: string,
+      at: number,
+      agentState: "working" | "waiting" = "working",
+    ) => {
+      vi.setSystemTime(at);
+      await t.mutation(api.sessions.upsertSession, {
+        deviceId: relayFixture.deviceId,
+        token: relayFixture.deviceToken,
+        sessionId,
+        status: "running",
+        agentState,
+        executionMode: "stream-json",
+      });
+    };
+
+    // Three threads that first streamed long ago, then a flood of newer ones —
+    // enough that creation order alone would bury all three.
+    await touch("old-active", base);
+    await touch("old-pinned", base + 1);
+    await touch("old-quiet", base + 2);
+    await t.mutation(api.sessions.setStarredByDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: "old-pinned",
+      starred: true,
+    });
+    for (let i = 0; i < SESSION_LIST_LIMIT; i += 1) {
+      await touch(`filler-${i}`, base + 10 + i);
+    }
+    // ...and one of them is picked up again right now.
+    await touch("old-active", base + 10 + SESSION_LIST_LIMIT, "waiting");
+
+    const list = await t.query(api.sessions.list, {
+      mobileId: relayFixture.mobileId,
+      token: relayFixture.mobileToken,
+    });
+    const ids = list.map((row) => row.sessionId);
+    // Used most recently -> top of the window, despite being the oldest row.
+    expect(ids[0]).toBe("old-active");
+    // Quiet but pinned -> pulled in from outside the window.
+    expect(ids).toContain("old-pinned");
+    // Quiet and unpinned -> correctly out of the window.
+    expect(ids).not.toContain("old-quiet");
+    expect(list).toHaveLength(SESSION_LIST_LIMIT + 1);
   });
 
   test("stars live off the session row, so pinning never dirties it", async () => {
@@ -822,6 +1121,59 @@ describe("relay protocol", () => {
     expect(list).toEqual([]);
   });
 
+  test("a sub-thread link reaches the phone's list, and detaching clears it", async () => {
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+    await upsertSession(t);
+
+    await t.mutation(api.sessions.setParentByDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: relayFixture.sessionId,
+      parentSessionId: "parent-section",
+    });
+
+    const nested = await t.query(api.sessions.list, {
+      mobileId: relayFixture.mobileId,
+      token: relayFixture.mobileToken,
+    });
+    expect(nested[0]).toMatchObject({ parentSessionId: "parent-section", status: "running" });
+
+    // Detaching is the absence of the argument. It has to be expressible, which
+    // is the whole reason this is not folded into the (sticky) upsert.
+    await t.mutation(api.sessions.setParentByDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: relayFixture.sessionId,
+    });
+
+    const detached = await t.query(api.sessions.list, {
+      mobileId: relayFixture.mobileId,
+      token: relayFixture.mobileToken,
+    });
+    expect(detached[0]?.parentSessionId).toBeUndefined();
+  });
+
+  test("re-parenting a session the relay has never seen creates nothing", async () => {
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+
+    await t.mutation(api.sessions.setParentByDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: "never-mirrored",
+      parentSessionId: "parent-section",
+    });
+
+    const list = await t.query(api.sessions.list, {
+      mobileId: relayFixture.mobileId,
+      token: relayFixture.mobileToken,
+    });
+    expect(list).toEqual([]);
+  });
+
   test("appendEvents keeps seq monotonic, updates headSeq, and tail is cursor-only", async () => {
     const t = createRelayTest();
     await registerDevice(t);
@@ -975,7 +1327,7 @@ describe("relay protocol", () => {
     await registerDevice(t);
     await pairMobile(t);
 
-    await t.mutation(api.pairing.registerDevice, {
+    await enrollDevice(t, {
       deviceId: "device-2",
       token: "second-desktop-token-with-high-entropy-fixture",
       name: "Other Mac",
@@ -1054,16 +1406,19 @@ describe("relay protocol", () => {
       return { deviceId: device._id, pairingId, eventId, closedCommandId, pendingCommandId };
     });
 
-    await expect(t.mutation(internal.maintenance.prune, {})).resolves.toEqual({
+    await expect(t.mutation(internal.maintenance.pruneLive, {})).resolves.toEqual({
       expiredPairings: 1,
       offlineDevices: 1,
       // The fixture session is mid-turn, and its desktop just went dark: the
       // sweep closes it out so the phone stops spinning on it.
       demotedSessions: 1,
+    });
+    await expect(t.mutation(internal.maintenance.pruneSweep, {})).resolves.toEqual({
       deletedEvents: 1,
       deletedCommands: 1,
       expiredCommands: 1,
       deletedBudgets: 0,
+      deletedBlobs: 0,
     });
 
     const state = await t.run(async (ctx) => ({
@@ -1105,7 +1460,7 @@ describe("relay protocol", () => {
       });
     });
 
-    await t.mutation(internal.maintenance.prune, {});
+    await t.mutation(internal.maintenance.pruneLive, {});
 
     const after = await t.run(async (ctx) => ({
       session: await ctx.db
@@ -1330,7 +1685,7 @@ describe("relay protocol", () => {
         });
       });
 
-      await expect(t.mutation(internal.maintenance.prune, {})).resolves.toMatchObject({
+      await expect(t.mutation(internal.maintenance.pruneSweep, {})).resolves.toMatchObject({
         deletedBudgets: 1,
       });
       expect(await t.run(async (ctx) => ctx.db.query("deviceWriteBudget").collect())).toHaveLength(0);
@@ -1339,7 +1694,7 @@ describe("relay protocol", () => {
     test("a fresh window is not pruned", async () => {
       const t = await seed();
       await append(t, 1);
-      await expect(t.mutation(internal.maintenance.prune, {})).resolves.toMatchObject({
+      await expect(t.mutation(internal.maintenance.pruneSweep, {})).resolves.toMatchObject({
         deletedBudgets: 0,
       });
       expect(await t.run(async (ctx) => ctx.db.query("deviceWriteBudget").collect())).toHaveLength(1);

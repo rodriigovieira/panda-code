@@ -1,0 +1,33 @@
+import { randomUUID } from "node:crypto";
+import { expect, it, vi } from "vitest";
+import { createRelayBridge } from "./relayBridge";
+import { commandKey, COMMAND_DOMAIN } from "./commandAuth";
+import { encryptJson } from "./crypto";
+it("the real dispatcher requires proof of key possession and executes each Stop once", () => {
+ const stopSession = vi.fn();
+ const bridge = createRelayBridge({sessionService:{stopSession}} as unknown as Parameters<typeof createRelayBridge>[0]);
+ const key = new Uint8Array(32).fill(3);
+ const internals = bridge as unknown as {credentials:unknown;dispatchCommand:(command:unknown)=>unknown};
+ internals.credentials={deviceId:"device",key};
+ const command={type:"stop",sessionId:"section",mobileId:"phone",payloadCipher:encryptJson({v:2,domain:COMMAND_DOMAIN,id:randomUUID(),deviceId:"device",mobileId:"phone",sessionId:"section",type:"stop",issuedAt:Date.now(),expiresAt:Date.now()+60_000,payload:null},commandKey(key))};
+ expect(()=>internals.dispatchCommand({...command,payloadCipher:undefined})).toThrow();
+ expect(()=>internals.dispatchCommand({...command,sessionId:"other"})).toThrow();
+ expect(stopSession).not.toHaveBeenCalled();
+ internals.dispatchCommand(command);
+ expect(stopSession).toHaveBeenCalledExactlyOnceWith({id:"section"});
+ expect(()=>internals.dispatchCommand(command)).toThrow(/already handled/);
+});
+it("full-access starts require the Mac-owned opt-in", async () => {
+ const startSession = vi.fn(() => ({ok:false}));
+ const key = new Uint8Array(32).fill(3);
+ let allowed = false;
+ const bridge = createRelayBridge({sessionService:{startSession},isRemoteWorkspaceAllowed:()=>true,allowRemoteFullAccess:()=>allowed} as unknown as Parameters<typeof createRelayBridge>[0]);
+ const internals = bridge as unknown as {credentials:unknown;dispatchStart:(command:unknown)=>Promise<unknown>};
+ internals.credentials={deviceId:"device",key};
+ const command={payloadCipher:encryptJson({id:"new-section",cwd:"/tmp/example",runtime:"codex",permissionMode:"danger-full-access"},key)};
+ await expect(internals.dispatchStart(command)).rejects.toThrow(/blocked by the Mac/);
+ expect(startSession).not.toHaveBeenCalled();
+ allowed = true;
+ await internals.dispatchStart(command);
+ expect(startSession).toHaveBeenCalledOnce();
+});

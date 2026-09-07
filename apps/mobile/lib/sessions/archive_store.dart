@@ -2,9 +2,11 @@ import 'dart:convert';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
-/// Locally-persisted set of archived (hidden) session ids. Archiving is a
-/// device-local view preference — it does not stop or delete the session on the
-/// Mac, it just hides ended/clutter sessions from the main list.
+/// Locally cached set of archived (hidden) session ids. The relay is the sync
+/// source for new archive/unarchive changes (mirrors [PinnedStore]'s
+/// contract); this cache preserves legacy/offline archives. Archiving never
+/// stops or deletes the session on the Mac — it just hides clutter from the
+/// main list, on both devices.
 class ArchiveStore {
   static const _storage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),

@@ -7,6 +7,45 @@ import 'code_view.dart';
 import 'diff_view.dart';
 import 'search_highlight.dart';
 
+/// A screenshot's success message ends "... to `<path>` — read that path to
+/// see it." — the path an agent itself would `Read` to view the capture.
+/// Matches `browserService.ts`'s `screenshot` result string exactly; if that
+/// message ever changes shape, this stops finding anything and the button
+/// just never appears (fails closed, not with a broken link).
+///
+/// The capture group is greedy `.+`, not `\S+`: `app.getPath("userData")`
+/// routinely contains spaces ("Application Support", "Panda Code"), so a
+/// whitespace-stopped match would truncate the path before `.png`. Matching
+/// up to the fixed " — read that path to see it" suffix instead works
+/// because that phrase appears at most once in the message.
+final _screenshotPathPattern = RegExp(r'to (.+\.png) — read that path to see it');
+
+/// A recording's stop message ends "... Video at `<path>`" once an mp4 was
+/// successfully encoded (a raw-frames fallback has no such line, so there is
+/// nothing to view yet). Matches `browserService.ts`'s `stopRecording`. Same
+/// greedy-capture-to-a-fixed-anchor reasoning as the screenshot pattern above,
+/// anchored on end-of-string instead since the path is the last thing in the
+/// message.
+final _recordingPathPattern = RegExp(r'Video at (.+\.mp4)$');
+
+/// The local (desktop) file path a `browser_screenshot`/`browser_record` tool
+/// result points at, if any — pulled out of the plain text the desktop already
+/// streams, since that text is the only place the path lives (docs/protocol.md
+/// carries no structured field for it). Returns null for a call that hasn't
+/// produced a capture yet (e.g. a `record` "start").
+({String path, bool isVideo})? browserMediaTarget(ToolData tool) {
+  if (tool.status != ToolStatus.success) return null;
+  final text = tool.output ?? '';
+  if (tool.name == 'browser_screenshot') {
+    final match = _screenshotPathPattern.firstMatch(text);
+    if (match != null) return (path: match.group(1)!, isVideo: false);
+  } else if (tool.name == 'browser_record') {
+    final match = _recordingPathPattern.firstMatch(text);
+    if (match != null) return (path: match.group(1)!, isVideo: true);
+  }
+  return null;
+}
+
 /// A tool call rendered as a collapsible card: a header (icon + name + target +
 /// status) always visible; the input/command/diff/output expandable. Long output
 /// stays collapsed by default so a tool-heavy session stays scannable.
@@ -18,12 +57,19 @@ class ToolCallView extends StatefulWidget {
     this.expandSignal,
     this.highlightQuery,
     this.activeHighlight = false,
+    this.onOpenMedia,
   });
 
   final ToolData tool;
 
   /// Shown when the desktop sent no structured fields (older payloads).
   final String? fallbackBody;
+
+  /// A `browser_screenshot`/`browser_record` result was found to point at a
+  /// capture on the desktop's disk — show a "View" affordance that fetches
+  /// and opens it. Null hides the affordance entirely (no relay wired up, or
+  /// [browserMediaTarget] found nothing to view).
+  final void Function(String path, bool isVideo)? onOpenMedia;
 
   /// Expand/collapse-all command as (epoch, expand). When the epoch changes this
   /// card syncs its expansion to the broadcast value.
@@ -110,6 +156,7 @@ class _ToolCallViewState extends State<ToolCallView> {
     final query = widget.highlightQuery;
     final active = widget.activeHighlight;
     final showExpanded = _showExpanded;
+    final mediaTarget = widget.onOpenMedia == null ? null : browserMediaTarget(t);
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 4),
       decoration: BoxDecoration(
@@ -160,6 +207,14 @@ class _ToolCallViewState extends State<ToolCallView> {
                       ),
                     ),
                   ),
+                  if (mediaTarget != null) ...[
+                    _ViewMediaButton(
+                      isVideo: mediaTarget.isVideo,
+                      onTap: () =>
+                          widget.onOpenMedia!(mediaTarget.path, mediaTarget.isVideo),
+                    ),
+                    SizedBox(width: 6),
+                  ],
                   _StatusChip(status: t.status, exitCode: t.exitCode),
                   if (_hasDetail)
                     Icon(showExpanded ? Icons.expand_less : Icons.expand_more,
@@ -337,6 +392,47 @@ class _ToolBody extends StatelessWidget {
     if (match == null) return (body, null);
     final lang = (match.group(1) ?? '').trim();
     return (match.group(2) ?? '', lang.isEmpty ? null : lang);
+  }
+}
+
+/// The "View screenshot"/"View recording" affordance on a capture's tool
+/// card. Sits in the header so it is reachable without expanding a card whose
+/// text output is otherwise the least interesting part of it.
+class _ViewMediaButton extends StatelessWidget {
+  const _ViewMediaButton({required this.isVideo, required this.onTap});
+
+  final bool isVideo;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: context.tokens.panel,
+      borderRadius: BorderRadius.circular(20),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(isVideo ? Icons.play_circle_outline : Icons.image_outlined,
+                  size: 15, color: context.tokens.info.text),
+              SizedBox(width: 4),
+              Text(
+                isVideo ? 'View recording' : 'View screenshot',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: context.tokens.info.text,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
 

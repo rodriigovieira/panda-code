@@ -6,6 +6,10 @@
 	<string>Panda Code uses the camera to scan the pairing QR shown on your Mac and to take photos you attach to prompts.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Panda Code lets you attach images to prompts sent to your Mac.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Panda Code uses the microphone so you can dictate prompts instead of typing them.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Panda Code transcribes your dictation on this device. Audio is not sent to Panda Code servers.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Panda Code uses Face ID to unlock the app and keep your sessions private.</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>

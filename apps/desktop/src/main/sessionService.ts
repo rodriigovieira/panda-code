@@ -27,6 +27,12 @@ export type ManagedStreamSession = {
   titleLocked?: boolean;
   /** Last observed background task output file signature, used to throttle live tail snapshots. */
   taskOutputSignature?: string;
+  /**
+   * Epoch ms of the last prompt the user sent here. The hibernation reaper picks
+   * its victims by this — see sessionReaper.ts for why it is the prompt and not
+   * any measure of the agent's own activity.
+   */
+  lastPromptAt: number;
 };
 
 type SessionServiceDependencies = {
@@ -59,11 +65,19 @@ type SessionServiceDependencies = {
     has: (id: string) => boolean;
     ids: () => string[];
     getRequest: (id: string) => SessionStartRequest | undefined;
+    /** Live thread id, which outruns the stored request's copy of it. */
+    threadId?: (id: string) => string | undefined;
     sendInput: (id: string, data: string, imagePaths?: string[]) => Promise<SessionInputResult>;
     answerApproval: (answer: SessionApprovalAnswer) => SessionApprovalResult;
     stop: (id: string) => void;
     updateOverrides: (id: string, overrides: { model?: string; effort?: string; permissionMode?: string }) => void;
     replay: () => void;
+  };
+  groq?: {
+    has: (id: string) => boolean;
+    ids: () => string[];
+    sendInput: (id: string, data: string) => Promise<SessionInputResult>;
+    stop: (id: string) => void;
   };
 };
 
@@ -72,17 +86,49 @@ export type SessionService = {
   sendInput: (request: SessionInputRequest) => Promise<SessionInputResult>;
   answerApproval: (answer: SessionApprovalAnswer) => SessionApprovalResult;
   switchSession: (request: SessionSwitchRequest) => void;
+  /** Kill a section's process but keep it resumable. Returns false if unsafe. */
+  hibernateSession: (id: string) => boolean;
   stopSession: (request: SessionStopRequest) => void;
   listSessions: () => string[];
+  getRequest?: (id: string) => SessionStartRequest | undefined;
 };
 
 export function createSessionService(deps: SessionServiceDependencies): SessionService {
-  // Claude sections whose persistent process we tore down for a mid-session
-  // switch. The next input for one of these resumes `claude --resume … --model …`
-  // from its stored request instead of writing to a dead pipe. Scoped to
-  // switches so a normally-exited Claude section keeps its old drop-the-input
-  // behavior (its resume request may carry stale settings / no session id).
+  // Claude sections whose persistent process we tore down deliberately — a
+  // mid-session switch, or hibernation by the reaper. The next input for one of
+  // these resumes `claude --resume … --model …` from its stored request instead
+  // of writing to a dead pipe.
+  //
+  // Membership means "this section's process was killed while the conversation
+  // was still good", and NOT simply "no process". That distinction is the whole
+  // point: a normally-exited Claude section keeps the old drop-the-input
+  // behavior, because its resume request may carry stale settings or no session
+  // id at all. Anything that kills a live process and expects the section to
+  // come back must add to this set — `switchSession` and `hibernateSession` are
+  // the two writers, and `sendInput` is the only reader, which consumes the
+  // marker exactly once.
   const pendingClaudeResume = new Set<string>();
+
+  /**
+   * A prompt just went down a live section's stdin, so the section is working —
+   * say so now instead of waiting for the CLI to prove it.
+   *
+   * Claude answers a prompt with `system:init` within ~200ms but takes seconds
+   * (13s on a long conversation) to emit its first real event. The state here
+   * still read "waiting" from the previous turn's `result`, and system notices
+   * deliberately don't move it (see stream-json.ts), so every snapshot in that
+   * window re-broadcast "waiting" — overwriting the optimistic "working" the
+   * composer had just set and reporting the section Ready while the transcript
+   * already showed "Thinking…". The Codex app-server path does the same thing
+   * via markWorking(); this is the exec path's version.
+   */
+  function markStreamWorking(id: string, streamSession: ManagedStreamSession): void {
+    streamSession.lastPromptAt = Date.now();
+    streamSession.state.agentState = "working";
+    streamSession.state.currentEventType = "input:submitted";
+    streamSession.state.lastEventAt = new Date().toISOString();
+    deps.sendStreamSnapshot(id, streamSession);
+  }
 
   function emitStarted(request: SessionStartRequest, result: SessionStartResult): SessionStartResult {
     if (result.ok) {
@@ -96,11 +142,12 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
     const ptyExisting = deps.sessions.get(request.id);
     const streamExisting = deps.streamSessions.get(request.id);
     const appServerExisting = deps.appServer?.has(request.id) ?? false;
-    const existingRuntime = streamExisting?.runtime ?? (appServerExisting ? "codex" : ptyExisting ? "claude" : undefined);
+    const groqExisting = deps.groq?.has(request.id) ?? false;
+    const existingRuntime = streamExisting?.runtime ?? (appServerExisting ? "codex" : groqExisting ? "groq" : ptyExisting ? "claude" : undefined);
     if (existingRuntime && existingRuntime !== requestedRuntime) {
       deps.logMain("session:start-runtime-mismatch", { id: request.id, existingRuntime, requestedRuntime });
       stopSession({ id: request.id });
-    } else if (ptyExisting || streamExisting || appServerExisting) {
+    } else if (ptyExisting || streamExisting || appServerExisting || groqExisting) {
       deps.logMain("session:start-existing", { id: request.id });
       return emitStarted(request, { ok: true });
     }
@@ -171,6 +218,9 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
   }
 
   async function sendInput(request: SessionInputRequest): Promise<SessionInputResult> {
+    if (deps.groq?.has(request.id)) {
+      return deps.groq.sendInput(request.id, request.data);
+    }
     if (deps.appServer?.has(request.id)) {
       deps.logMain("app-server:input", {
         id: request.id,
@@ -191,6 +241,7 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
         preview: request.data.replace(/\s+/g, " ").trim(),
       });
       streamSession.process.stdin.write(deps.streamPromptPayload(request.data));
+      markStreamWorking(request.id, streamSession);
       return { ok: true };
     }
 
@@ -211,12 +262,17 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
       return deps.appServer.sendInput(request.id, request.data, request.imagePaths);
     }
 
-    // A Claude section whose persistent process we tore down for a mid-session
-    // model switch leaves behind a resume request carrying the claudeSessionId +
-    // new model. Re-spawn `claude --resume … --model …` and deliver this prompt
-    // so the switch takes effect on the very next message.
+    // A Claude section whose persistent process we tore down on purpose — a
+    // mid-session model switch, or hibernation — leaves behind a resume request
+    // carrying the claudeSessionId (plus the new model, for a switch). Re-spawn
+    // `claude --resume … --model …` and deliver this prompt, so a switch takes
+    // effect on the very next message and a hibernated section wakes up on it.
+    //
+    // This is the only place the user pays for hibernation: the first prompt
+    // after a reap waits for a cold CLI start (~3s warm, 30s+ with MCP servers)
+    // instead of going straight down a live pipe.
     // `resumeRequest.runtime` is already narrowed to non-codex by the branch
-    // above (which returns for codex), so we only gate on the switch marker.
+    // above (which returns for codex), so we only gate on the marker.
     if (pendingClaudeResume.has(request.id) && resumeRequest) {
       pendingClaudeResume.delete(request.id);
       deps.logMain("stream-json:claude-resume-for-input", {
@@ -228,6 +284,7 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
       const resumed = deps.streamSessions.get(request.id);
       if (result.ok && resumed) {
         resumed.process.stdin.write(deps.streamPromptPayload(request.data));
+        markStreamWorking(request.id, resumed);
         return { ok: true };
       }
       deps.logMain("stream-json:claude-resume-input-failed", {
@@ -287,9 +344,13 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
     if (deps.appServer?.has(request.id)) {
       return deps.appServer.sendInput(request.id, request.data, request.imagePaths);
     }
+    if (deps.groq?.has(request.id)) {
+      return deps.groq.sendInput(request.id, request.data);
+    }
     const restarted = deps.streamSessions.get(request.id);
     if (restarted) {
       restarted.process.stdin.write(deps.streamPromptPayload(request.data));
+      markStreamWorking(request.id, restarted);
       return { ok: true };
     }
     const restartedPty = deps.sessions.get(request.id);
@@ -348,7 +409,7 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
       ? {
           ...base,
           runtime: nextRuntime,
-          command: nextRuntime === "codex" ? "codex" : "claude",
+          command: nextRuntime === "codex" ? "codex" : nextRuntime === "groq" ? "groq" : "claude",
           // A provider switch is a fresh conversation — don't carry the previous
           // runtime's model/effort. Keep the previous provider's transcript id
           // as read-only history so the section can be restored after restart;
@@ -402,7 +463,74 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
     }
   }
 
+  /**
+   * Release a section's agent process while keeping the section itself intact —
+   * the next prompt resumes the same conversation. Called by the reaper when the
+   * live-section cap is reached or a section has sat idle (see sessionReaper.ts).
+   *
+   * This is the mid-session-switch teardown with no settings change: refresh the
+   * resume request from the live thread id, mark the section for resume, push a
+   * "waiting" snapshot, then kill. The ordering is what keeps it invisible —
+   * deleting from `streamSessions` before the async `close` fires means the exit
+   * handler takes its stale-exit branch and never emits `session:exit`, so
+   * neither the sidebar nor the phone shows the section as crashed.
+   *
+   * Returns false when the section cannot be hibernated safely, which the caller
+   * treats as "leave it alone": a cap exceeded by a few processes is cheaper than
+   * a section that cannot come back.
+   */
+  function hibernateSession(id: string): boolean {
+    const live = deps.streamSessions.get(id);
+    const appServerLive = deps.appServer?.has(id) ?? false;
+    if (!live && !appServerLive) return false;
+
+    const base = live?.request ?? deps.getStreamResumeRequest(id) ?? deps.appServer?.getRequest(id);
+    if (!base) {
+      deps.logMain("session:hibernate-no-request", { id });
+      return false;
+    }
+
+    if (appServerLive) {
+      // One `codex app-server` process backs every Codex section, so hibernating
+      // one only returns memory once it is the last — the manager disposes the
+      // client when its session count hits zero.
+      const threadId = deps.appServer!.threadId?.(id) ?? base.codexThreadId;
+      if (!threadId) {
+        deps.logMain("session:hibernate-no-thread", { id });
+        return false;
+      }
+      deps.setStreamResumeRequest(id, { ...base, codexThreadId: threadId });
+      deps.logMain("session:hibernate", { id, runtime: "codex", codexThreadId: threadId });
+      deps.appServer!.stop(id);
+      deps.refreshSleepBlocker();
+      return true;
+    }
+
+    const claudeSessionId = live!.state.claudeSessionId ?? base.claudeSessionId;
+    if (!claudeSessionId) {
+      // Nothing to `--resume` from: this section has not been answered yet, and
+      // killing it now would lose the conversation rather than park it.
+      deps.logMain("session:hibernate-no-session-id", { id });
+      return false;
+    }
+
+    deps.setStreamResumeRequest(id, { ...base, claudeSessionId });
+    pendingClaudeResume.add(id);
+    live!.state.agentState = "waiting";
+    live!.state.lastEventAt = new Date().toISOString();
+    deps.sendStreamSnapshot(id, live!);
+    deps.logMain("session:hibernate", { id, runtime: live!.runtime, claudeSessionId });
+    live!.process.kill();
+    deps.streamSessions.delete(id);
+    deps.refreshSleepBlocker();
+    return true;
+  }
+
   function stopSession(request: SessionStopRequest): void {
+    if (deps.groq?.has(request.id)) {
+      deps.logMain("groq:stop", { id: request.id });
+      deps.groq.stop(request.id);
+    }
     if (deps.appServer?.has(request.id)) {
       deps.logMain("app-server:stop", { id: request.id });
       deps.appServer.stop(request.id);
@@ -429,7 +557,7 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
       deps.sendStreamSnapshot(id, streamSession);
     }
     deps.appServer?.replay();
-    return [...deps.sessions.keys(), ...deps.streamSessions.keys(), ...(deps.appServer?.ids() ?? [])];
+    return [...deps.sessions.keys(), ...deps.streamSessions.keys(), ...(deps.appServer?.ids() ?? []), ...(deps.groq?.ids() ?? [])];
   }
 
   function answerApproval(answer: SessionApprovalAnswer): SessionApprovalResult {
@@ -439,5 +567,7 @@ export function createSessionService(deps: SessionServiceDependencies): SessionS
     return deps.appServer.answerApproval(answer);
   }
 
-  return { startSession, sendInput, answerApproval, switchSession, stopSession, listSessions };
+  return { startSession, sendInput, answerApproval, switchSession, hibernateSession, stopSession, listSessions,
+    getRequest: (id) => deps.appServer?.getRequest(id) ?? deps.streamSessions.get(id)?.request ?? deps.getStreamResumeRequest(id) ?? deps.getStoredStartRequest?.(id),
+  };
 }

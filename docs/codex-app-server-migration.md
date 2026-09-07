@@ -8,11 +8,11 @@ what the transport does and why.
 
 ## Why
 
-Today Codex sessions run as a one-shot child per turn (`buildStreamCodexCommand`
-in `apps/desktop/src/main/index.ts` → `codex exec --json`, resumed via
-`codex exec resume <threadId>`). JSONL is parsed in `src/shared/stream-json.ts`
-(`applyCodexItem` / `applyCodexError`); "idle" is inferred from process exit.
-Approvals are hard-disabled (`--ask-for-approval never`).
+Before this migration, Codex sessions ran as a one-shot child per turn through
+`codex exec --json`; resume required another child, idle was inferred from
+process exit, and interactive approvals were unavailable. Panda now launches one
+shared, long-lived app-server process and maps each Panda section to a Codex
+thread on that connection.
 
 `codex app-server` is a persistent JSON-RPC (newline-delimited JSON over stdio)
 server that already backs one feature here: rate-limit reads
@@ -25,10 +25,20 @@ server that already backs one feature here: rate-limit reads
   which the exec path cannot do — this is what unblocks the `needs_action`
   remote-approval flow reserved in `docs/protocol.md`.
 
-## Target protocol (codex-cli 0.142.3)
+## Protocol compatibility
 
-Regenerate the bindings anytime with:
-`codex app-server generate-ts -o <dir>` (or `generate-json-schema`).
+The original cutover targeted `codex-cli 0.142.3`. The compatibility sweep on
+2026-09-04 compared the generated `0.147.0` and `0.153.2` schemas and drove a
+real turn through Panda's session manager on `0.153.2`; the required lifecycle
+remained compatible. Panda intentionally invokes the user's external `codex`
+binary rather than bundling or pinning one.
+
+Run `pnpm check:codex-protocol` to generate the installed CLI's TypeScript schema
+in a temporary directory and verify every method Panda requires. The command also
+reports whether optional permission, MCP elicitation, and warning contracts are
+available. Run `pnpm probe:codex turn` (or `all`) for behavioral verification.
+Generated artifacts remain temporary because the CLI documents them as specific
+to the exact Codex version that produced them.
 
 Session lifecycle:
 - `thread/start` (`ThreadStartParams`) / `thread/resume` (`ThreadResumeParams`)
@@ -130,16 +140,19 @@ JSON-RPC routing rule (one socket carries all three):
         `item/tool/requestUserInput` (options or free text; a multi-question
         request is surfaced one question at a time and the JSON-RPC request is
         answered ONCE with every answer).
-      - Still refused, but refused *fast* and with a transcript line saying why
-        (never left hanging): `item/permissions/requestApproval`,
-        `mcpServer/elicitation/request`, `item/tool/call`.
+      - The 2026-09-04 compatibility update added
+        `item/permissions/requestApproval` (grant only the requested subset, for
+        one turn or the session) and `mcpServer/elicitation/request` (typed form
+        fields plus URL confirmation). `item/tool/call` is still refused fast:
+        Panda does not advertise client-owned dynamic tools, so receiving one
+        would be a protocol violation rather than a usable capability.
       - `manager.answerApproval()` → IPC `session:answer-approval` → desktop
         `ApprovalPanel` (docked above the composer). `serverRequest/resolved` and
         `turn/started` clear a prompt that was answered elsewhere or expired;
         `stop()` answers a held request with `cancel` so the thread is not wedged.
       - Relay: `pendingApproval` + `pendingPromptId` ride `runtimeCipher`, and the
         `approve`/`deny` commands reserved in `docs/protocol.md` §6 are now
-        implemented (`dispatchApproval`). Mobile UI for it is NOT built yet.
+        implemented (`dispatchApproval`) on both desktop and mobile.
       - `item/tool/requestUserInput` is gated by Codex's own
         `default_mode_request_user_input` experimental flag (stage
         `underDevelopment`, default off). Panda honors that default; set
@@ -193,14 +206,27 @@ JSON-RPC routing rule (one socket carries all three):
   live session client first (or its `account/rateLimits/updated` cache) and only
   spawns a throwaway app-server every 15 minutes at most. It used to spawn and
   SIGTERM one per poll — 3,611 times in one debug log.
+- **Subscription cleanup.** Stopping one section now calls `thread/unsubscribe`
+  when other sections keep the shared app-server alive, allowing Codex to unload
+  the abandoned thread after its grace period.
+- **Current interaction surface.** Permission profiles and MCP elicitations use
+  the same encrypted approval payload and desktop/mobile answer path as command
+  approvals. Managed-network requests name the destination rather than showing a
+  meaningless empty shell command.
+- **Forward-compatible notices.** Connection-scoped deprecations/config warnings,
+  thread warnings, auth recovery, strict review, function-call output, image-view,
+  context-compaction, and public misalignment explanations are rendered instead
+  of silently discarded.
 
 ### Testing
 
-- Unit: `appServerSession.test.ts` (24 cases) covers the queue, steering, the
-  steer-race fallback, images, approvals (hold → answer → clear, stale answers,
-  cancel on stop, multi-question), and the sandbox opt-out.
-  `stream-json.appserver.test.ts` covers failed/interrupted turns and the relay
-  payload.
+- Unit: `appServerSession.test.ts` covers the queue, steering, the steer-race
+  fallback, images, subscription cleanup, command/network/file/permission
+  approvals, MCP form and URL elicitation, cancellation, and sandbox opt-out.
+  `stream-json.appserver.test.ts` covers item mapping, warnings,
+  failed/interrupted/misaligned turns, and the relay payload.
+- Contract: `pnpm check:codex-protocol` checks the installed CLI's generated
+  schema without committing version-specific generated output.
 - Live: `pnpm probe:codex <scenario>` (`apps/desktop/scripts/codex-probe.ts`)
   drives the REAL `codex app-server` through the same manager the app uses and
   asserts each outcome. `all` runs turn, queue, steer, image, approve, usage.

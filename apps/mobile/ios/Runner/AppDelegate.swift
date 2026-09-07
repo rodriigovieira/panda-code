@@ -22,6 +22,12 @@ import UserNotifications
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+
+    if let dictationRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "PandaCodeDictation") {
+      DictationPlugin.register(with: dictationRegistrar)
+    }
+
     guard let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PandaCodeApns") else {
       return
     }

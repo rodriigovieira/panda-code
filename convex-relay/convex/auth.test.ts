@@ -19,6 +19,7 @@ describe("relay authentication failures", () => {
       mobileId: relayFixture.mobileId,
       token: relayFixture.mobileToken,
       type: "stop",
+      payloadCipher: "cipher:authenticated-command-fixture",
     });
 
     const invalidDeviceToken = "invalid-device-token";
@@ -74,6 +75,7 @@ describe("relay authentication failures", () => {
             mobileId: relayFixture.mobileId,
             token: invalidMobileToken,
             type: "stop",
+      payloadCipher: "cipher:authenticated-command-fixture",
           }),
         error: "MOBILE_AUTH_FAILED",
       },

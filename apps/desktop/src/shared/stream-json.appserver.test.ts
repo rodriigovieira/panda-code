@@ -7,8 +7,9 @@ const AT = "2026-07-16T00:00:00.000Z";
 describe("applyAppServerNotification", () => {
   it("captures the thread id from thread/started", () => {
     const state = createStreamJsonState();
-    applyAppServerNotification(state, "thread/started", { thread: { id: "th_123" } }, AT);
+    applyAppServerNotification(state, "thread/started", { thread: { id: "th_123" }, model: "gpt-5.6-sol" }, AT);
     expect(state.codexThreadId).toBe("th_123");
+    expect(state.latestModel).toBe("gpt-5.6-sol");
   });
 
   it("marks the session working on turn/started and stamps turn accounting", () => {
@@ -20,6 +21,7 @@ describe("applyAppServerNotification", () => {
 
   it("streams agent message deltas then supersedes them with the completed item", () => {
     const state = createStreamJsonState();
+    state.latestModel = "gpt-5.6-sol";
     applyAppServerNotification(state, "item/agentMessage/delta", { threadId: "th_1", itemId: "it_1", delta: "Hel" }, AT);
     applyAppServerNotification(state, "item/agentMessage/delta", { threadId: "th_1", itemId: "it_1", delta: "lo" }, AT);
     const assistant = state.items.filter((item) => item.kind === "assistant");
@@ -36,6 +38,7 @@ describe("applyAppServerNotification", () => {
     expect(after).toHaveLength(1);
     expect(after[0]!.body).toBe("Hello world");
     expect(after[0]!.title).toBe("Codex");
+    expect(after[0]!.model).toBe("gpt-5.6-sol");
   });
 
   it("strips the developer instructions wrapper from the echoed user message", () => {
@@ -157,6 +160,27 @@ describe("applyAppServerNotification", () => {
     expect(state.items.some((i) => i.title === TURN_SUMMARY_TITLE)).toBe(false);
   });
 
+  it("prefers the public misalignment explanation on a blocked turn", () => {
+    const state = createStreamJsonState();
+    applyAppServerNotification(
+      state,
+      "turn/completed",
+      {
+        threadId: "th_1",
+        turn: {
+          id: "t1",
+          status: "failed",
+          error: {
+            message: "policy block",
+            misalignment: { detailedExplanation: "The requested operation conflicts with the current instructions." },
+          },
+        },
+      },
+      AT,
+    );
+    expect(state.items.find((item) => item.title === "Codex error")?.body).toContain("conflicts with the current instructions");
+  });
+
   it("goes idle on an interrupted turn", () => {
     const state = createStreamJsonState();
     applyAppServerNotification(state, "turn/started", { threadId: "th_1", turn: { id: "t1" } }, AT);
@@ -212,5 +236,39 @@ describe("applyAppServerNotification", () => {
     const state = createStreamJsonState();
     applyAppServerNotification(state, "error", { threadId: "th_1", willRetry: true, error: { message: "transient" } }, AT);
     expect(state.agentState).toBe("working");
+  });
+
+  it("surfaces connection-scoped deprecation and config notices", () => {
+    const state = createStreamJsonState();
+    applyAppServerNotification(state, "deprecationNotice", { summary: "Old setting", details: "Use the new setting." }, AT);
+    applyAppServerNotification(state, "configWarning", { summary: "Invalid value", details: "Ignored.", path: "/tmp/config.toml" }, AT);
+    expect(state.items.find((item) => item.title === "Codex deprecation")?.body).toContain("Use the new setting");
+    expect(state.items.find((item) => item.title === "Codex configuration warning")?.body).toContain("/tmp/config.toml");
+  });
+
+  it("renders standalone function-call output items", () => {
+    const state = createStreamJsonState();
+    applyAppServerNotification(
+      state,
+      "item/completed",
+      { threadId: "th_1", item: { id: "out_1", type: "functionCallOutput", name: "run_tests", namespace: null, output: "42 passed" } },
+      AT,
+    );
+    expect(state.items.find((item) => item.title === "run_tests")?.body).toContain("42 passed");
+  });
+
+  it("identifies compaction while it is active, then records its completion", () => {
+    const state = createStreamJsonState();
+    const item = { id: "compact_1", type: "contextCompaction" };
+
+    applyAppServerNotification(state, "item/started", { threadId: "th_1", item }, AT);
+    expect(state.agentState).toBe("working");
+    expect(state.currentEventType).toBe("contextCompaction:started");
+    expect(state.latestTool).toBe("Compacting context");
+
+    applyAppServerNotification(state, "item/completed", { threadId: "th_1", item }, AT);
+    expect(state.currentEventType).toBe("contextCompaction:completed");
+    expect(state.latestTool).toBeUndefined();
+    expect(state.items.find((entry) => entry.title === "Context compacted")?.body).toContain("continued");
   });
 });

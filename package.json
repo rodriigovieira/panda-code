@@ -9,10 +9,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "typecheck": "turbo run typecheck",
-    "build": "turbo run build",
-    "test": "turbo run test",
-    "lint": "turbo run lint",
+    "typecheck": "scripts/with-lock.sh turbo run typecheck",
+    "build": "scripts/with-lock.sh turbo run build",
+    "test": "scripts/with-lock.sh turbo run test",
+    "lint": "scripts/with-lock.sh turbo run lint",
+    "machine": "scripts/with-lock.sh --status",
     "mobile:testflight": "apps/mobile/scripts/testflight.sh",
     "convex:dev": "pnpm --dir convex-relay exec convex dev",
     "convex:deploy": "pnpm --dir convex-relay exec convex dev --once"

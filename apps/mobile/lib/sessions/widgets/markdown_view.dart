@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:markdown/markdown.dart' as md;
+import 'package:url_launcher/url_launcher.dart';
 
+import '../../backlog/card_mentions.dart';
 import '../../theme/panda_tokens.dart';
 import 'code_view.dart';
 import 'search_highlight.dart';
@@ -20,6 +22,8 @@ class MarkdownView extends StatelessWidget {
     this.selectable = true,
     this.highlightQuery,
     this.activeHighlight = false,
+    this.cardNumbers,
+    this.onCardTap,
   });
 
   final String data;
@@ -27,11 +31,31 @@ class MarkdownView extends StatelessWidget {
   final String? highlightQuery;
   final bool activeHighlight;
 
+  /// The workspace board's card numbers, so a bare `#12` in [data] can become
+  /// a link. Null or empty leaves every `#12` as plain text — the common case,
+  /// since most bodies never mention a card and the board is a round-trip to
+  /// the Mac nobody should pay for just to render a message.
+  final Set<int>? cardNumbers;
+
+  /// Where a tapped card link goes. Linking only happens when this and
+  /// [cardNumbers] are both set.
+  final void Function(int number)? onCardTap;
+
   @override
   Widget build(BuildContext context) {
     final base = Theme.of(context).textTheme.bodyMedium;
     final query = highlightQuery;
     final highlighting = query != null && query.isNotEmpty;
+    final cards = cardNumbers;
+    final onTap = onCardTap;
+    final linkingCards = cards != null && cards.isNotEmpty && onTap != null;
+    final customSyntaxes = <md.InlineSyntax>[
+      // A literal-text inline syntax that wraps query hits in a <mark> element,
+      // rendered by [_HighlightMarkBuilder]. Only added while searching, so the
+      // normal render path is byte-for-byte unchanged.
+      if (highlighting) _HighlightSyntax(query),
+      if (linkingCards) _CardRefSyntax(cards),
+    ];
     return MarkdownBody(
       data: data,
       selectable: selectable,
@@ -40,10 +64,60 @@ class MarkdownView extends StatelessWidget {
       // run-on paragraph; desktop renders the same text with `pre-wrap`, so
       // honour soft breaks here to keep both apps reading alike.
       softLineBreak: true,
-      // A literal-text inline syntax that wraps query hits in a <mark> element,
-      // rendered by [_HighlightMarkBuilder]. Only added while searching, so the
-      // normal render path is byte-for-byte unchanged.
-      inlineSyntaxes: highlighting ? [_HighlightSyntax(query)] : null,
+      inlineSyntaxes: customSyntaxes.isEmpty ? null : customSyntaxes,
+      // Desktop agents can now put a picture in a reply as `![caption](/abs/path)`,
+      // and the file lives on the Mac. flutter_markdown's default builder would
+      // hand that path to Image.file and paint a broken box on a phone that has
+      // no such file, so show the caption instead — the one thing that does
+      // travel over the relay. Remote images stay unrendered for the same reason
+      // desktop refuses them: agent output should not make the app fetch a URL.
+      sizedImageBuilder: (config) {
+        final alt = config.alt;
+        final title = config.title;
+        final label = (alt != null && alt.trim().isNotEmpty)
+            ? alt.trim()
+            : (title != null && title.trim().isNotEmpty)
+            ? title.trim()
+            : config.uri.pathSegments.isNotEmpty
+            ? config.uri.pathSegments.last
+            : 'image';
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.image_outlined,
+                  size: 14, color: context.tokens.muted),
+              const SizedBox(width: 4),
+              Flexible(
+                child: Text(
+                  label,
+                  style: base?.copyWith(
+                    fontSize: 12.5,
+                    color: context.tokens.muted,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+      // Always wired, regardless of card linking: a plain http(s) link (from
+      // `[text](url)` or a bare autolinked URL — flutter_markdown's default
+      // GFM extension set already turns both into an `<a>`) needs somewhere to
+      // go too, and without this handler a tap on one did nothing at all.
+      onTapLink: (text, href, title) {
+        if (href == null) return;
+        final number = cardNumberFromCardRefHref(href);
+        if (number != null) {
+          if (linkingCards) onTap(number);
+          return;
+        }
+        final uri = Uri.tryParse(href);
+        if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
+          launchUrl(uri, mode: LaunchMode.externalApplication);
+        }
+      },
       builders: {
         'code': _CodeElementBuilder(
           highlightQuery: highlighting ? query : null,
@@ -91,6 +165,32 @@ class _HighlightSyntax extends md.InlineSyntax {
   @override
   bool onMatch(md.InlineParser parser, Match match) {
     parser.addNode(md.Element.text('mark', match[0]!));
+    return true;
+  }
+}
+
+/// `#12` in prose becomes an `<a>` to that card when its number is on this
+/// workspace's board — mirrors the desktop's `CardRefLink` in `inline.tsx`.
+/// Off the board, [onMatch] still consumes the match (it must: the underlying
+/// parser reruns unconsumed syntaxes at the same position forever) but emits
+/// the matched text back unchanged, so an unrelated `#3` renders exactly as it
+/// would with no custom syntax registered at all. A code span's backticks are
+/// claimed by markdown's own `CodeSyntax` before the parser ever reaches a `#`
+/// inside them, so this never fires there.
+class _CardRefSyntax extends md.InlineSyntax {
+  _CardRefSyntax(this.cardNumbers) : super(cardRefPattern.pattern);
+
+  final Set<int> cardNumbers;
+
+  @override
+  bool onMatch(md.InlineParser parser, Match match) {
+    final number = int.parse(match[1]!);
+    if (cardNumbers.contains(number)) {
+      parser.addNode(md.Element.text('a', match[0]!)
+        ..attributes['href'] = '$cardRefLinkPrefix$number');
+    } else {
+      parser.addNode(md.Text(match[0]!));
+    }
     return true;
   }
 }

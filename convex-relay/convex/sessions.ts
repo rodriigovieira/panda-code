@@ -10,6 +10,8 @@ import {
   EVENT_RATE_LIMIT_WINDOW_MS,
   MAX_EVENTS_PER_APPEND,
   MAX_EVENT_PAYLOAD_BYTES,
+  SESSION_LIST_LIMIT,
+  SESSION_LIST_PINNED_EXTRA,
 } from "./lib/retention";
 
 function isTerminalStatus(status: "idle" | "running" | "exited" | "error"): boolean {
@@ -62,6 +64,40 @@ async function writeStar(
   });
 }
 
+/**
+ * Write the shared archive (hide-from-list) state for one session into
+ * `sessionArchive`. Same shape as `writeStar` and for the same reason: never
+ * touches the `sessions` row.
+ */
+async function writeArchive(
+  ctx: MutationCtx,
+  deviceId: string,
+  sessionId: string,
+  archived: boolean,
+): Promise<void> {
+  const now = Date.now();
+  const existing = await ctx.db
+    .query("sessionArchive")
+    .withIndex("by_device_session", (q) => q.eq("deviceId", deviceId).eq("sessionId", sessionId))
+    .unique();
+  if (!existing) {
+    await ctx.db.insert("sessionArchive", {
+      deviceId,
+      sessionId,
+      archived,
+      ...(archived ? { archivedAt: now } : {}),
+      updatedAt: now,
+    });
+    return;
+  }
+  if (existing.archived === archived) return;
+  await ctx.db.patch(existing._id, {
+    archived,
+    archivedAt: archived ? now : undefined,
+    updatedAt: now,
+  });
+}
+
 /** Per-tick runtime badge write, shared by `upsertSession` and `putRuntime`. */
 async function writeRuntime(
   ctx: MutationCtx,
@@ -97,6 +133,7 @@ export const upsertSession = mutation({
     executionMode: v.union(v.literal("terminal"), v.literal("stream-json")),
     claudeSessionId: v.optional(v.string()),
     runtimeCipher: v.optional(v.string()),
+    parentSessionId: v.optional(v.string()),
     startedByMobileId: v.optional(v.string()),
     notifyOnExit: v.optional(v.boolean()),
     starred: v.optional(v.boolean()),
@@ -118,6 +155,7 @@ export const upsertSession = mutation({
       agentState: args.agentState,
       executionMode: args.executionMode,
       claudeSessionId: args.claudeSessionId ?? existing?.claudeSessionId,
+      parentSessionId: args.parentSessionId ?? existing?.parentSessionId,
       startedByMobileId: args.startedByMobileId ?? existing?.startedByMobileId,
       notifyOnExit: args.notifyOnExit ?? existing?.notifyOnExit,
     };
@@ -190,6 +228,7 @@ export const upsertSession = mutation({
         existing.agentState !== nextSlow.agentState ||
         existing.executionMode !== nextSlow.executionMode ||
         existing.claudeSessionId !== nextSlow.claudeSessionId ||
+        existing.parentSessionId !== nextSlow.parentSessionId ||
         existing.startedByMobileId !== nextSlow.startedByMobileId ||
         existing.notifyOnExit !== nextSlow.notifyOnExit ||
         existing.notifiedExitAt !== nextNotifiedExitAt;
@@ -385,11 +424,13 @@ export const list = query({
   args: { mobileId: v.string(), token: v.string() },
   handler: async (ctx, { mobileId, token }) => {
     const mobile = await requireMobile(ctx, mobileId, token);
+    // Most recently ACTIVE first. See `SESSION_LIST_LIMIT` for why this is not
+    // the `by_device` (creation-ordered) index.
     const rows = await ctx.db
       .query("sessions")
-      .withIndex("by_device", (q) => q.eq("deviceId", mobile.deviceId))
+      .withIndex("by_device_updated", (q) => q.eq("deviceId", mobile.deviceId))
       .order("desc")
-      .take(100);
+      .take(SESSION_LIST_LIMIT);
     // Annotate each row with THIS phone's effective notification subscription:
     // its explicit override if any, else the default (subscribed to sessions it
     // started). Overrides are keyed by (deviceId, sessionId); fetch this phone's
@@ -406,6 +447,35 @@ export const list = query({
       .withIndex("by_device", (q) => q.eq("deviceId", mobile.deviceId))
       .collect();
     const stars = new Map(starRows.map((s) => [s.sessionId, s]));
+    // Archive state lives in its own table too, same reason as stars. Unlike a
+    // star, an archived flag never forces a row back into the window — hiding
+    // a thread the activity window already dropped is a no-op — so this is a
+    // plain join, no `pinnedMisses`-style backfill.
+    const archiveRows = await ctx.db
+      .query("sessionArchive")
+      .withIndex("by_device", (q) => q.eq("deviceId", mobile.deviceId))
+      .collect();
+    const archives = new Map(archiveRows.map((a) => [a.sessionId, a]));
+    // A PINNED thread must never fall out of the window. Pinning is the user
+    // saying "keep this one reachable", and the whole point of a pin is that it
+    // survives going quiet — so the ones the activity window missed are fetched
+    // by key and appended. Bounded by `SESSION_LIST_PINNED_EXTRA`: stars are a
+    // handful per device, and each miss is one indexed point read.
+    const inWindow = new Set(rows.map((r) => r.sessionId));
+    const pinnedMisses = starRows
+      .filter((s) => s.starred && !inWindow.has(s.sessionId))
+      .slice(0, SESSION_LIST_PINNED_EXTRA);
+    for (const miss of pinnedMisses) {
+      const row = await ctx.db
+        .query("sessions")
+        .withIndex("by_device_session", (q) =>
+          q.eq("deviceId", mobile.deviceId).eq("sessionId", miss.sessionId),
+        )
+        .unique();
+      // A star with no session row is normal: the desktop can pin a thread it has
+      // never streamed (`setStarredByDevice`). Nothing to show until it does.
+      if (row) rows.push(row);
+    }
     // Project to the low-churn routing/status shape ONLY. Deliberately excludes
     // `runtimeCipher` and `headSeq` (now in `sessionRuntime`): the mobile list
     // renders coarse status from `agentState`, and the open session view pulls
@@ -421,6 +491,7 @@ export const list = query({
       status: row.status,
       agentState: row.agentState,
       executionMode: row.executionMode,
+      parentSessionId: row.parentSessionId,
       updatedAt: row.updatedAt,
       lastPromptAt: row.lastPromptAt,
       startedByMobileId: row.startedByMobileId,
@@ -428,6 +499,8 @@ export const list = query({
       // `sessionStars` when present, else the pre-split field still on the row.
       starred: stars.get(row.sessionId)?.starred ?? row.starred ?? false,
       starredAt: stars.get(row.sessionId)?.starredAt ?? row.starredAt,
+      archived: archives.get(row.sessionId)?.archived ?? false,
+      archivedAt: archives.get(row.sessionId)?.archivedAt,
       // Back-compat stub for already-installed mobile builds that parse
       // `(row['headSeq'] as num)` off the list shape and would crash on null.
       // New builds ignore this and read the head from `sessions:runtime`.
@@ -475,6 +548,45 @@ export const setStarredByDevice = mutation({
   },
 });
 
+export const setArchivedByMobile = mutation({
+  args: {
+    mobileId: v.string(),
+    token: v.string(),
+    sessionId: v.string(),
+    archived: v.boolean(),
+  },
+  handler: async (ctx, { mobileId, token, sessionId, archived }) => {
+    const mobile = await requireMobile(ctx, mobileId, token);
+    // The session must exist (a phone can only archive what it can see), but the
+    // archive flag itself is written to `sessionArchive`, leaving the session
+    // document untouched.
+    const session = await ctx.db
+      .query("sessions")
+      .withIndex("by_device_session", (q) => q.eq("deviceId", mobile.deviceId).eq("sessionId", sessionId))
+      .unique();
+    if (!session) throw new Error("SESSION_NOT_FOUND");
+    await writeArchive(ctx, mobile.deviceId, sessionId, archived);
+    return null;
+  },
+});
+
+export const setArchivedByDevice = mutation({
+  args: {
+    deviceId: v.string(),
+    token: v.string(),
+    sessionId: v.string(),
+    archived: v.boolean(),
+  },
+  handler: async (ctx, { deviceId, token, sessionId, archived }) => {
+    await requireDevice(ctx, deviceId, token);
+    // Unlike the mobile path this does NOT require a routing row: the desktop can
+    // archive a thread it has never streamed to the relay, and the archive row is
+    // what carries that intent when the session shows up.
+    await writeArchive(ctx, deviceId, sessionId, archived);
+    return null;
+  },
+});
+
 /**
  * Desktop renames a section. Title only, and deliberately NOT an upsert:
  *
@@ -505,6 +617,36 @@ export const setTitleByDevice = mutation({
 });
 
 /**
+ * Desktop moves a section in the sub-thread tree. Same shape as
+ * `setTitleByDevice` — a patch, never an upsert — and for the same reason: the
+ * tree is re-arranged from the sidebar for sections that may have been dormant
+ * for weeks, and creating a routing row here would surface each of them on the
+ * phone as though it had just started.
+ *
+ * An absent `parentSessionId` means DETACHED, so this cannot be folded into
+ * `upsertSession`, whose fields are sticky by design (an omitted arg keeps the
+ * stored value, which is what makes a partial upsert safe).
+ */
+export const setParentByDevice = mutation({
+  args: {
+    deviceId: v.string(),
+    token: v.string(),
+    sessionId: v.string(),
+    parentSessionId: v.optional(v.string()),
+  },
+  handler: async (ctx, { deviceId, token, sessionId, parentSessionId }) => {
+    await requireDevice(ctx, deviceId, token);
+    const session = await ctx.db
+      .query("sessions")
+      .withIndex("by_device_session", (q) => q.eq("deviceId", deviceId).eq("sessionId", sessionId))
+      .unique();
+    if (!session || session.parentSessionId === parentSessionId) return null;
+    await ctx.db.patch(session._id, { parentSessionId, updatedAt: Date.now() });
+    return null;
+  },
+});
+
+/**
  * Desktop: the phone's pin/unpin actions, mirrored back so the two lists agree.
  *
  * The desktop holds this open for its whole run, so its READ SET is the thing
@@ -513,19 +655,51 @@ export const setTitleByDevice = mutation({
  * `sessions` range instead, which made every status transition, rename and
  * prompt on the device re-read ~100 full session documents to answer a question
  * about stars: on its own, the largest single consumer of relay bandwidth.
+ *
+ * `since` is a bandwidth cursor, not a filter the caller may skip: the desktop
+ * holds this subscription open for its whole run, and reading the entire
+ * `by_device` range meant every re-execution re-shipped all ~200 rows to report
+ * one flipped boolean. The desktop takes the full set once with `since: 0` and
+ * then subscribes with `since: <now>`, whose read set is the empty tail of the
+ * `by_device_updated` index until a star actually moves.
  */
 export const starredForDevice = query({
-  args: { deviceId: v.string(), token: v.string() },
-  handler: async (ctx, { deviceId, token }) => {
+  args: { deviceId: v.string(), token: v.string(), since: v.optional(v.number()) },
+  handler: async (ctx, { deviceId, token, since }) => {
     await requireDevice(ctx, deviceId, token);
     const rows = await ctx.db
       .query("sessionStars")
-      .withIndex("by_device", (q) => q.eq("deviceId", deviceId))
+      .withIndex("by_device_updated", (q) =>
+        q.eq("deviceId", deviceId).gt("updatedAt", since ?? 0),
+      )
       .take(200);
     return rows.map((row) => ({
       sessionId: row.sessionId,
       starred: row.starred,
       starredAt: row.starredAt,
+      updatedAt: row.updatedAt,
+    }));
+  },
+});
+
+/**
+ * Desktop: the phone's archive/unarchive actions, mirrored back so the two
+ * lists agree. Same shape as `starredForDevice` and for the same reason.
+ */
+export const archivedForDevice = query({
+  args: { deviceId: v.string(), token: v.string(), since: v.optional(v.number()) },
+  handler: async (ctx, { deviceId, token, since }) => {
+    await requireDevice(ctx, deviceId, token);
+    const rows = await ctx.db
+      .query("sessionArchive")
+      .withIndex("by_device_updated", (q) =>
+        q.eq("deviceId", deviceId).gt("updatedAt", since ?? 0),
+      )
+      .take(200);
+    return rows.map((row) => ({
+      sessionId: row.sessionId,
+      archived: row.archived,
+      archivedAt: row.archivedAt,
       updatedAt: row.updatedAt,
     }));
   },

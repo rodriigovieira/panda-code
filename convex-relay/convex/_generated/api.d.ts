@@ -11,14 +11,18 @@
 import type * as commands from "../commands.js";
 import type * as crons from "../crons.js";
 import type * as devices from "../devices.js";
+import type * as http from "../http.js";
 import type * as lib_auth from "../lib/auth.js";
 import type * as lib_commandPayloads from "../lib/commandPayloads.js";
+import type * as lib_commandResults from "../lib/commandResults.js";
 import type * as lib_retention from "../lib/retention.js";
 import type * as lib_stranded from "../lib/stranded.js";
 import type * as maintenance from "../maintenance.js";
+import type * as media from "../media.js";
 import type * as notifications from "../notifications.js";
 import type * as pairing from "../pairing.js";
 import type * as sessions from "../sessions.js";
+import type * as traces from "../traces.js";
 
 import type {
   ApiFromModules,
@@ -30,14 +34,18 @@ declare const fullApi: ApiFromModules<{
   commands: typeof commands;
   crons: typeof crons;
   devices: typeof devices;
+  http: typeof http;
   "lib/auth": typeof lib_auth;
   "lib/commandPayloads": typeof lib_commandPayloads;
+  "lib/commandResults": typeof lib_commandResults;
   "lib/retention": typeof lib_retention;
   "lib/stranded": typeof lib_stranded;
   maintenance: typeof maintenance;
+  media: typeof media;
   notifications: typeof notifications;
   pairing: typeof pairing;
   sessions: typeof sessions;
+  traces: typeof traces;
 }>;
 
 /**

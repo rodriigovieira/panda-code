@@ -50,7 +50,36 @@ export const MAX_EVENT_PAYLOAD_BYTES = 1024 * 1024;
 export const WRITE_BUDGET_RETENTION_MS = 24 * 60 * 60_000;
 export const WRITE_BUDGET_PRUNE_BATCH = 200;
 
+/**
+ * How many sessions `sessions:list` ships to a phone, and how many extra pinned
+ * rows may be pulled in from outside that window.
+ *
+ * The window is taken over `by_device_updated` — most recently ACTIVE first, not
+ * most recently created. Ordering by row creation (the `by_device` index, which
+ * sorts by `_creationTime`) meant a thread's position was fixed the first time it
+ * ever streamed: `sessions` rows are never pruned, so on a device with ~400 of
+ * them a thread used yesterday sat at position 223 and simply never reached the
+ * phone. Activity order is what the user actually means by "recent".
+ *
+ * The limit is a bandwidth knob: this query re-fires whenever a row in its read
+ * set changes, re-shipping every row it returns. The row shape is deliberately
+ * lean (no runtime blob, no headSeq — see `sessions:list`), so ~150 costs little,
+ * but it should not grow without a reason.
+ */
+export const SESSION_LIST_LIMIT = 150;
+export const SESSION_LIST_PINNED_EXTRA = 50;
+
 export const PAIRING_PRUNE_BATCH = 200;
 export const DEVICE_PRUNE_BATCH = 200;
 export const EVENT_PRUNE_BATCH = 500;
 export const COMMAND_PRUNE_BATCH = 250;
+
+/**
+ * A screenshot or recording is a one-time "look at this" — the desktop still
+ * has the file, and the phone caches whatever it actually opened (see
+ * `media_store.dart`). There is no reason for the ciphertext to sit in
+ * Convex file storage once nobody is mid-request for it, so it gets a much
+ * shorter leash than commands/events do.
+ */
+export const MEDIA_BLOB_RETENTION_MS = 60 * 60_000;
+export const MEDIA_BLOB_PRUNE_BATCH = 100;

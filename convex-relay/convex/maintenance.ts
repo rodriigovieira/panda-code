@@ -7,6 +7,8 @@ import {
   DEVICE_PRUNE_BATCH,
   EVENT_PRUNE_BATCH,
   EVENT_RETENTION_MS,
+  MEDIA_BLOB_PRUNE_BATCH,
+  MEDIA_BLOB_RETENTION_MS,
   OFFLINE_AFTER_MS,
   PAIRING_PRUNE_BATCH,
   PENDING_COMMAND_TTL_MS,
@@ -15,6 +17,7 @@ import {
 } from "./lib/retention";
 import { demoteStrandedSessions } from "./lib/stranded";
 import { deletePayload } from "./lib/commandPayloads";
+import { deleteResult } from "./lib/commandResults";
 
 /**
  * One-off admin remediation for a session wedged in a re-emit loop (mobile
@@ -263,8 +266,17 @@ export const migrateDeviceUsage = internalMutation({
   },
 });
 
-/** Bounded cleanup work invoked by the relay pruning cron. */
-export const prune = internalMutation({
+/**
+ * LIVENESS half of the cron, run every minute.
+ *
+ * This is the part with a deadline attached: it notices a desktop that died
+ * mid-turn and demotes its stranded sessions, and a phone left staring at a
+ * spinner reads as a hang. It touches only the two small heartbeat/pairing
+ * ranges — the bulk retention sweeps are in {@link pruneSweep}, which has no
+ * such deadline and was paying for fourteen thousand runs per ten days to
+ * delete rows that are a week and a month old.
+ */
+export const pruneLive = internalMutation({
   args: {},
   handler: async (ctx) => {
     const now = Date.now();
@@ -293,6 +305,28 @@ export const prune = internalMutation({
       await ctx.db.patch(device._id, { status: "offline" });
       demotedSessions += await demoteStrandedSessions(ctx, device.deviceId);
     }
+
+    return {
+      expiredPairings: expiredPairings.length,
+      offlineDevices: staleDevices.length,
+      demotedSessions,
+    };
+  },
+});
+
+/**
+ * RETENTION half of the cron, run every fifteen minutes.
+ *
+ * Everything here deletes rows that are already hours to weeks past their
+ * retention, so the cadence only has to be fast enough to keep up with the
+ * inflow — the batch caps, not the interval, are what bound a backlog. Running
+ * it once a minute alongside the liveness sweep cost fifteen times the reads for
+ * no earlier deletion.
+ */
+export const pruneSweep = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const now = Date.now();
 
     const oldEvents = await ctx.db
       .query("events")
@@ -325,6 +359,9 @@ export const prune = internalMutation({
       // catches the rest (never-claimed requests, revoked phones' leftovers) so a
       // stale screenshot can't outlive its command row.
       await deletePayload(ctx, command._id);
+      // Same for a result the phone never consumed (it was killed mid-request):
+      // a board or process list must not outlive the command row it answers.
+      await deleteResult(ctx, command._id);
       await ctx.db.delete(command._id);
     }
 
@@ -365,14 +402,47 @@ export const prune = internalMutation({
       deletedBudgets += 1;
     }
 
+    // A blob's ciphertext is dead weight the moment its retention window
+    // passes — the desktop still has the source file, and a phone that never
+    // opened it was never going to. `ctx.storage.delete` frees the underlying
+    // file; the row is what let `media:url` check ownership, so both go
+    // together.
+    const oldBlobs = await ctx.db
+      .query("mediaBlobs")
+      .withIndex("by_created", (query) => query.lt("createdAt", now - MEDIA_BLOB_RETENTION_MS))
+      .take(MEDIA_BLOB_PRUNE_BATCH);
+    for (const blob of oldBlobs) {
+      await ctx.storage.delete(blob.storageId);
+      await ctx.db.delete(blob._id);
+    }
+
     return {
-      expiredPairings: expiredPairings.length,
-      offlineDevices: staleDevices.length,
-      demotedSessions,
       deletedEvents: oldEvents.length,
       deletedCommands: oldDoneCommands.length + oldErrorCommands.length,
       expiredCommands: stalePendingCommands.length + staleClaimedCommands.length,
       deletedBudgets,
+      deletedBlobs: oldBlobs.length,
     };
+  },
+});
+
+/** Legacy diagnostic data is no longer uploaded. Remove it and sweep storage
+ * orphans (including uploads issued by old app versions) in bounded pages. */
+export const pruneSecurityArtifacts = internalMutation({
+  args: { cursor: v.optional(v.string()) },
+  handler: async (ctx, { cursor }): Promise<{ deleted: number }> => {
+    let deleted = 0;
+    for (const table of ["dictationTraces", "perfTraces"] as const) {
+      const rows = await ctx.db.query(table).take(100);
+      for (const row of rows) { await ctx.db.delete(row._id); deleted++; }
+    }
+    const page = await ctx.db.system.query("_storage").paginate({ cursor: cursor ?? null, numItems: 50 });
+    for (const file of page.page) {
+      if (file._creationTime > Date.now() - 60 * 60_000) continue;
+      const owned = await ctx.db.query("mediaBlobs").withIndex("by_storage", q => q.eq("storageId", file._id)).first();
+      if (!owned) { await ctx.storage.delete(file._id); deleted++; }
+    }
+    if (!page.isDone) await ctx.scheduler.runAfter(0, internal.maintenance.pruneSecurityArtifacts, { cursor: page.continueCursor });
+    return { deleted };
   },
 });

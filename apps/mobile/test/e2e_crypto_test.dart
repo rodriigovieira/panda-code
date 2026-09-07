@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -10,6 +11,13 @@ import 'package:panda_code_mobile/crypto/e2e.dart';
 /// each side must open the other's. Prompt 4 wires that CI check; here we lock
 /// the shape and prove round-tripping.
 void main() {
+  test('command envelope matches desktop KDF and ciphertext vector', () {
+    final vector = (jsonDecode(File('../../docs/crypto-vectors.json').readAsStringSync()) as Map)['commandVector'] as Map;
+    final codec = E2ECodec.fromBase64Key(vector['keyBase64'] as String);
+    expect(codec.sealCommand(vector['plaintext'], nonce: base64Decode(vector['nonceBase64'] as String)), vector['envelopeBase64']);
+    expect(() => codec.open(vector['envelopeBase64'] as String), throwsA(anything));
+  });
+
   final key = Uint8List.fromList(List<int>.generate(32, (i) => i + 1));
   final nonce = Uint8List.fromList(List<int>.generate(24, (i) => 100 + i));
 

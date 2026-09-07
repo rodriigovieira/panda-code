@@ -1,6 +1,6 @@
 export type BodyBlock =
   | { type: "paragraph"; text: string }
-  | { type: "heading"; text: string }
+  | { type: "heading"; level: 1 | 2 | 3 | 4 | 5 | 6; text: string }
   | { type: "list"; ordered: boolean; items: Array<{ text: string; checked?: boolean }> }
   | { type: "quote"; text: string }
   | { type: "rule" }
@@ -161,12 +161,15 @@ export function parseBodyBlocks(value: string): BodyBlock[] {
       continue;
     }
 
-    const heading = trimmed.match(/^#{1,3}\s+(.+)$/);
+    // All six levels, and the level is kept: collapsing them all onto one size
+    // loses the document's outline, which is the whole job of a heading.
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
       flushParagraph();
       flushList();
       flushQuote();
-      blocks.push({ type: "heading", text: heading[1] ?? "" });
+      const level = (heading[1] ?? "#").length as 1 | 2 | 3 | 4 | 5 | 6;
+      blocks.push({ type: "heading", level, text: heading[2] ?? "" });
       continue;
     }
 

@@ -98,7 +98,7 @@ export function findModelRate(model: string | undefined): PricedModel | null {
     return null;
   }
   for (const entry of MODEL_RATES) {
-    if (entry.match.some((needle) => normalized.includes(needle))) {
+    if (entry.match.some((needle) => normalized === needle || normalized.startsWith(`${needle}-`))) {
       return entry;
     }
   }

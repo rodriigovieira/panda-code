@@ -154,7 +154,7 @@ class _SectionLabel extends StatelessWidget {
   }
 }
 
-class _PromptTile extends StatelessWidget {
+class _PromptTile extends StatefulWidget {
   const _PromptTile({
     required this.entry,
     required this.badge,
@@ -164,6 +164,14 @@ class _PromptTile extends StatelessWidget {
   final PromptEntry entry;
   final String badge;
   final bool highlight;
+
+  @override
+  State<_PromptTile> createState() => _PromptTileState();
+}
+
+class _PromptTileState extends State<_PromptTile> {
+  static const _collapsedCharacterLimit = 500;
+  bool _expanded = false;
 
   String _time(int ms) {
     final d = DateTime.fromMillisecondsSinceEpoch(ms).toLocal();
@@ -175,11 +183,17 @@ class _PromptTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final entry = widget.entry;
     final accent = entry.queued
         ? context.tokens.accent.text
-        : highlight
+        : widget.highlight
             ? theme.colorScheme.primary
             : context.tokens.muted;
+    final fullText = entry.display;
+    final collapsible = fullText.length > _collapsedCharacterLimit;
+    final visibleText = collapsible && !_expanded
+        ? fullText.substring(0, _collapsedCharacterLimit)
+        : fullText;
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
@@ -205,7 +219,7 @@ class _PromptTile extends StatelessWidget {
                   borderRadius: BorderRadius.circular(999),
                 ),
                 child: Text(
-                  badge,
+                  widget.badge,
                   style: TextStyle(
                     fontSize: 10.5,
                     fontWeight: FontWeight.w700,
@@ -252,9 +266,25 @@ class _PromptTile extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           SelectableText(
-            entry.display,
+            visibleText,
             style: const TextStyle(fontSize: 14, height: 1.4),
           ),
+          if (collapsible) ...[
+            const SizedBox(height: 4),
+            TextButton.icon(
+              onPressed: () => setState(() => _expanded = !_expanded),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                minimumSize: const Size(0, 32),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              icon: Icon(
+                _expanded ? Icons.expand_less : Icons.expand_more,
+                size: 16,
+              ),
+              label: Text(_expanded ? 'View less' : 'View more'),
+            ),
+          ],
         ],
       ),
     );

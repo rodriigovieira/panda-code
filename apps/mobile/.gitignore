@@ -50,3 +50,8 @@ app.*.map.json
 # Real signing identity (team + bundle id) for the iOS target; the repo only
 # carries placeholders in ios/Flutter/{Debug,Release}.xcconfig.
 ios/Flutter/Signing.xcconfig
+
+# Dictation vocabulary is mined from local Claude Code transcripts and is
+# personal to each machine. Regenerate with:
+#   python3 scripts/mine_dictation_vocabulary.py
+assets/dictation_vocabulary.json

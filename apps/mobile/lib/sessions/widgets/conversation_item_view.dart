@@ -22,9 +22,21 @@ class ConversationItemView extends StatelessWidget {
     this.highlightQuery,
     this.activeMatch = false,
     this.onRetrySend,
+    this.cardNumbers,
+    this.onCardTap,
+    this.onOpenMedia,
   });
 
   final ConversationItem item;
+
+  /// Forwarded to [ToolCallView] — fetch and show a `browser_screenshot`/
+  /// `browser_record` capture. Null (the default) hides the affordance.
+  final void Function(String path, bool isVideo)? onOpenMedia;
+
+  /// The workspace board's card numbers, so a `#12` in [item]'s body can
+  /// become a tappable link to that card. See [MarkdownView.cardNumbers].
+  final Set<int>? cardNumbers;
+  final void Function(int number)? onCardTap;
 
   /// Retry delivery of an optimistic user message that failed to send. Passed
   /// down to failed [_UserMessage] bubbles as a tap-to-retry action.
@@ -57,6 +69,7 @@ class ConversationItemView extends StatelessWidget {
         expandSignal: toolExpand,
         highlightQuery: highlightQuery,
         activeHighlight: activeMatch,
+        onOpenMedia: onOpenMedia,
       );
     }
     if (item.thinking) {
@@ -71,23 +84,27 @@ class ConversationItemView extends StatelessWidget {
       'user' => _UserMessage(
           body: item.body,
           images: item.images,
-          createdAt: item.createdAt,
+          createdAt: item.displayTimestamp,
           queued: item.queued,
           sendState: item.sendState,
           onRetry: item.sendState == SendState.failed && onRetrySend != null
               ? () => onRetrySend!(item.id)
               : null,
           highlightQuery: highlightQuery,
-          activeMatch: activeMatch),
+          activeMatch: activeMatch,
+          cardNumbers: cardNumbers,
+          onCardTap: onCardTap),
       'system' || 'marker' => _SystemMarker(
           text: item.title ?? item.body,
           highlightQuery: highlightQuery,
           activeMatch: activeMatch),
       _ => _AssistantMessage(
           body: item.body,
-          createdAt: item.createdAt,
+          createdAt: item.displayTimestamp,
           highlightQuery: highlightQuery,
-          activeMatch: activeMatch),
+          activeMatch: activeMatch,
+          cardNumbers: cardNumbers,
+          onCardTap: onCardTap),
     };
   }
 }
@@ -127,16 +144,23 @@ Future<void> _showMessageActions(
   );
 }
 
+/// Bare "HH:MM" clock, used both inline under a bubble and inside
+/// [_formatTimestamp]'s longer "Sent at ..." form.
+String _formatClock(int ms) {
+  final d = DateTime.fromMillisecondsSinceEpoch(ms);
+  final hh = d.hour.toString().padLeft(2, '0');
+  final mm = d.minute.toString().padLeft(2, '0');
+  return '$hh:$mm';
+}
+
 String _formatTimestamp(int ms) {
   final d = DateTime.fromMillisecondsSinceEpoch(ms);
   final now = DateTime.now();
-  final hh = d.hour.toString().padLeft(2, '0');
-  final mm = d.minute.toString().padLeft(2, '0');
   final sameDay =
       d.year == now.year && d.month == now.month && d.day == now.day;
-  if (sameDay) return 'Sent at $hh:$mm';
+  if (sameDay) return 'Sent at ${_formatClock(ms)}';
   return 'Sent ${d.year}-${d.month.toString().padLeft(2, '0')}-'
-      '${d.day.toString().padLeft(2, '0')} $hh:$mm';
+      '${d.day.toString().padLeft(2, '0')} ${_formatClock(ms)}';
 }
 
 class _UserMessage extends StatelessWidget {
@@ -149,6 +173,8 @@ class _UserMessage extends StatelessWidget {
     this.onRetry,
     this.highlightQuery,
     this.activeMatch = false,
+    this.cardNumbers,
+    this.onCardTap,
   });
 
   final String body;
@@ -161,6 +187,8 @@ class _UserMessage extends StatelessWidget {
   final VoidCallback? onRetry;
   final String? highlightQuery;
   final bool activeMatch;
+  final Set<int>? cardNumbers;
+  final void Function(int number)? onCardTap;
 
   @override
   Widget build(BuildContext context) {
@@ -177,73 +205,89 @@ class _UserMessage extends StatelessWidget {
     }
     final bubble = Align(
       alignment: Alignment.centerRight,
-      child: GestureDetector(
-        onLongPress: () => _showMessageActions(context, body, createdAt),
-        onTap: failed ? onRetry : null,
-        child: Container(
-          margin: const EdgeInsets.symmetric(vertical: 4),
-          constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.82),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: context.tokens.info.solid,
-            borderRadius: const BorderRadius.only(
-              topLeft: Radius.circular(14),
-              topRight: Radius.circular(14),
-              bottomLeft: Radius.circular(14),
-              bottomRight: Radius.circular(4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          GestureDetector(
+            onLongPress: () => _showMessageActions(context, body, createdAt),
+            onTap: failed ? onRetry : null,
+            child: Container(
+              margin: const EdgeInsets.symmetric(vertical: 4),
+              constraints: BoxConstraints(
+                  maxWidth: MediaQuery.of(context).size.width * 0.82),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: context.tokens.info.solid,
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(14),
+                  topRight: Radius.circular(14),
+                  bottomLeft: Radius.circular(14),
+                  bottomRight: Radius.circular(4),
+                ),
+                border: failed
+                    ? Border.all(
+                        color: Theme.of(context).colorScheme.error, width: 1)
+                    : null,
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (body.trim().isNotEmpty)
+                    MarkdownView(
+                      data: body,
+                      selectable: false,
+                      highlightQuery: highlightQuery,
+                      activeHighlight: activeMatch,
+                      cardNumbers: cardNumbers,
+                      onCardTap: onCardTap,
+                    ),
+                  if (images.isNotEmpty) ...[
+                    if (body.trim().isNotEmpty) SizedBox(height: 8),
+                    ImageAttachmentStrip(images: images),
+                  ],
+                  if (queued) ...[
+                    SizedBox(height: 6),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.schedule,
+                            size: 11, color: context.tokens.subtle),
+                        SizedBox(width: 4),
+                        Text('Queued',
+                            style: TextStyle(
+                                color: context.tokens.subtle, fontSize: 11)),
+                      ],
+                    ),
+                  ],
+                  if (failed) ...[
+                    const SizedBox(height: 6),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.error_outline,
+                            size: 12,
+                            color: Theme.of(context).colorScheme.error),
+                        const SizedBox(width: 4),
+                        Text('Not sent — tap to retry',
+                            style: TextStyle(
+                                color: Theme.of(context).colorScheme.error,
+                                fontSize: 11)),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
             ),
-            border: failed
-                ? Border.all(
-                    color: Theme.of(context).colorScheme.error, width: 1)
-                : null,
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              if (body.trim().isNotEmpty)
-                MarkdownView(
-                  data: body,
-                  selectable: false,
-                  highlightQuery: highlightQuery,
-                  activeHighlight: activeMatch,
-                ),
-              if (images.isNotEmpty) ...[
-                if (body.trim().isNotEmpty) SizedBox(height: 8),
-                ImageAttachmentStrip(images: images),
-              ],
-              if (queued) ...[
-                SizedBox(height: 6),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.schedule,
-                        size: 11, color: context.tokens.subtle),
-                    SizedBox(width: 4),
-                    Text('Queued',
-                        style: TextStyle(
-                            color: context.tokens.subtle, fontSize: 11)),
-                  ],
-                ),
-              ],
-              if (failed) ...[
-                const SizedBox(height: 6),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.error_outline,
-                        size: 12, color: Theme.of(context).colorScheme.error),
-                    const SizedBox(width: 4),
-                    Text('Not sent — tap to retry',
-                        style: TextStyle(
-                            color: Theme.of(context).colorScheme.error,
-                            fontSize: 11)),
-                  ],
-                ),
-              ],
-            ],
-          ),
-        ),
+          if (createdAt != null && createdAt! > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 6, bottom: 2),
+              child: Text(
+                _formatClock(createdAt!),
+                style: TextStyle(color: context.tokens.subtle, fontSize: 10.5),
+              ),
+            ),
+        ],
       ),
     );
     if (!sending) return bubble;
@@ -276,36 +320,57 @@ class _AssistantMessage extends StatelessWidget {
     this.createdAt,
     this.highlightQuery,
     this.activeMatch = false,
+    this.cardNumbers,
+    this.onCardTap,
   });
 
   final String body;
   final int? createdAt;
   final String? highlightQuery;
   final bool activeMatch;
+  final Set<int>? cardNumbers;
+  final void Function(int number)? onCardTap;
 
   @override
   Widget build(BuildContext context) {
     if (body.trim().isEmpty) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Padding(
-            padding: EdgeInsets.only(top: 1, right: 10),
-            child: PandaLogo(size: 24),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(top: 1, right: 10),
+                child: PandaLogo(size: 24),
+              ),
+              Expanded(
+                child: GestureDetector(
+                  onLongPress: () =>
+                      _showMessageActions(context, body, createdAt),
+                  child: MarkdownView(
+                    data: body,
+                    selectable: false,
+                    highlightQuery: highlightQuery,
+                    activeHighlight: activeMatch,
+                    cardNumbers: cardNumbers,
+                    onCardTap: onCardTap,
+                  ),
+                ),
+              ),
+            ],
           ),
-          Expanded(
-            child: GestureDetector(
-              onLongPress: () => _showMessageActions(context, body, createdAt),
-              child: MarkdownView(
-                data: body,
-                selectable: false,
-                highlightQuery: highlightQuery,
-                activeHighlight: activeMatch,
+          if (createdAt != null && createdAt! > 0)
+            Padding(
+              // Align under the message text (24px logo + 10px gap).
+              padding: const EdgeInsets.only(left: 34, top: 2),
+              child: Text(
+                _formatClock(createdAt!),
+                style: TextStyle(color: context.tokens.subtle, fontSize: 10.5),
               ),
             ),
-          ),
         ],
       ),
     );

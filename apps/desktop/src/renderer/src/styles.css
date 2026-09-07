@@ -212,6 +212,7 @@ button:disabled,
 .sidebar-new-button,
 .group-new-button,
 .group-git-button,
+.group-archive-button,
 .workspace-toggle {
   display: inline-flex;
   align-items: center;
@@ -222,6 +223,14 @@ button:disabled,
   color: var(--text);
   cursor: pointer;
   user-select: none;
+  /* Control text is a property of the control, not of whoever happens to contain
+     it. Without this every button inherited its parent's size — 12.5px inside the
+     sidebar, the 16px browser default inside any panel that set none — so the same
+     button rendered at different sizes across the app. A fixed-height control also
+     never wraps its label. */
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
   transition:
     background var(--motion-enter) var(--motion-ease),
     border-color var(--motion-enter) var(--motion-ease),
@@ -343,17 +352,30 @@ button:disabled,
   color: var(--text);
 }
 
+/* Collapsed to zero width at rest, not just invisible — same reclaim trick as
+   .workspace-chevron just below. An opacity-only hide still reserves its
+   track in the header's grid-auto-flow:column layout, which is exactly what
+   was shrinking the project label down to a sliver whenever a workspace had
+   a git button and/or an archived-sessions toggle to show. */
 .group-new-button,
-.group-git-button {
-  width: 26px;
-  min-width: 26px;
+.group-git-button,
+.group-archive-button {
+  width: 0;
+  min-width: 0;
   height: 26px;
   border-radius: var(--r-sm);
   color: var(--muted);
   opacity: 0;
+  overflow: hidden;
+  transition:
+    width var(--motion-enter) var(--motion-ease),
+    opacity var(--motion-enter) var(--motion-ease),
+    background var(--motion-enter) var(--motion-ease),
+    color var(--motion-enter) var(--motion-ease);
 }
 
-.group-git-button {
+.group-git-button,
+.group-archive-button {
   background: transparent;
   border: var(--bw) solid transparent;
 }
@@ -361,13 +383,28 @@ button:disabled,
 .workspace-group:hover .group-new-button,
 .group-new-button:focus-visible,
 .workspace-group:hover .group-git-button,
-.group-git-button:focus-visible {
+.group-git-button:focus-visible,
+.workspace-group:hover .group-archive-button,
+.group-archive-button:focus-visible,
+.group-archive-button.active {
+  width: 26px;
+  min-width: 26px;
   opacity: 1;
 }
 
-.group-git-button:hover {
+.group-git-button:hover,
+.group-archive-button:not(.active):hover {
   background: var(--hover-wash);
   color: var(--text);
+}
+
+/* Stays lit (and stays expanded) even off-hover once toggled, so "archived
+   sections are showing" remains visible after the cursor moves away — same
+   contract as .icon-button.active elsewhere. */
+.group-archive-button.active {
+  border-color: var(--accent-edge);
+  background: var(--accent-wash);
+  color: var(--accent-text-hi);
 }
 
 /* Filled buttons own a colour, so hover lifts it. Neutral and ghost controls
@@ -442,7 +479,15 @@ button:disabled,
 
 .workspace-group-header {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  /* Only the drag handle and the flexible label are explicit columns. Every
+     button after them (git, show/hide-archived, archive-all, new — however
+     many of them are actually rendered) auto-places into its own implicit
+     column via grid-auto-flow, so a button added later can't silently wrap
+     onto its own row again the way it did when this counted explicit
+     columns by hand. */
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: auto;
   align-items: center;
   gap: 4px;
   border-radius: var(--r-md);
@@ -586,8 +631,8 @@ button:disabled,
   display: flex;
   align-items: center;
   gap: 6px;
-  width: calc(100% - 24px);
-  margin: 2px 0 4px 24px;
+  width: calc(100% - 20px);
+  margin: 2px 0 4px 20px;
   border: 1px dashed var(--line);
   border-radius: var(--r-md);
   padding: 7px 9px;
@@ -646,9 +691,10 @@ button:disabled,
   display: grid;
   position: relative;
   gap: 1px;
-  /* Shallower indent so section titles get more room to read. */
-  margin-left: 12px;
-  padding: 2px 0 2px 6px;
+  /* No indent of its own: every row opens with the same 16px gutter the
+     workspace header spends on its drag handle, so the row's chevron sits in
+     that column and the row's box lands on the workspace toggle. */
+  padding: 2px 0;
 }
 
 .thread-list::before {
@@ -730,14 +776,26 @@ button:disabled,
   color: var(--accent-text);
 }
 
-/* Something typed but not sent. Deliberately quiet — it marks a draft worth
-   returning to, it is not a notification. */
-.draft-dot {
-  width: 6px;
-  height: 6px;
+/* Something typed but not sent. Green and pencilled: it marks a draft worth
+   returning to, it is not a notification. Sized and built like
+   `.thread-terminal-count` so the marks on a title line read as one set, and
+   `flex: none` so it holds its width against a title that wants all of it. */
+.draft-mark {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--run-edge);
   border-radius: var(--r-pill);
-  background: var(--accent-text);
-  opacity: 0.75;
+  color: var(--run-text);
+  background: var(--run-wash);
+}
+
+.draft-mark svg {
+  width: 9px;
+  height: 9px;
 }
 
 .status-dot,
@@ -804,6 +862,41 @@ button:disabled,
   border-color: var(--line);
   background: var(--panel-soft);
   color: var(--subtle);
+}
+
+/* The sidebar badge doubles as a stop shortcut on a live section. It only says
+   so on hover — the badge's job at rest is still to report the state. */
+.agent-badge.stoppable {
+  cursor: pointer;
+}
+
+.agent-badge.stoppable:hover,
+.agent-badge.stoppable:focus-visible {
+  border-color: var(--danger-edge);
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+/* Armed: one click landed, the next one stops it. Loud on purpose, and wide
+   enough to say "Stop?" even in the compact sidebar form, so an accidental
+   first click is impossible to miss before it lapses. */
+.agent-badge.stop-armed,
+.agent-badge.stop-armed:hover {
+  border-color: var(--danger-edge);
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+.agent-badge.compact.stop-armed {
+  width: auto;
+  min-width: 18px;
+  padding: 0 7px;
+  gap: 5px;
+}
+
+.agent-badge.compact.stop-armed span:last-child {
+  display: inline;
+  font-size: 10px;
 }
 
 .agent-spinner {
@@ -981,10 +1074,284 @@ button:disabled,
   height: 11px;
 }
 
+/* Pages this section has open in the built-in browser. Same pill as the
+   terminal count — these are the two "something of yours is live over there"
+   marks and they should read as one family. */
+.thread-browser-count {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  height: 17px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-pill);
+  padding: 0 5px;
+  color: var(--muted);
+  background: var(--input-bg);
+  font-size: 10.5px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+/* An agent left a note on one of those pages: it is waiting on the user, so it
+   gets the same colour as everything else that is. */
+.thread-browser-count.has-note {
+  border-color: var(--accent-edge-strong);
+  background: var(--accent-wash);
+  color: var(--accent);
+}
+
+.thread-browser-count svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* The cluster of marks on a row.
+   ------------------------------
+   One mark can afford its number. Two or more cannot: the sidebar is narrow and
+   user-resizable, and a run of pills pushes the title into an ellipsis. Past one
+   the counts fold away and the marks become bare icons; hovering the cluster
+   spreads them back out.
+
+   The counts are collapsed with width and opacity rather than `display: none` so
+   they can animate, and so the row keeps a stable height while they move. */
+.thread-marks {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+}
+
+.thread-marks.grouped {
+  gap: 3px;
+}
+
+.thread-marks.grouped .thread-mark {
+  padding: 0 3px;
+}
+
+.thread-marks.grouped .thread-mark-count {
+  max-width: 0;
+  margin-left: -3px;
+  opacity: 0;
+  overflow: hidden;
+}
+
+.thread-marks.grouped:hover {
+  gap: 5px;
+}
+
+.thread-marks.grouped:hover .thread-mark {
+  padding: 0 5px;
+}
+
+.thread-marks.grouped:hover .thread-mark-count {
+  max-width: 3em;
+  margin-left: 0;
+  opacity: 1;
+}
+
+.thread-mark,
+.thread-mark-count {
+  transition:
+    max-width 120ms ease,
+    opacity 120ms ease,
+    padding 120ms ease,
+    margin 120ms ease;
+}
+
+/* The pencil has no count and is already a circle, so folding must not squash
+   it into an oval. */
+.thread-marks.grouped .draft-mark,
+.thread-marks.grouped:hover .draft-mark {
+  padding: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thread-mark,
+  .thread-mark-count {
+    transition: none;
+  }
+}
+
 .thread-star {
   flex: none;
   color: var(--accent);
   fill: var(--accent);
+}
+
+.thread-archive-mark {
+  flex: none;
+  color: var(--muted);
+  margin-right: 2px;
+}
+
+/* Dimmed, not hidden: an archived row only shows up here at all when the
+   workspace's "show archived" toggle is on, so it needs to read as "tucked
+   away" without disappearing into the background. */
+.thread-item.archived-thread {
+  opacity: 0.55;
+}
+
+.thread-item.archived-thread:hover,
+.thread-item.archived-thread.active {
+  opacity: 0.85;
+}
+
+/* Quick archive toggle: sits where the timestamp usually is, revealed on row
+   hover so archiving doesn't require the right-click menu. Same reveal rule
+   as the workspace header's own hover buttons. */
+/* One grid cell shared by the timestamp and the archive toggle — an overlay
+   crossfade instead of a fourth column, so the row's width doesn't change
+   whether or not a section is being hovered. Without this the toggle's own
+   reserved space (even at opacity 0) widened the gap between the title and
+   the time on every row, not just the hovered one. */
+.thread-trailing {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-self: end;
+  min-height: 22px;
+}
+
+.thread-trailing time {
+  transition: opacity var(--motion-enter) var(--motion-ease);
+}
+
+.thread-item:hover .thread-trailing time {
+  opacity: 0;
+}
+
+.thread-archive-toggle {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  opacity: 0;
+  pointer-events: none;
+  cursor: pointer;
+  transition: background var(--motion-enter) var(--motion-ease), color var(--motion-enter) var(--motion-ease), opacity var(--motion-enter) var(--motion-ease);
+}
+
+.thread-item:hover .thread-archive-toggle,
+.thread-archive-toggle:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.thread-archive-toggle:hover,
+.thread-archive-toggle:focus-visible {
+  background: var(--panel-hover);
+  color: var(--text);
+}
+
+/* Sub-threads.
+   ------------
+   A branch is one row plus the rows of everything it opened. The row and its
+   children are DOM siblings (a button cannot hold buttons, and the chevron must
+   be clickable without selecting the parent), so the tree is drawn with an
+   indent that grows per level and a guide line down the left of each nested
+   run — nesting a container per level would compound the sidebar's padding and
+   run out of width by the second level. */
+.thread-branch {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+/* The chevron gutter is unconditional — 16px wide, the width of the workspace
+   drag handle above it, so the chevron lines up with the grip and the agent
+   badge lands on the same x whether or not the row can expand. Expanding a
+   row must not shove its own title sideways; only its children step right. */
+.thread-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  /* One step per level; the depth cap is what keeps this from eating the list. */
+  padding-left: calc(var(--thread-depth, 0) * 13px);
+}
+
+.subthread-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.subthread-toggle:hover {
+  color: var(--text);
+  background: var(--hover-wash);
+}
+
+/* The elbow in place of a chevron on a leaf sub-thread, so every nested row
+   lines up with the ones that can expand. */
+.subthread-branch-mark {
+  display: block;
+  justify-self: center;
+  width: 6px;
+  height: 6px;
+  border-left: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  border-bottom-left-radius: 2px;
+  margin-bottom: 4px;
+}
+
+/* Holds the chevron column open for rows that have no chevron and no branch
+   mark, so every row's box starts on the same x. */
+.subthread-gutter-spacer {
+  display: block;
+}
+
+.subthread-item .thread-copy strong {
+  font-size: 12.5px;
+  color: var(--muted-strong, var(--text));
+}
+
+/* Sub-thread count on a COLLAPSED parent: the folded rows still say how much
+   work is hidden under them, and colour it when any of it is running. */
+.thread-subthread-count {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  height: 17px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-pill);
+  padding: 0 5px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 10.5px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.thread-subthread-count.busy {
+  border-color: var(--accent-edge);
+  background: var(--accent-wash);
+  color: var(--accent);
+}
+
+.thread-subthread-count svg {
+  width: 11px;
+  height: 11px;
 }
 
 .starred-group {
@@ -999,12 +1366,41 @@ button:disabled,
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 0 8px 2px 10px;
+  width: 100%;
+  padding: 2px 8px 3px 10px;
+  border: var(--bw) solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
   color: var(--muted);
   font-size: 11px;
   font-weight: 650;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--motion-enter) var(--motion-ease);
+}
+
+.starred-group-header:hover {
+  background: var(--hover-wash);
+}
+
+/* Pushes the chevron to the far edge, the way the workspace header's "+" sits. */
+.starred-group-count {
+  margin-left: auto;
+  color: var(--subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Same reveal as a workspace group: the chevron only takes space on hover, or
+   whenever the list is folded away and needs to say so. */
+.starred-group:hover .workspace-chevron,
+.starred-group-header:focus-visible .workspace-chevron,
+.starred-group.collapsed .workspace-chevron {
+  width: 15px;
+  min-width: 15px;
+  opacity: 1;
 }
 
 .starred-thread-list {
@@ -1019,7 +1415,6 @@ button:disabled,
 }
 
 .thread-item time {
-  justify-self: end;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1043,18 +1438,78 @@ button:disabled,
   gap: 10px;
 }
 
-/* /btw opens as a second column beside the conversation — the topbar keeps
-   spanning the full width, and the conversation shell simply gets narrower. */
-.workspace.with-btw > .workspace-top {
+/* Place every workspace child explicitly, always.
+
+   The docks (/btw, the browser) add columns, and anything left to grid
+   auto-placement will drift into one of them the moment a second column
+   appears — which looks like "the app exploded" rather than like a layout rule
+   being missed. Pinning the two permanent children costs nothing and makes that
+   impossible. Out-of-flow children (context menus, the closed browser dock) are
+   not grid items and need no rule. */
+.workspace > .workspace-top {
   grid-column: 1 / -1;
+  grid-row: 1;
 }
 
-.workspace.with-btw > .conversation-shell {
+.workspace > .conversation-shell {
   grid-column: 1;
+  grid-row: 2;
 }
 
 .workspace.with-btw > .btw-panel {
   grid-column: 2;
+  grid-row: 2;
+}
+
+/* The browser takes the second column, the same one /btw would. */
+.workspace.with-browser > .browser-dock {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+/* Full width: the browser takes the whole row and the conversation steps out of
+   the way rather than being squeezed into a strip. The topbar goes too — at full
+   width the point is the page, and the section's header is the one thing on
+   screen that is not it. It is not a trap: the panel's own tab bar carries the
+   way back (exit full width, hide the browser), and ⌘⇧J still closes it. */
+.workspace.browser-full > .conversation-shell,
+.workspace.browser-full > .workspace-top {
+  display: none;
+}
+
+.workspace.browser-full > .browser-dock {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
+/* The hidden top row is still a track; without this its gap leaves a 10px band
+   above the panel that reads as a misalignment. */
+.workspace.browser-full {
+  row-gap: 0;
+}
+
+/* The topbar doubles as the draggable title bar, so with it hidden the tab bar
+   has to take that job — otherwise full width is a window you cannot move.
+   Interactive children opt back out, exactly as they do in the topbar. */
+.workspace.browser-full .browser-tabbar {
+  -webkit-app-region: drag;
+}
+
+.workspace.browser-full .browser-tabbar button,
+.workspace.browser-full .browser-tab {
+  -webkit-app-region: no-drag;
+}
+
+/* And with no topbar to indent, the tab bar is what the macOS traffic lights
+   would otherwise sit on top of. */
+.compact-sidebar .workspace.browser-full .browser-tabbar {
+  padding-left: 70px;
+}
+
+/* Both docks open: conversation | browser | /btw. More specific than the
+   two-column rule above, so /btw moves over rather than landing on the browser. */
+.workspace.with-browser.with-btw > .btw-panel {
+  grid-column: 3;
   grid-row: 2;
 }
 
@@ -1087,6 +1542,21 @@ button:disabled,
 .topbar a,
 .topbar .actions,
 .topbar .title-row > * {
+  -webkit-app-region: no-drag;
+}
+
+/* Drag regions are a native hit-test on the window, not a painted layer: an
+   overlay drawn *over* the title bar still lands inside it, and every click in
+   that strip moves the window instead of pressing what is under the cursor —
+   which is where a sheet's own header, with its close and confirm buttons,
+   tends to sit. Full-window overlays opt their whole subtree back out. */
+.dialog-backdrop,
+.image-preview-backdrop,
+.doc-reader-backdrop,
+.quick-start-backdrop,
+.backlog-backdrop,
+.task-backdrop,
+.task-attachment-lightbox-backdrop {
   -webkit-app-region: no-drag;
 }
 
@@ -1147,6 +1617,48 @@ button:disabled,
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* "Opened by …" ahead of the section name. Muted and clipped hard: it is
+   context for the title, never a competitor to it. */
+.subthread-breadcrumb {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 4px;
+  max-width: min(20vw, 220px);
+  min-width: 0;
+  padding: 2px 7px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.subthread-breadcrumb span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subthread-breadcrumb:hover {
+  border-color: var(--accent-edge);
+  color: var(--text);
+}
+
+.subthread-header-count {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-pill);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .title-input {
@@ -1313,6 +1825,119 @@ button:disabled,
   padding: 18px;
 }
 
+.conversation-feed-content {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  animation: conversation-reveal var(--motion-enter) var(--motion-ease) both;
+}
+
+@keyframes conversation-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.conversation-loading {
+  display: grid;
+  align-self: stretch;
+  gap: 14px;
+  width: min(680px, 100%);
+  margin: auto;
+  padding: 24px;
+  color: var(--muted);
+}
+
+.conversation-loading-copy {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.conversation-loading-copy > div {
+  display: grid;
+  gap: 2px;
+}
+
+.conversation-loading-copy strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.conversation-loading-copy span:not(.conversation-loading-spinner) {
+  font-size: 12px;
+}
+
+.conversation-loading-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent-text-hi);
+  border-radius: 50%;
+  animation: conversation-loading-spin 700ms linear infinite;
+}
+
+@keyframes conversation-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.conversation-loading-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  padding: 16px;
+  background: var(--panel);
+}
+
+.conversation-loading-card span {
+  height: 8px;
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--line-soft) 25%, var(--line) 50%, var(--line-soft) 75%);
+  background-size: 200% 100%;
+  animation: conversation-loading-shimmer 1.4s ease-in-out infinite;
+}
+
+.conversation-loading-card span:nth-child(1) { width: 32%; }
+.conversation-loading-card span:nth-child(2) { width: 92%; }
+.conversation-loading-card span:nth-child(3) { width: 68%; }
+.conversation-loading-card.short { width: 76%; }
+.conversation-loading-card.short span:nth-child(1) { width: 44%; }
+.conversation-loading-card.short span:nth-child(2) { width: 84%; }
+
+@keyframes conversation-loading-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conversation-feed-content,
+  .conversation-loading-spinner,
+  .conversation-loading-card span {
+    animation: none;
+  }
+}
+
+/* Sits at the top of a windowed feed, where the folded-away history would be. */
+.conversation-show-earlier {
+  align-self: center;
+  flex: 0 0 auto;
+}
+
 .scroll-to-bottom-button {
   position: absolute;
   right: 22px;
@@ -1438,6 +2063,95 @@ button:disabled,
   /* The user's own prompt is primary content, not secondary — the rest of the
      transcript is muted so this reads as the thing you actually wrote. */
   color: var(--text);
+}
+
+.conversation-card.peer-message {
+  align-self: flex-start;
+  width: min(720px, 92%);
+  border-color: var(--info-edge);
+  background:
+    linear-gradient(135deg, var(--info-wash), transparent 62%),
+    rgba(255, 255, 255, 0.025);
+}
+
+.conversation-card.peer-message .conversation-icon {
+  background: var(--info-wash);
+  color: var(--info-text);
+}
+
+.peer-origin-badge {
+  flex: 0 0 auto;
+  border: 1px solid var(--info-edge);
+  border-radius: var(--r-pill);
+  padding: 1px 7px;
+  background: var(--info-wash);
+  color: var(--info-text);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.peer-relation {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--subtle);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-body-wrap {
+  position: relative;
+  min-width: 0;
+}
+
+.conversation-body-wrap.prompt-collapsed .conversation-body {
+  max-height: 11.5rem;
+  overflow: hidden;
+}
+
+.prompt-expander {
+  display: flex;
+  justify-content: center;
+  padding-top: 7px;
+}
+
+.prompt-collapsed .prompt-expander {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  align-items: flex-end;
+  min-height: 76px;
+  padding: 30px 0 1px;
+  background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--panel) 94%, var(--accent) 6%) 72%);
+  pointer-events: none;
+}
+
+.peer-message .prompt-collapsed .prompt-expander {
+  background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--panel) 90%, var(--info-text) 10%) 72%);
+}
+
+.prompt-expander button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--accent-edge);
+  border-radius: var(--r-pill);
+  padding: 4px 10px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.prompt-expander button:hover {
+  border-color: var(--accent-edge-strong);
+  background: var(--accent-wash-strong);
 }
 
 .conversation-line {
@@ -1573,11 +2287,23 @@ button.conversation-line-header:disabled {
 }
 
 .conversation-passage-body {
+  flex: 1 1 auto;
   min-width: 0;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.48;
   overflow-wrap: anywhere;
+}
+
+/* Emission time, right-aligned on the passage's first line — the same caption
+   the collapsed activity rows carry, so a mid-turn reply reads on the same clock. */
+.conversation-passage > time {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  padding-top: 2px;
+  color: var(--subtle);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 
 .conversation-line-body {
@@ -1604,7 +2330,9 @@ button.conversation-line-header:disabled {
 
 .conversation-marker {
   display: grid;
-  grid-template-columns: minmax(24px, 1fr) auto auto minmax(24px, 1fr);
+  /* Three columns, not four: the pill carries its own timestamp so the rules
+     stay symmetrical and the pill sits dead centre of the transcript. */
+  grid-template-columns: minmax(24px, 1fr) auto minmax(24px, 1fr);
   align-items: center;
   gap: 9px;
   align-self: stretch;
@@ -1619,11 +2347,15 @@ button.conversation-line-header:disabled {
 }
 
 .conversation-marker-pill {
-  display: grid;
-  gap: 2px;
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  max-width: min(560px, 100%);
   border: 1px solid var(--info-edge);
   border-radius: var(--r-pill);
-  padding: 4px 10px;
+  padding: 3px 10px;
   background: var(--info-wash);
   text-align: center;
 }
@@ -1641,7 +2373,8 @@ button.conversation-line-header:disabled {
 
 .conversation-marker time {
   color: var(--subtle);
-  font-size: 11px;
+  font-size: 10px;
+  opacity: 0.75;
 }
 
 .conversation-card-header {
@@ -1673,6 +2406,45 @@ button.conversation-line-header:disabled {
   flex: 0 0 auto;
   color: var(--subtle);
   font-size: 11px;
+}
+
+/* "Read in Markdown editor", parked at the top right of a reply. Quiet until
+   the message is hovered: it is an escape hatch for a long answer, not a
+   control the transcript should advertise on every card. */
+.conversation-read-button {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  border: 0;
+  border-radius: var(--r-sm, 6px);
+  padding: 3px;
+  background: transparent;
+  color: var(--subtle);
+  opacity: 0;
+  cursor: pointer;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease,
+    background 120ms ease;
+}
+
+.conversation-card:hover .conversation-read-button,
+.conversation-passage:hover .conversation-read-button,
+.conversation-read-button:focus-visible {
+  opacity: 1;
+}
+
+.conversation-read-button:hover {
+  background: var(--accent-wash);
+  color: var(--text);
+}
+
+/* The passage's time sits after the button, so the button takes the free space
+   instead of the timestamp. */
+.conversation-passage > .conversation-read-button {
+  align-self: flex-start;
 }
 
 .conversation-model {
@@ -2016,6 +2788,15 @@ button.conversation-line-header:disabled {
   gap: 2px;
 }
 
+.agent-card-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--subtle);
+  font-size: 10px;
+  padding: 0 0 4px;
+}
+
 .agent-card-empty {
   color: var(--subtle);
   font-size: 11px;
@@ -2034,6 +2815,73 @@ button.conversation-line-header:disabled {
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* Plain/background Bash command card: no subagent_type, so it isn't a real
+   delegated turn — reads as a terminal instead of the purple subagent wash. */
+.agent-card.command {
+  border-color: var(--edge);
+  background: #14161a;
+}
+
+.agent-card.command .agent-card-header:hover {
+  background: #1b1e24;
+}
+
+.agent-card.command .agent-card-icon {
+  background: #1b1e24;
+  color: var(--muted);
+}
+
+.agent-card-title.command-text {
+  font-family: var(--mono);
+  font-weight: 500;
+}
+
+/* The header truncates the command with an ellipsis; the expanded body always
+   shows it in full, wrapped, so there is somewhere to read the whole thing. */
+.agent-card-command-full {
+  margin: 0 0 4px;
+  padding: 4px 6px;
+  border-radius: var(--r-sm);
+  background: #0d0f12;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.agent-card.command .agent-card-body {
+  border-left-color: var(--edge);
+}
+
+.agent-card.command .agent-card-output {
+  color: #7ee787;
+}
+
+.agent-card-kill {
+  flex: 0 0 auto;
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  opacity: 0;
+}
+
+.agent-card-header:hover .agent-card-kill,
+.agent-card-kill:focus-visible {
+  opacity: 1;
+}
+
+.agent-card-kill:not(:disabled):hover {
+  color: var(--red);
+}
+
+.agent-card-kill:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
 }
 
 .message-image-grid {
@@ -2085,6 +2933,87 @@ button.conversation-line-header:disabled {
   white-space: nowrap;
 }
 
+/* ---- Media an agent put in its own message ------------------------------
+   `![caption](/path/shot.png)` in a reply. Deliberately smaller than the grid
+   the user's own attachments get: it lands mid-prose, often several in a row,
+   and a full-width screenshot in the middle of a paragraph reads as an
+   interruption rather than as evidence. Click opens it full size. */
+
+.inline-media {
+  display: inline-grid;
+  gap: 5px;
+  vertical-align: bottom;
+  max-width: min(280px, 100%);
+  margin: 4px 6px 4px 0;
+  border: 1px solid var(--accent-edge);
+  border-radius: var(--r-md);
+  padding: 5px;
+  background: var(--input-bg);
+  color: var(--text);
+  cursor: zoom-in;
+  text-align: left;
+  transition:
+    border-color var(--motion-enter) var(--motion-ease),
+    box-shadow var(--motion-enter) var(--motion-ease),
+    transform var(--motion-enter) var(--motion-ease);
+}
+
+.inline-media:hover {
+  border-color: var(--accent-edge-strong);
+  box-shadow: var(--elev-popover);
+  transform: translateY(-1px);
+}
+
+.inline-media-frame {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  border-radius: var(--r-sm);
+}
+
+.inline-media-frame img,
+.inline-media-frame video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+  background: var(--panel);
+}
+
+.inline-media-play {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+
+.inline-media-caption {
+  overflow: hidden;
+  padding: 0 2px 1px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The file moved or was never there. Named rather than silent: a screenshot in
+   a temp directory outlives the turn that made it by hours, not days, and the
+   caption is then the only record of what it showed. */
+.inline-media-missing {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-sm);
+  padding: 1px 7px;
+  color: var(--placeholder);
+  font-size: 11.5px;
+}
+
 .thinking-dot {
   width: 9px;
   min-width: 9px;
@@ -2110,21 +3039,98 @@ button.conversation-line-header:disabled {
 .formatted-body p,
 .formatted-body ul,
 .formatted-body ol,
+.formatted-body h1,
+.formatted-body h2,
 .formatted-body h3,
+.formatted-body h4,
+.formatted-body h5,
+.formatted-body h6,
 .formatted-body blockquote,
 .formatted-body hr,
 .formatted-code {
   margin: 0;
 }
 
+/* Fills the card in regular chat reading — the transcript column itself is
+   already a comfortable measure, so a second cap here just left a gap
+   between the prose and the card's right edge. The doc reader is a longer,
+   denser read and keeps its own 70ch cap below. */
+.formatted-body p,
+.formatted-body ul,
+.formatted-body ol,
+.formatted-body blockquote {
+  max-width: 100%;
+}
+
+/* Capped independent of the reader column's own width (which the measure
+   slider controls) — unbroken prose past ~70 characters is what made long
+   documents tiring to read, not the column's overall size. */
+.doc-reader-body .formatted-body p,
+.doc-reader-body .formatted-body ul,
+.doc-reader-body .formatted-body ol,
+.doc-reader-body .formatted-body blockquote {
+  max-width: 70ch;
+}
+
 .formatted-body p {
   white-space: pre-wrap;
+  line-height: 1.62;
+}
+
+.formatted-body li {
+  line-height: 1.55;
+}
+
+/* GitHub's heading ramp, in `em` so it tracks the reader's size slider and
+   stays proportionate inside a chat bubble. Sized relative to the body rather
+   than pinned at 13px, which used to render a heading *smaller* than the prose
+   under it. The grid `gap` supplies the space below; the extra top margin is
+   what sets a new section apart from the block it follows. */
+.formatted-body h1,
+.formatted-body h2,
+.formatted-body h3,
+.formatted-body h4,
+.formatted-body h5,
+.formatted-body h6 {
+  margin-top: 10px;
+  color: var(--text);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.formatted-body > :first-child {
+  margin-top: 0;
+}
+
+.formatted-body h1,
+.formatted-body h2 {
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 0.3em;
+}
+
+.formatted-body h1 {
+  font-size: 2em;
+}
+
+.formatted-body h2 {
+  font-size: 1.5em;
 }
 
 .formatted-body h3 {
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 720;
+  font-size: 1.25em;
+}
+
+.formatted-body h4 {
+  font-size: 1em;
+}
+
+.formatted-body h5 {
+  font-size: 0.875em;
+}
+
+.formatted-body h6 {
+  color: var(--muted);
+  font-size: 0.85em;
 }
 
 .formatted-body ul,
@@ -2177,13 +3183,36 @@ button.conversation-line-header:disabled {
   text-decoration: underline;
 }
 
+/* Links that go somewhere in the app (a backlog card) rather than to the web.
+   Underlined at rest so they read as clickable even outside .formatted-body. */
+a.inline-app-link {
+  color: var(--info-text);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+a.inline-app-link:hover {
+  text-decoration-style: solid;
+}
+
+/* A bare `#12` in prose. Quieter than a titled link — it is a reference inside
+   a sentence, not a phrase you are meant to read as a destination — and set in
+   the numeric font so a run of them lines up. */
+a.inline-card-ref {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-decoration-style: dotted;
+}
+
 .formatted-body del {
   color: var(--subtle);
 }
 
 .formatted-body p code,
 .formatted-body li code,
-.formatted-body h3 code,
+.formatted-body :is(h1, h2, h3, h4, h5, h6) code,
 .formatted-body blockquote code {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: var(--r-sm);
@@ -2244,6 +3273,11 @@ button.conversation-line-header:disabled {
   padding: 9px 11px;
   text-align: left;
   vertical-align: top;
+  /* Keep any single column from collapsing to a few characters wide when a
+     neighbour holds long unbreakable content (code chips, paths, URLs). The
+     shell scrolls horizontally instead. */
+  min-width: 7rem;
+  overflow-wrap: anywhere;
 }
 
 .formatted-table th {
@@ -2268,8 +3302,15 @@ button.conversation-line-header:disabled {
   border-right: 1px solid rgba(255, 255, 255, 0.055);
 }
 
+/* The first column used to be nowrap, which let a row of code chips blow the
+   table far past the shell and squeeze the remaining columns into one-character
+   ribbons. Let it wrap; individual code chips still stay intact. */
 .formatted-table td:first-child,
 .formatted-table th:first-child {
+  white-space: normal;
+}
+
+.formatted-table code {
   white-space: nowrap;
 }
 
@@ -2452,6 +3493,509 @@ button.conversation-line-header:disabled {
 
 .terminal-view .xterm {
   height: 100%;
+}
+
+/* ---------------------------------------------------------------------------
+   The built-in browser.
+
+   Layout only — behaviour is in `main/browserService.ts`, the model in
+   `shared/browser.ts`. Two rules here are load-bearing and have each already
+   caused a visible regression, so read their comments before editing:
+   `.browser-dock.hidden` (never `display: none`) and the workspace grid
+   placement further up, which `workspace-grid.test.ts` guards.
+   --------------------------------------------------------------------------- */
+
+/* The built-in browser, docked as a column beside the conversation — the same
+   shape as /btw, for the same reason: a band under the feed steals the vertical
+   space the composer needs, and a web page wants height more than the chat does. */
+.browser-dock {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The grid placement for this dock lives with the other workspace grid rules,
+   next to /btw's — deliberately NOT here. A second copy of it in this section is
+   what broke full width: same specificity, later in the file, so it silently
+   overrode `.workspace.browser-full > .browser-dock`. */
+
+/* Closed, but never `display: none`.
+
+   An Electron <webview> whose ancestor is display:none loses its compositing
+   surface and comes back blank — the page is still there and still readable,
+   it just never paints again. That is not a cosmetic bug: it silently kills
+   every tab an agent is working in. Moving the dock off-screen keeps the guests
+   sized, painted and alive. */
+.browser-dock.hidden {
+  position: fixed;
+  top: 0;
+  left: -20000px;
+  z-index: -1;
+  width: 900px;
+  height: 700px;
+  pointer-events: none;
+}
+
+/* Screenshot staging.
+
+   A webview can remain awake and fully scriptable while Chromium declines to
+   raster it because its section is behind another one, its tab is inactive, or
+   the dock is parked offscreen. During a capture main asks BrowserPanel to put
+   the exact live guest here for two frames. Non-zero opacity matters: zero,
+   visibility:hidden and clipping all let Chromium cull the layer again. The
+   value is far below a displayable pixel while still requiring a real texture.
+   :has() lifts the dock out of its -20000px resting place without changing the
+   section, opening the panel, taking focus, or reloading the page. */
+.browser-dock:has(.browser-panel.capture-staging) {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 2147483646;
+  width: 900px;
+  height: 700px;
+  opacity: 0.0001;
+  pointer-events: none;
+  transform: translateZ(0);
+}
+
+.browser-panel.capture-staging {
+  width: 900px;
+  height: 700px;
+}
+
+/* The detached window: the panel is the entire window. */
+.browser-window-shell {
+  display: grid;
+  height: 100vh;
+  padding: 28px 10px 10px;
+  background: var(--bg, #111318);
+}
+
+.browser-window-shell .browser-panel {
+  border-radius: var(--r-md);
+}
+
+/* Tabs grouped under the section that owns them, in the detached window. */
+.browser-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  border-left: 1px solid var(--line-soft);
+  padding-left: 6px;
+}
+
+.browser-group:first-child {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.browser-group-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 150px;
+  height: 22px;
+  border-radius: var(--r-sm);
+  padding: 0 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.browser-group-label span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.browser-group-label:hover {
+  background: var(--hover-wash-strong);
+  color: var(--text);
+}
+
+.browser-group-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+/* Grip on the dock's left edge — mirrors .btw-resizer on the same side. */
+.browser-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  z-index: 3;
+  width: 6px;
+  cursor: col-resize;
+}
+
+.browser-resizer:hover,
+.workspace.resizing-browser .browser-resizer {
+  background: var(--accent-edge-strong);
+}
+
+.workspace.resizing-browser {
+  cursor: col-resize;
+  user-select: none;
+}
+
+/* While dragging, the pages stop hit-testing entirely. A <webview> otherwise
+   swallows the pointer the instant it crosses one, which killed the drag
+   halfway across. */
+.workspace.resizing-browser .browser-view {
+  pointer-events: none;
+}
+
+/* A wider grab target than /btw's: the thing on the other side of this line is
+   a web page, and overshooting it by a pixel used to mean clicking the page. */
+.browser-resizer {
+  width: 10px;
+  left: -5px;
+}
+
+.browser-panel {
+  /* Flex, not grid: the note row only exists when an agent has left one, and a
+     fixed row template would drop the page into the wrong row without it. */
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  background: var(--input-bg);
+}
+
+.browser-tabbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--panel);
+}
+
+.browser-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 180px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  padding: 0 5px 0 9px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.browser-tab > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.browser-tab:hover {
+  background: var(--hover-wash);
+  color: var(--text);
+}
+
+.browser-tab.active {
+  border-color: var(--line-soft);
+  background: var(--input-bg);
+  color: var(--text);
+}
+
+/* A tab an agent is waiting on the user for. */
+.browser-tab.has-note {
+  border-color: var(--accent-edge-strong);
+}
+
+.browser-tab-note-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.browser-tab-close,
+.browser-tabbar-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    background var(--motion-enter) var(--motion-ease),
+    color var(--motion-enter) var(--motion-ease);
+}
+
+.browser-tab-close:hover,
+.browser-tabbar-button:hover:not(:disabled) {
+  background: var(--hover-wash-strong);
+  color: var(--text);
+}
+
+.browser-tabbar-button.active {
+  background: var(--hover-wash-strong);
+  color: var(--text);
+}
+
+.browser-tabbar-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.browser-tabbar-spacer {
+  flex: 1;
+}
+
+.browser-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--panel);
+}
+
+.browser-address {
+  flex: 1;
+  min-width: 0;
+}
+
+.browser-address input {
+  width: 100%;
+  height: 26px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  padding: 0 10px;
+  background: var(--input-bg);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.browser-address input:focus {
+  outline: none;
+  border-color: var(--accent-edge-strong);
+}
+
+/* An agent's hand-off. Loud on purpose: it is the one thing in this panel that
+   is waiting on the user rather than reporting to them. */
+.browser-note {
+  display: grid;
+  gap: 8px;
+  border-bottom: 1px solid var(--accent-edge-strong);
+  padding: 10px 12px;
+  background: var(--accent-wash);
+}
+
+.browser-note-body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.browser-note-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.browser-note-body strong {
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.browser-note-body p {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.browser-note-hide {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  border-radius: var(--r-sm);
+  padding: 3px 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11.5px;
+}
+
+.browser-note-hide:hover,
+.browser-note-restore {
+  background: var(--hover-wash-strong);
+  color: var(--text);
+}
+
+.browser-note-restore {
+  border: 1px solid var(--accent-edge-strong);
+}
+
+.browser-note-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.browser-note-actions input {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  padding: 0 10px;
+  background: var(--input-bg);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.browser-views {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: #fff;
+}
+
+.browser-view {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* Inactive tabs: kept painted (see .browser-dock.hidden) and merely covered. */
+.browser-view.hidden {
+  visibility: hidden;
+  z-index: -1;
+}
+
+.browser-empty {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 20px;
+  color: var(--muted);
+  background: var(--input-bg);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+/* The activity log: every action in the browser, whoever took it. Along the
+   bottom rather than beside the page, since the dock is a narrow column. */
+.browser-activity {
+  flex: 0 0 auto;
+  overflow-y: auto;
+  max-height: 220px;
+  border-top: 1px solid var(--line-soft);
+  padding: 8px;
+  background: var(--panel);
+  font-size: 11.5px;
+}
+
+.browser-activity-empty {
+  margin: 8px 4px;
+  color: var(--muted);
+}
+
+.browser-activity-row {
+  display: grid;
+  gap: 2px;
+  border-bottom: 1px solid var(--line-soft);
+  padding: 7px 4px;
+}
+
+.browser-activity-row.failed strong {
+  color: var(--danger, #e0736d);
+}
+
+.browser-activity-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.browser-activity-head strong {
+  color: var(--text);
+}
+
+.browser-activity-head span {
+  flex: 1;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-activity-head time,
+.browser-activity-row small {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.browser-activity-row code {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A tab whose page has been released. Still a tab — recedes rather than
+   disappears, because it comes back the moment you touch it. */
+.browser-tab.asleep {
+  opacity: 0.55;
+}
+
+.browser-tab.asleep > span {
+  font-style: italic;
+}
+
+/* Recording: the same red dot every screen recorder uses, on the tab itself. */
+.browser-tab-recording {
+  flex: 0 0 auto;
+  color: #e0736d;
+  fill: #e0736d;
+  animation: browser-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes browser-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.spin {
+  animation: browser-spin 900ms linear infinite;
+}
+
+@keyframes browser-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* Codex approval / question, docked between the status bar and the composer:
@@ -3018,6 +4562,236 @@ button.conversation-line-header:disabled {
   filter: brightness(1.08);
 }
 
+/* Dictation. Quiet when idle so it never competes with send — it occupies the
+   send button's slot only because there is nothing to send yet. */
+.composer-fab--mic {
+  background: var(--panel-strong);
+  border-color: var(--line);
+  color: var(--subtle);
+}
+
+.composer-fab--mic:not(:disabled):hover {
+  color: var(--text);
+  border-color: var(--accent-edge-strong);
+}
+
+/* The one case where two buttons share the corner: the agent is working (so
+   stop keeps the primary slot) and the composer is empty (so the microphone is
+   still worth offering). */
+.composer-fab--beside {
+  right: calc(9px + var(--ctl-h) + 6px);
+}
+
+/* Live. Accent rather than danger — this is recording, not an error — and it
+   both pulses and breathes, because a static colour change was easy to miss
+   while reading the transcript above it. */
+.composer-fab--recording {
+  background: var(--accent-solid);
+  border-color: var(--accent-edge-strong);
+  color: var(--accent-on);
+  animation: mic-pulse 1.6s var(--motion-ease) infinite;
+}
+
+/* The icon itself grows and shrinks. Motion inside the button reads as "still
+   going" in a way a halo alone does not. */
+.composer-fab--recording svg {
+  animation: mic-breathe 1.6s var(--motion-ease) infinite;
+}
+
+/* Held rather than latched: no halo, because the key being down is itself the
+   signal. The icon still breathes, so a stuck key is visible. */
+.composer-fab--recording.pushing {
+  animation: none;
+}
+
+@keyframes mic-pulse {
+  0%,
+  100% {
+    box-shadow: var(--elev-button), 0 0 0 0 var(--accent-edge-strong);
+  }
+  50% {
+    box-shadow: var(--elev-button), 0 0 0 6px transparent;
+  }
+}
+
+@keyframes mic-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.18);
+  }
+}
+
+/* The quick-start overlay's foot is a flex row, not the composer's absolutely
+   positioned button well, so the microphone sits in the flow there. */
+.quick-start-mic {
+  position: static;
+  margin-left: auto;
+}
+
+/* The recording bar: the unmissable half of the signal. */
+.dictation-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0 0 6px;
+  padding: 5px 10px;
+  border: var(--bw) solid var(--accent-edge-strong);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--accent-solid) 12%, var(--panel-strong));
+  color: var(--text);
+  font-size: 11px;
+}
+
+/* A four-bar level meter. Not wired to real input amplitude — it animates on a
+   fixed loop — because its job is to say "the microphone is open", and a meter
+   that sits flat through a quiet passage says the opposite. */
+.dictation-level {
+  display: inline-flex;
+  gap: 2px;
+  align-items: center;
+  height: 14px;
+}
+
+.dictation-level i {
+  width: 2px;
+  height: 100%;
+  border-radius: 1px;
+  background: var(--accent-solid);
+  animation: dictation-level 1s var(--motion-ease) infinite;
+}
+
+.dictation-level i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.dictation-level i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+.dictation-level i:nth-child(4) {
+  animation-delay: 0.45s;
+}
+
+@keyframes dictation-level {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+.dictation-bar-label {
+  display: flex;
+  flex: 1;
+  gap: 6px;
+  align-items: baseline;
+  font-weight: 600;
+}
+
+.dictation-bar-hint {
+  color: var(--subtle);
+  font-weight: 400;
+}
+
+.dictation-discard {
+  padding: 2px 8px;
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--subtle);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.dictation-discard:hover {
+  border-color: var(--danger-edge);
+  color: var(--danger-solid);
+}
+
+/* The way back from a discard. Quiet rather than accent — the microphone is
+   closed, and the only thing worth noticing here is the Undo. */
+.dictation-bar--undo {
+  border-color: var(--line);
+  background: var(--panel-strong);
+  color: var(--subtle);
+}
+
+.dictation-undo {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  padding: 2px 8px;
+  border: var(--bw) solid var(--accent-edge-strong);
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--accent-solid);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.dictation-undo:hover {
+  background: color-mix(in srgb, var(--accent-solid) 12%, transparent);
+}
+
+.dictation-undo-dismiss {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: none;
+  background: none;
+  color: var(--subtle);
+  cursor: pointer;
+}
+
+.dictation-undo-dismiss:hover {
+  color: var(--text);
+}
+
+/* Reduced motion keeps the colour and the bar, and drops only the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .composer-fab--recording,
+  .composer-fab--recording svg,
+  .dictation-level i {
+    animation: none;
+  }
+}
+
+.composer-dictation-error {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 0 0 6px;
+  padding: 5px 8px;
+  border: var(--bw) solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--panel-strong);
+  color: var(--subtle);
+  font-size: 11px;
+}
+
+.composer-dictation-error span {
+  flex: 1;
+}
+
+.composer-dictation-error button {
+  display: inline-flex;
+  padding: 2px;
+  border: 0;
+  background: none;
+  color: var(--subtle);
+  cursor: pointer;
+}
+
+.composer-dictation-error button:hover {
+  color: var(--text);
+}
+
 /* Stop glyph: a filled square reads as "stop" more clearly than an outline
    icon, and a soft pulse signals the section is actively running. */
 .stop-glyph {
@@ -3105,6 +4879,73 @@ button.conversation-line-header:disabled {
   opacity: 0.45;
 }
 
+.notification-menu-item {
+  position: relative;
+}
+
+.notification-menu-item > button .context-menu-chevron {
+  margin-left: auto;
+  color: var(--subtle);
+}
+
+.notification-channel-card {
+  position: absolute;
+  z-index: 2;
+  top: -6px;
+  right: calc(100% + 8px);
+  display: flex;
+  visibility: hidden;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 196px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 5px;
+  background: var(--overlay);
+  background-image: var(--overlay-sheen);
+  box-shadow: var(--elev-popover);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(4px);
+  transition: opacity 100ms ease, transform 100ms ease, visibility 100ms;
+}
+
+.notification-menu-item.opens-right .notification-channel-card {
+  right: auto;
+  left: calc(100% + 8px);
+  transform: translateX(-4px);
+}
+
+/* Keep the submenu open while the pointer crosses the eight-pixel visual gap. */
+.notification-channel-card::before {
+  position: absolute;
+  inset: 0 -9px 0 auto;
+  width: 9px;
+  content: "";
+}
+
+.notification-menu-item.opens-right .notification-channel-card::before {
+  right: auto;
+  left: -9px;
+}
+
+.notification-menu-item:hover .notification-channel-card,
+.notification-menu-item:focus-within .notification-channel-card {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0);
+}
+
+.notification-channel-title {
+  padding: 5px 8px 4px;
+  color: var(--subtle);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 .context-menu svg,
 .files-editor-menu svg {
   flex-shrink: 0;
@@ -3127,6 +4968,14 @@ button.conversation-line-header:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Invisible layer under a context menu that is opened inside a modal: it eats
+   the dismissing click so the modal behind does not also close. */
+.menu-shield {
+  position: fixed;
+  z-index: 39;
+  inset: 0;
 }
 
 .context-menu-separator {
@@ -3230,13 +5079,502 @@ button.conversation-line-header:disabled {
   font-size: 11px;
 }
 
-.image-preview-dialog > img {
+.image-preview-dialog > img,
+.image-preview-dialog > video,
+.image-preview-dialog > .video-player > video {
   display: block;
   width: 100%;
   max-height: calc(92vh - 76px);
   object-fit: contain;
   border-radius: var(--r-md);
   background: var(--input-bg);
+}
+
+/* ---- Video player ------------------------------------------------------
+   A wrapper around `<video controls>` that owns the keyboard shortcuts
+   (space / f / a / d / …) and the little speed-and-volume HUD they flash.
+   It goes fullscreen itself rather than the video, so the HUD survives. */
+
+.video-player {
+  position: relative;
+  min-height: 0;
+}
+
+.video-player:fullscreen {
+  display: grid;
+  place-items: center;
+  background: #000;
+}
+
+.video-player:fullscreen > video {
+  width: 100vw;
+  height: 100vh;
+  max-height: 100vh;
+  border-radius: 0;
+}
+
+.video-player-hud {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  border-radius: var(--r-md);
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  animation: video-player-hud-in 120ms ease-out;
+}
+
+@keyframes video-player-hud-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ---- In-app document reader -------------------------------------------- */
+
+.doc-reader-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: var(--scrim);
+  backdrop-filter: blur(10px);
+}
+
+.doc-reader-dialog {
+  display: grid;
+  /* Toolbar, document, and — in edit mode only — the hint/save footer. */
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(880px, 94vw);
+  height: min(880px, 92vh);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+  box-shadow: var(--elev-popover);
+}
+
+.doc-reader-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 10px 12px;
+}
+
+.doc-reader-icon {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.doc-reader-heading {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.doc-reader-heading strong,
+.doc-reader-heading span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-reader-heading strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+/* The path is the second line and reads right-to-left: the tail of a long path
+   is the part that identifies the file. */
+.doc-reader-heading span {
+  color: var(--muted);
+  font-size: 11px;
+  direction: rtl;
+  text-align: left;
+}
+
+.doc-reader-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.doc-reader-modes {
+  display: flex;
+  gap: 2px;
+  margin-right: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 2px;
+}
+
+.doc-reader-modes button {
+  border: none;
+  border-radius: calc(var(--r-md) - 2px);
+  padding: 3px 8px;
+  background: none;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.doc-reader-modes button.is-active {
+  background: var(--input-bg);
+  color: var(--text);
+}
+
+.doc-reader-modes button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Text size, set per reader and remembered. A document is read at whatever
+   distance the user happens to be sitting; the transcript's one size can't be
+   right for all of them. */
+.doc-reader-zoom {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 2px;
+}
+
+.doc-reader-zoom button {
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: calc(var(--r-md) - 2px);
+  padding: 3px 5px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.doc-reader-zoom button:hover:not(:disabled) {
+  background: var(--input-bg);
+  color: var(--text);
+}
+
+.doc-reader-zoom button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.doc-reader-zoom span {
+  min-width: 18px;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+/* Back/forward, first in the toolbar the way a browser puts them: the reader
+   stacks documents, so a link followed from one is a place to come back from. */
+.doc-reader-nav {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: 2px;
+}
+
+.doc-reader-nav button {
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: var(--r-sm);
+  padding: 2px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.doc-reader-nav button:hover:not(:disabled) {
+  background: var(--input-bg);
+  color: var(--text);
+}
+
+.doc-reader-nav button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* The measure slider. Squeezing the column is a reading control, not a window
+   control, so it sits beside the text size and is remembered the same way. */
+.doc-reader-measure-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+  color: var(--subtle);
+}
+
+.doc-reader-measure-control input[type="range"] {
+  width: 74px;
+  height: 3px;
+  appearance: none;
+  border-radius: var(--r-pill);
+  background: var(--line);
+  cursor: ew-resize;
+}
+
+.doc-reader-measure-control input[type="range"]::-webkit-slider-thumb {
+  width: 11px;
+  height: 11px;
+  appearance: none;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.doc-reader-body {
+  overflow: auto;
+  padding: 18px 24px 32px;
+}
+
+/* The column itself: centred, and never wider than the slider allows. */
+.doc-reader-measure {
+  max-width: var(--doc-measure, 760px);
+  margin: 0 auto;
+}
+
+/* Prose, not a transcript bubble: a wider measure than the chat column would
+   give, and room to breathe between blocks. The size is the reader's own
+   variable so the adjuster moves everything — prose, source and editor —
+   together. */
+.doc-reader-body .formatted-body {
+  font-size: var(--doc-font-size, 16px);
+  line-height: 1.65;
+}
+
+.doc-reader-source {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: calc(var(--doc-font-size, 16px) - 2px);
+  line-height: 1.55;
+}
+
+.doc-reader-note {
+  margin: 0;
+  padding: 8px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.doc-reader-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  padding: 7px 12px;
+  color: var(--subtle);
+  font-size: 11px;
+}
+
+.doc-reader-hint {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-reader-save {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.doc-reader-save.is-failed {
+  color: var(--danger-text);
+}
+
+/* ---- Live Markdown editor ------------------------------------------------
+   The source stays on screen while it is styled: the `#` of a heading is still
+   there, dimmed, next to the large text it makes. See MarkdownLiveEditor.tsx —
+   nothing here may change how many characters are rendered. */
+
+.mdl-editor {
+  outline: none;
+  color: var(--text);
+  font-size: var(--doc-font-size, 16px);
+  line-height: 1.5;
+  caret-color: var(--info-text);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.mdl-editor:empty::before,
+.mdl-editor.mdl-empty::before {
+  content: attr(data-placeholder);
+  color: var(--subtle);
+  pointer-events: none;
+}
+
+.mdl-line {
+  min-height: 1.5em;
+}
+
+/* A blank source line *is* the gap between blocks, so it is set to the size of
+   one — GitHub's 16px block margin — instead of a full empty line of text. */
+.mdl-blank {
+  min-height: 1em;
+  line-height: 1;
+}
+
+/* Syntax markers (#, **, `, >, …) stay legible but recede. */
+.mdl-syntax {
+  color: var(--subtle);
+  font-weight: 400;
+}
+
+/* Headings follow GitHub's ramp and its 24/16px rhythm. Where the source
+   already has a blank line on a side, that line is the gap and the margin
+   stands down, so the spacing never doubles. */
+.mdl-h1,
+.mdl-h2,
+.mdl-h3,
+.mdl-h4,
+.mdl-h5,
+.mdl-h6 {
+  margin-top: 24px;
+  margin-bottom: 16px;
+  color: var(--text);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.mdl-blank + .mdl-h1,
+.mdl-blank + .mdl-h2,
+.mdl-blank + .mdl-h3,
+.mdl-blank + .mdl-h4,
+.mdl-blank + .mdl-h5,
+.mdl-blank + .mdl-h6,
+.mdl-editor > .mdl-line:first-child {
+  margin-top: 0;
+}
+
+.mdl-h1:has(+ .mdl-blank),
+.mdl-h2:has(+ .mdl-blank),
+.mdl-h3:has(+ .mdl-blank),
+.mdl-h4:has(+ .mdl-blank),
+.mdl-h5:has(+ .mdl-blank),
+.mdl-h6:has(+ .mdl-blank) {
+  margin-bottom: 0;
+}
+
+.mdl-h1 {
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 0.3em;
+  font-size: 2em;
+}
+
+.mdl-h2 {
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 0.3em;
+  font-size: 1.5em;
+}
+
+.mdl-h3 {
+  font-size: 1.25em;
+}
+
+.mdl-h4 {
+  font-size: 1em;
+}
+
+.mdl-h5 {
+  font-size: 0.875em;
+}
+
+.mdl-h6 {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.mdl-quote {
+  border-left: 0.25em solid var(--line-hi);
+  padding-left: 1em;
+  color: var(--muted);
+}
+
+.mdl-li {
+  padding-left: 2px;
+}
+
+.mdl-bullet {
+  color: var(--muted);
+}
+
+.mdl-code {
+  border-radius: var(--r-sm);
+  padding: 0.2em 0.4em;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+
+/* Fenced blocks are one line div each; the run of them reads as a single slab,
+   rounded only where the run starts and ends. */
+.mdl-code-line {
+  padding: 0 16px;
+  background: var(--input-bg);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.85em;
+  line-height: 1.45;
+}
+
+.mdl-line:not(.mdl-code-line) + .mdl-code-line,
+.mdl-editor > .mdl-code-line:first-child {
+  border-top-left-radius: var(--r-sm);
+  border-top-right-radius: var(--r-sm);
+  padding-top: 8px;
+}
+
+.mdl-code-line:not(:has(+ .mdl-code-line)) {
+  border-bottom-left-radius: var(--r-sm);
+  border-bottom-right-radius: var(--r-sm);
+  padding-bottom: 8px;
+}
+
+.mdl-strike {
+  color: var(--subtle);
+  text-decoration: line-through;
+}
+
+.mdl-link {
+  color: var(--info-text);
+}
+
+.mdl-url {
+  color: var(--subtle);
+}
+
+.mdl-hr {
+  color: var(--subtle);
 }
 
 .sidebar-header-actions {
@@ -3254,6 +5592,134 @@ button.conversation-line-header:disabled {
   padding: 10px 12px 11px;
   background: var(--panel-strong);
   box-shadow: 0 -10px 16px -10px rgba(0, 0, 0, 0.45);
+}
+
+.sidebar-attention-footer {
+  display: grid;
+  gap: 6px;
+  margin: 10px 4px 0 0;
+  border: 1px solid var(--warn-text);
+  border-radius: var(--r-lg);
+  padding: 9px 10px 10px;
+  background: var(--warn-wash);
+  box-shadow: 0 -10px 16px -10px rgba(0, 0, 0, 0.45);
+}
+
+.sidebar-attention-footer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--warn-text);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+.sidebar-attention-footer-heading {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+
+.sidebar-attention-footer-heading svg {
+  flex: 0 0 auto;
+}
+
+.sidebar-attention-mark-all {
+  flex: 0 0 auto;
+  border: none;
+  border-radius: var(--r-sm);
+  padding: 3px 5px;
+  background: transparent;
+  color: var(--warn-text);
+  font: inherit;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+
+.sidebar-attention-mark-all:hover,
+.sidebar-attention-mark-all:focus-visible {
+  background: rgba(10, 13, 18, 0.2);
+}
+
+.sidebar-attention-footer-list {
+  display: grid;
+  gap: 2px;
+  max-height: 96px;
+  overflow-y: auto;
+}
+
+.sidebar-attention-footer-item {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  overflow: hidden;
+}
+
+.sidebar-attention-footer-item:hover {
+  background: rgba(10, 13, 18, 0.2);
+}
+
+.sidebar-attention-footer-open {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 6px;
+  border: none;
+  padding: 4px 2px 4px 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-attention-mark-read {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 25px;
+  height: 25px;
+  border: none;
+  border-radius: var(--r-sm);
+  padding: 0;
+  background: transparent;
+  color: var(--warn-text);
+  cursor: pointer;
+}
+
+.sidebar-attention-mark-read:hover,
+.sidebar-attention-mark-read:focus-visible {
+  background: rgba(10, 13, 18, 0.28);
+  color: var(--text);
+}
+
+.sidebar-attention-footer-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--warn-text);
+}
+
+.sidebar-attention-footer-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.sidebar-attention-footer-workspace {
+  flex: 0 0 auto;
+  color: var(--subtle);
+  font-size: 10px;
 }
 
 .usage-card-header {
@@ -3457,7 +5923,10 @@ button.conversation-line-header:disabled {
   z-index: 30;
   display: grid;
   gap: 15px;
-  width: 340px;
+  width: min(390px, calc(100vw - 32px));
+  max-height: min(740px, calc(100dvh - 100px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border: var(--bw) solid var(--line);
   border-radius: var(--r-xl);
   padding: 15px 16px 16px;
@@ -3725,6 +6194,131 @@ button.conversation-line-header:disabled {
   justify-content: center;
 }
 
+/* Codex advertises richer model metadata than a pill can carry. Keep that
+   information visible in compact rows, matching the Codex desktop hierarchy. */
+.codex-model-options {
+  display: grid;
+  max-height: min(310px, 44vh);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--panel-soft) 70%, transparent);
+}
+
+.codex-model-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  gap: 10px;
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 10px 11px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--motion-enter) var(--motion-ease),
+    box-shadow var(--motion-enter) var(--motion-ease);
+}
+
+.codex-model-option:last-child {
+  border-bottom: 0;
+}
+
+.codex-model-option:hover {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.codex-model-option.selected {
+  background: color-mix(in srgb, #c9a24a 13%, transparent);
+  box-shadow: inset 2px 0 #c9a24a;
+}
+
+.codex-model-copy,
+.codex-model-title {
+  display: flex;
+  min-width: 0;
+}
+
+.codex-model-copy {
+  flex-direction: column;
+  gap: 3px;
+}
+
+.codex-model-title {
+  align-items: center;
+  gap: 7px;
+}
+
+.codex-model-title strong {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-model-title em {
+  flex: none;
+  border-radius: var(--r-pill);
+  padding: 1px 6px;
+  background: rgba(201, 162, 74, 0.16);
+  color: #dfbd69;
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 720;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.codex-model-description,
+.codex-model-reasoning {
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.codex-model-reasoning {
+  color: var(--subtle);
+}
+
+.codex-model-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-pill);
+  color: #dfbd69;
+}
+
+.codex-model-option.selected .codex-model-check {
+  border-color: color-mix(in srgb, #c9a24a 62%, transparent);
+  background: color-mix(in srgb, #c9a24a 16%, transparent);
+}
+
+.codex-model-custom {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  justify-self: start;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--subtle);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.codex-model-custom:hover,
+.codex-model-custom.active {
+  color: var(--text);
+}
+
 /* Model row carries a small "custom model" toggle beside its slider. */
 .selector-card-row {
   display: grid;
@@ -3807,8 +6401,14 @@ button.conversation-line-header:disabled {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin: 3px 0 0 24px;
-  padding: 0 0 2px 8px;
+  /* Starts where a thread row's box starts: past the chevron gutter. */
+  margin: 3px 0 0 20px;
+  padding: 0 0 2px;
+}
+
+/* Lines up with the sub-thread rows it pages, which are indented by depth. */
+.subthread-list-more {
+  margin-left: calc(20px + var(--thread-depth, 0) * 13px);
 }
 
 .thread-more-button {
@@ -3836,60 +6436,72 @@ button.conversation-line-header:disabled {
 
 .settings-dialog {
   display: grid;
-  gap: 18px;
-  width: min(560px, calc(100vw - 32px));
-  max-height: calc(100vh - 56px);
-  overflow-y: auto;
+  grid-template-columns: 176px minmax(0, 1fr);
+  grid-template-rows: 64px minmax(0, 1fr);
+  width: calc(100vw - 32px);
+  height: calc(100vh - 32px);
+  max-width: 1080px;
+  max-height: 780px;
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
-  padding: 0 18px 18px;
+  padding: 0;
   background: var(--panel-soft);
   box-shadow: var(--elev-popover);
 }
 
 .settings-header {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  /* Span the dialog's horizontal padding so content scrolls fully behind it. */
-  margin: 0 -18px;
-  padding: 16px 18px 0;
-  background: var(--panel-soft);
-  border-bottom: 1px solid var(--line-soft);
+  display: contents;
 }
 
 .settings-header h2 {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: center;
+  padding-left: 18px;
   margin: 0;
   color: var(--text);
   font-size: 17px;
 }
 
+.settings-header > .ghost-icon-button {
+  z-index: 1;
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: end;
+  margin-right: 10px;
+}
+
 .settings-tabs {
   display: flex;
-  gap: 4px;
-  width: 100%;
-  margin-top: 6px;
+  flex-direction: column;
+  grid-column: 1;
+  grid-row: 2;
+  align-self: stretch;
+  gap: 3px;
+  min-width: 0;
+  padding: 8px;
+  border-top: 1px solid var(--line-soft);
+  border-right: 1px solid var(--line-soft);
+  background: var(--panel);
 }
 
 .settings-tab {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  flex: 1;
-  justify-content: center;
+  flex: 0 0 var(--ctl-h);
+  justify-content: flex-start;
   height: var(--ctl-h);
   padding: 0 10px;
   border: 0;
-  border-bottom: 2px solid transparent;
+  border-left: 2px solid transparent;
+  border-radius: var(--r-sm);
   background: transparent;
   color: var(--subtle);
   font-size: 12.5px;
   font-weight: 600;
+  white-space: nowrap;
   cursor: pointer;
   transition: color 0.12s ease, border-color 0.12s ease;
 }
@@ -3900,20 +6512,54 @@ button.conversation-line-header:disabled {
 
 .settings-tab.active {
   color: var(--text);
-  border-bottom-color: var(--accent-text);
+  border-left-color: var(--accent-text);
+  background: var(--accent-wash);
 }
 
 .settings-panel {
   display: grid;
+  grid-column: 2;
+  grid-row: 1 / -1;
   gap: 18px;
-  /* Keep the dialog a stable height across tabs so switching doesn't resize the window.
-     Taller panels simply grow and scroll within the dialog. */
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   align-content: start;
-  min-height: 360px;
+  padding: 24px 28px 32px;
 }
 
 .settings-panel[hidden] {
   display: none;
+}
+
+@media (max-width: 620px) {
+  .settings-dialog {
+    grid-template-columns: 148px minmax(0, 1fr);
+    grid-template-rows: 56px minmax(0, 1fr);
+    width: calc(100vw - 16px);
+    height: calc(100vh - 16px);
+    border-radius: var(--r-md);
+  }
+
+  .settings-header h2 {
+    padding-left: 14px;
+    font-size: 15px;
+  }
+
+  .settings-tabs {
+    padding: 6px;
+  }
+
+  .settings-tab {
+    gap: 5px;
+    padding: 0 7px;
+    font-size: 12px;
+  }
+
+  .settings-panel {
+    gap: 16px;
+    padding: 18px 16px 26px;
+  }
 }
 
 .settings-field {
@@ -3955,6 +6601,18 @@ button.conversation-line-header:disabled {
   color: var(--subtle);
   font-size: 11px;
   line-height: 1.45;
+}
+
+.settings-inline-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-inline-row .quiet-action,
+.settings-inline-row .ghost-icon-button {
+  height: var(--ctl-h);
 }
 
 .settings-folder-button {
@@ -4057,6 +6715,63 @@ button.conversation-line-header:disabled {
   background: var(--scrim);
   backdrop-filter: blur(3px);
 }
+
+.agent-attention-backdrop {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  display: grid;
+  place-items: start center;
+  padding-top: 13vh;
+  background: color-mix(in srgb, var(--scrim) 88%, transparent);
+  backdrop-filter: blur(5px);
+  -webkit-app-region: no-drag;
+}
+
+.agent-attention-dialog {
+  width: min(540px, calc(100vw - 36px));
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--warning, #d99a36);
+  border-radius: var(--r-lg);
+  padding: 18px;
+  background: var(--overlay);
+  box-shadow: var(--elev-popover);
+}
+
+.agent-attention-dialog.urgent { border-top-color: var(--danger, #ef645f); }
+.agent-attention-kicker { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+.agent-attention-kicker svg { color: var(--warning, #d99a36); }
+.agent-attention-dialog.urgent .agent-attention-kicker svg { color: var(--danger, #ef645f); }
+.agent-attention-kicker small { margin-left: auto; color: var(--subtle); font-weight: 600; text-transform: none; letter-spacing: 0; }
+.agent-attention-source { margin-top: 14px; color: var(--subtle); font-size: 12px; }
+.agent-attention-summary { margin: 5px 0 0; color: var(--text); font-size: 18px; font-weight: 680; line-height: 1.35; }
+.agent-attention-detail { margin: 10px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+.agent-attention-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.agent-attention-actions button { min-height: 34px; border: 1px solid var(--line); border-radius: var(--r-md); padding: 0 12px; background: var(--surface-raised); color: var(--text); cursor: pointer; }
+.agent-attention-actions button:hover { border-color: var(--line-strong); }
+.agent-attention-actions button.primary { border-color: var(--accent-edge-strong); background: var(--accent); color: var(--accent-contrast, white); }
+.agent-attention-actions button.quiet { margin-left: auto; color: var(--muted); }
+
+.agent-attention-minimized {
+  position: fixed;
+  z-index: 79;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  border: 1px solid var(--danger, #ef645f);
+  border-radius: 999px;
+  padding: 0 14px;
+  background: var(--overlay);
+  color: var(--text);
+  box-shadow: var(--elev-popover);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.agent-attention-minimized svg { color: var(--danger, #ef645f); }
 
 .quick-start-dialog {
   display: grid;
@@ -4248,7 +6963,7 @@ button.conversation-line-header:disabled {
 }
 
 .quick-start-settings .selector-card {
-  width: min(340px, calc(100vw - 72px));
+  width: min(390px, calc(100vw - 72px));
 }
 
 .quick-start-input {
@@ -4905,7 +7620,29 @@ button.conversation-line-header:disabled {
     grid-row: 3;
   }
 
-  .btw-resizer {
+  /* Same for the browser: two slivers side by side are worse than a pane under
+     the conversation. */
+  .workspace.with-browser {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-rows: auto minmax(0, 1fr) minmax(0, 0.85fr);
+  }
+
+  .workspace.with-browser > .browser-dock {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .workspace.with-browser.with-btw {
+    grid-template-rows: auto minmax(0, 1fr) minmax(0, 0.85fr) minmax(0, 0.85fr);
+  }
+
+  .workspace.with-browser.with-btw > .btw-panel {
+    grid-column: 1;
+    grid-row: 4;
+  }
+
+  .btw-resizer,
+  .browser-resizer {
     display: none;
   }
 }
@@ -5119,19 +7856,22 @@ button.conversation-line-header:disabled {
   display: block;
   width: 100%;
   min-width: 0;
-  height: 62px;
-  min-height: 62px;
-  max-height: 200px;
+  /* Every metric here mirrors `.prompt-composer textarea` — the two fields sit
+     side by side on the same baseline, so any difference in height, type size or
+     padding reads as a misalignment rather than as a second control. */
+  height: 72px;
+  min-height: 72px;
+  max-height: 220px;
   resize: vertical;
   border: var(--bw) solid var(--line);
   border-radius: var(--r-md);
   outline: 0;
   /* Right padding reserves room for the FAB — see `.prompt-composer textarea`. */
-  padding: 10px 46px 10px 12px;
+  padding: 13px 52px 13px 14px;
   background: var(--input-bg);
   color: var(--text);
-  font-size: 13px;
-  line-height: 1.4;
+  font-size: 14px;
+  line-height: 1.45;
   transition:
     border-color var(--motion-enter) var(--motion-ease),
     box-shadow var(--motion-enter) var(--motion-ease);
@@ -5142,14 +7882,12 @@ button.conversation-line-header:disabled {
   box-shadow: var(--focus-ring);
 }
 
-/* Inherits every state from `.composer-fab--send`; only the smaller control
-   size differs, because the panel column is narrower than the main composer. */
+/* Inherits every state and size from `.composer-fab--send`; only the offsets are
+   restated, because this container carries the composer's bottom padding while
+   `.composer-input-row` does not — 12px of padding + the same 9px inset. */
 .btw-send {
-  right: 8px;
-  bottom: 20px;
-  width: var(--ctl-h-sm);
-  min-width: var(--ctl-h-sm);
-  height: var(--ctl-h-sm);
+  right: 9px;
+  bottom: 21px;
 }
 
 /* Workspace git status drawer */
@@ -5165,7 +7903,7 @@ button.conversation-line-header:disabled {
 .git-drawer {
   display: flex;
   flex-direction: column;
-  width: min(420px, 86vw);
+  width: min(560px, 92vw);
   height: 100%;
   background: var(--sidebar);
   border-right: 1px solid var(--line);
@@ -5282,6 +8020,12 @@ button.conversation-line-header:disabled {
   gap: 7px;
 }
 
+/* `display: flex` outranks the `hidden` attribute's UA `display: none`, so a
+   section hidden by an attribute would otherwise stay on screen. */
+.git-section[hidden] {
+  display: none;
+}
+
 .git-section-head {
   display: flex;
   align-items: baseline;
@@ -5326,6 +8070,88 @@ button.conversation-line-header:disabled {
   margin: 0;
   color: var(--subtle);
   font-size: 12px;
+}
+
+/* "Am I in sync with the remote?" — the answer, and how stale the answer is. */
+.git-sync {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--panel-strong);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.git-sync-dot {
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.git-sync-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-sync-age {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--subtle);
+  font-size: 11px;
+}
+
+.git-sync-chip {
+  font-size: 11px;
+  border-radius: var(--r-pill);
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+
+.git-sync-synced {
+  color: var(--run-text);
+  background: var(--run-wash);
+}
+
+.git-sync-ahead,
+.git-sync-behind,
+.git-sync-diverged {
+  color: var(--warn-text);
+  background: var(--warn-wash);
+}
+
+.git-sync-diverged {
+  color: var(--danger-text);
+  background: var(--danger-wash);
+}
+
+.git-sync-unknown {
+  color: var(--subtle);
+  background: var(--panel-strong);
+}
+
+/* The banner keeps the panel background; only its dot and text take the tone. */
+.git-sync.git-sync-synced,
+.git-sync.git-sync-ahead,
+.git-sync.git-sync-behind,
+.git-sync.git-sync-diverged,
+.git-sync.git-sync-unknown {
+  background: var(--panel-strong);
+}
+
+.git-remote-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
 }
 
 .git-list {
@@ -5397,6 +8223,244 @@ button.conversation-line-header:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 100%;
+}
+
+/* ---- Git drawer: Status / History / Files ------------------------------ */
+
+.git-drawer-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--line-soft);
+  flex-shrink: 0;
+}
+
+.git-drawer-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.git-drawer-tab:hover {
+  color: var(--text);
+}
+
+.git-drawer-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent-text, var(--green));
+}
+
+/* ---- Commit history ---------------------------------------------------- */
+
+.git-log-row {
+  gap: 4px;
+  padding: 6px 7px;
+}
+
+.git-log-subject {
+  font-size: 13px;
+  line-height: 1.32;
+  color: var(--text);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  max-width: 100%;
+}
+
+.git-log-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* The SHA is the one thing here worth taking with you, so it is the button. */
+.git-log-hash {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: var(--panel-strong);
+  border: none;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  color: var(--info-text);
+  cursor: pointer;
+}
+
+.git-log-hash:hover {
+  color: var(--text);
+}
+
+.git-log-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 8px;
+}
+
+/* ---- GitHub Actions ---------------------------------------------------- */
+
+.git-actions-head .ghost-icon-button {
+  margin-left: auto;
+}
+
+.git-action-row {
+  padding: 0;
+}
+
+.git-action-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px;
+  border-radius: var(--r-sm);
+  color: inherit;
+  text-decoration: none;
+}
+
+.git-action-link:hover {
+  background: var(--hover-wash);
+}
+
+.git-action-status {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--panel-strong);
+}
+
+.git-action-status-success,
+.git-action-result-success { color: var(--run-text); }
+.git-action-status-failure,
+.git-action-result-failure { color: var(--danger-text); }
+.git-action-status-active,
+.git-action-result-active { color: var(--warn-text); }
+.git-action-status-neutral,
+.git-action-result-neutral { color: var(--muted); }
+
+.git-action-status-active svg {
+  animation: spin 1.4s linear infinite;
+}
+
+.git-action-copy {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  gap: 3px;
+}
+
+.git-action-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.git-action-copy .git-log-meta {
+  color: var(--subtle);
+  font-size: 11px;
+}
+
+.git-action-result {
+  flex-shrink: 0;
+  font-size: 11px;
+  text-transform: capitalize;
+}
+
+.git-actions-more {
+  align-self: center;
+  margin-top: 8px;
+}
+
+.git-actions-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+/* ---- Workspace file tree ----------------------------------------------- */
+
+.git-tree-row {
+  position: relative;
+  padding-right: 60px;
+}
+
+.git-tree-toggle,
+.git-tree-leaf {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-size: 13px;
+  text-align: left;
+}
+
+.git-tree-toggle,
+.git-tree-doc {
+  cursor: pointer;
+}
+
+/* A file the reader can open reads as clickable; every other file is inert
+   text with its actions in the hover row. */
+.git-tree-doc:hover .git-tree-name {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Files line up with the folder names above them, not with their chevrons. */
+.git-tree-toggle-gap {
+  width: 12px;
+  flex-shrink: 0;
+}
+
+.git-tree-toggle svg.rotated {
+  transform: rotate(90deg);
+}
+
+.git-tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* Ignored and .git are shown, not hidden: knowing a folder exists but is out of
+   git's sight is worth more than a shorter list. */
+.git-tree-row.is-ignored .git-tree-name,
+.git-tree-row.is-ignored svg {
+  opacity: 0.45;
+}
+
+.git-tree-row:hover .files-row-actions,
+.git-tree-row:focus-within .files-row-actions {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 /* ---- Changed files drawer ---------------------------------------------- */
@@ -5518,8 +8582,20 @@ button.conversation-line-header:disabled {
   font-variant-numeric: tabular-nums;
 }
 
+/* Pulled out to the drawer's padding edge so a row's content spans the same
+   width as the summary bar above it, and given room to breathe now that each
+   row is two lines tall. */
 .files-row {
-  gap: 8px;
+  position: relative;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 0 -6px;
+  padding: 6px;
+}
+
+/* The status letter caps at the file name's line, not the middle of the stack. */
+.files-row .git-code {
+  margin-top: 1px;
 }
 
 .files-row.gone .files-name {
@@ -5527,9 +8603,31 @@ button.conversation-line-header:disabled {
   text-decoration: line-through;
 }
 
+/* File name and its folder stack, so the folder gets the row's full width
+   instead of competing with the name for it — a truncated `.../foo.test.ts`
+   never says which feature it belongs to. */
 .files-name {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.files-file {
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The folder's tail identifies it best, so long paths truncate from the left:
+   `direction: rtl` puts the ellipsis at the start, and the inner span restores
+   ltr so the path itself still reads normally. */
+.files-dir {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--subtle);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -5537,35 +8635,47 @@ button.conversation-line-header:disabled {
   text-align: left;
 }
 
-/* The path is what identifies a row, and its tail identifies it best, so long
-   paths truncate from the left: `direction: rtl` puts the ellipsis at the start,
-   and the inner span restores ltr so the path itself still reads normally. */
-.files-name-inner {
+.files-dir-inner {
   direction: ltr;
   unicode-bidi: embed;
 }
 
-.files-dir {
-  color: var(--subtle);
-}
-
+/* Fixed column widths so +/− stack into two readable columns down the list
+   rather than drifting with each number's length. */
 .files-counts {
   display: flex;
-  gap: 6px;
+  justify-content: flex-end;
+  gap: 8px;
   flex-shrink: 0;
   font-size: 12px;
+  line-height: 1.4;
 }
 
+.files-counts .files-add,
+.files-counts .files-del {
+  min-width: 38px;
+  text-align: right;
+}
+
+/* Sits in the counts column, so it keeps that column's width. */
 .files-binary {
   flex-shrink: 0;
+  min-width: 84px;
+  text-align: right;
   font-size: 11px;
+  line-height: 1.5;
   color: var(--subtle);
 }
 
+/* Same footprint as the two hover buttons that replace them, so nothing shifts
+   and both land on the row's right edge. */
 .files-blips {
   display: flex;
+  justify-content: flex-end;
   gap: 2px;
   flex-shrink: 0;
+  min-width: 62px;
+  margin-top: 4px;
 }
 
 .files-blip {
@@ -5583,16 +8693,31 @@ button.conversation-line-header:disabled {
   background: var(--danger-text);
 }
 
+/* Lifted out of the flow: reserving a slot for buttons that are usually
+   invisible left a dead gutter on the right and stopped the counts from
+   reaching the row's edge. On hover they sit over the blips instead. */
 .files-row-actions {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
   display: flex;
   gap: 2px;
-  flex-shrink: 0;
   opacity: 0;
+  pointer-events: none;
 }
 
 .files-row:hover .files-row-actions,
 .files-row:focus-within .files-row-actions {
   opacity: 1;
+  pointer-events: auto;
+}
+
+/* The blips and the buttons share the right edge; hovering trades the shape of
+   the change for the actions on it. */
+.files-row:hover .files-blips,
+.files-row:focus-within .files-blips {
+  opacity: 0;
 }
 
 .git-code.tone-run {
@@ -5893,3 +9018,1513 @@ button.conversation-line-header:disabled {
   font-size: 11px;
   line-height: 1.45;
 }
+
+/* ---- Workspace backlog -------------------------------------------------
+   The kanban board a workspace's right-click menu opens. A centred sheet
+   rather than a drawer: three columns need the width, and unlike the git
+   drawer it is a place you work in rather than a thing you glance at. */
+
+.backlog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: var(--scrim);
+}
+
+.backlog-board {
+  display: flex;
+  flex-direction: column;
+  width: min(1180px, 100%);
+  height: min(760px, 100%);
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  box-shadow: var(--elev-popover);
+  overflow: hidden;
+}
+
+.backlog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.backlog-title {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+
+.backlog-title strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.backlog-title span {
+  color: var(--subtle);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backlog-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.backlog-count {
+  color: var(--subtle);
+  font-size: 11px;
+}
+
+/* The count riding the "On hold" switch. Same pill as everywhere else a number
+   sits next to a label, and it inherits the button's own font. */
+.backlog-head-badge {
+  border-radius: var(--r-pill);
+  padding: 1px 6px;
+  background: var(--hover-wash);
+  color: var(--subtle);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+}
+
+.quiet-action.active .backlog-head-badge {
+  background: var(--accent-wash-strong);
+  color: var(--accent-text-hi);
+}
+
+.backlog-error {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--danger-edge);
+  background: var(--danger-wash);
+  color: var(--danger-text);
+  font-size: 11px;
+}
+
+.backlog-columns {
+  display: grid;
+  /* Derived from how many columns actually render rather than hardcoded, because
+     Pending comes and goes with its contents — a fixed `repeat(3)` wraps the
+     fourth column onto a second row the moment automation files something. */
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 1px;
+  flex: 1;
+  min-height: 0;
+  background: var(--line-soft);
+}
+
+.backlog-column {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel-soft);
+  transition: background var(--motion-enter) var(--motion-ease);
+}
+
+.backlog-column.is-drop-target {
+  background: var(--accent-wash);
+}
+
+.backlog-column-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.backlog-column-head em {
+  color: var(--subtle);
+  font-style: normal;
+  font-weight: 600;
+}
+
+.backlog-column-head button {
+  margin-left: auto;
+}
+
+.backlog-column-body {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex: 1;
+  min-height: 0;
+  padding: 10px;
+  overflow-y: auto;
+}
+
+.backlog-empty {
+  padding: 10px 2px;
+  color: var(--placeholder);
+  font-size: 12px;
+}
+
+/* Deliberately tight: the board is a place you scan, and how many cards a
+   column shows at once matters more than how much of each one you can read —
+   the card's own view is one click away. */
+.backlog-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 9px 11px;
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  box-shadow: var(--elev-card);
+  cursor: pointer;
+  transition: background var(--motion-enter) var(--motion-ease), border-color var(--motion-enter) var(--motion-ease);
+}
+
+.backlog-card:hover {
+  border-color: var(--line-hi);
+  background: var(--panel-hover);
+}
+
+.backlog-card.is-dragging {
+  opacity: 0.45;
+}
+
+/* ⌘/⌥-clicked: picked for a session, not opened. */
+.backlog-card.is-selected {
+  border-color: var(--accent-edge-strong);
+  background: var(--accent-wash);
+}
+
+.backlog-card.is-selected:hover {
+  border-color: var(--accent-edge-strong);
+  background: var(--accent-wash-strong);
+}
+
+/* Parked: on screen only because the user asked to see it, so it reads as
+   set-aside rather than as work — dashed edge, no card shadow, dimmed until
+   pointed at. Selection and focus still win over it, since those say something
+   about right now. */
+.backlog-card.is-on-hold {
+  border-style: dashed;
+  box-shadow: none;
+  background: var(--panel-soft);
+  opacity: 0.72;
+}
+
+.backlog-card.is-on-hold:hover {
+  opacity: 1;
+}
+
+/* The chip that names it, on the card and in the card's breadcrumb. Sized like
+   the author pill it sits beside rather than like the text around it. */
+.backlog-hold-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  border-radius: var(--r-pill);
+  padding: 2px 8px 2px 6px;
+  background: var(--hover-wash);
+  color: var(--subtle);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+/* Two lines at most, same as the summary: a long title used to set the height
+   of every other card in the column. */
+.backlog-card-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+/* The card's number, leading its title. Muted and tabular: it is how you say
+   the card out loud and type it into the composer, not the point of the card. */
+.backlog-card-number {
+  margin-right: 6px;
+  color: var(--subtle);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+/* One line: the TL;DR earns its place on the card only as long as it cannot
+   push the card's height around. */
+.backlog-card-summary {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.backlog-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  color: var(--subtle);
+  font-size: 11px;
+}
+
+/* Font size is set here rather than inherited from the card's footer: the same
+   pill also renders in the task detail's sidebar, where the surrounding text is
+   larger — and a section title in a badge is a label, not a heading. It stays on
+   one line and elides, since a card filed by a section with a long title used to
+   turn the badge into a three-line paragraph. */
+.backlog-author {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  border-radius: var(--r-pill);
+  padding: 2px 8px 2px 6px;
+  background: var(--hover-wash);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+.backlog-author svg {
+  flex-shrink: 0;
+}
+
+.backlog-author-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.backlog-author.agent {
+  background: var(--agent-wash);
+  color: var(--agent-text);
+}
+
+.backlog-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backlog-editor-backdrop {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--scrim);
+}
+
+.backlog-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: min(560px, 100%);
+  padding: 22px;
+  background: var(--overlay);
+  background-image: var(--overlay-sheen);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--elev-popover);
+}
+
+.backlog-field {
+  display: grid;
+  gap: 7px;
+}
+
+.backlog-field-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.backlog-input {
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--input-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.backlog-input:focus-visible {
+  outline: none;
+  border-color: var(--accent-edge-strong);
+  box-shadow: var(--focus-ring);
+}
+
+.backlog-textarea {
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.backlog-select {
+  width: auto;
+  height: var(--ctl-h-sm);
+  padding: 0 8px;
+}
+
+.backlog-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.backlog-editor-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Card highlighted because the user arrived from its own view. */
+.backlog-card.is-focused {
+  border-color: var(--accent-edge-strong);
+  box-shadow:
+    var(--elev-card),
+    0 0 0 1px var(--accent-edge-strong);
+}
+
+.backlog-sections,
+.backlog-attachments {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: var(--r-pill);
+  padding: 2px 8px 2px 6px;
+  background: var(--hover-wash);
+}
+
+/* ---- One task, in full --------------------------------------------------
+   The card as a page rather than a form: room to read a description, and
+   fields that are text until clicked. Used by the board (over its columns)
+   and on its own, over the app, when a link or a section opens a task. */
+
+.task-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 72;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  background: var(--scrim);
+}
+
+/* Inside the board, the same view is contained by it. */
+.task-backdrop.is-inset {
+  position: absolute;
+  z-index: 1;
+  padding: 28px;
+}
+
+/* Do not clip or promote this outer shell. Chromium can retain stale tiles
+   when a promoted overflow scroller moves beneath a rounded clipping layer;
+   long cards then paint old description/verification text over the live
+   scroll position. The header and the two body panes own their corner radii
+   instead, so the shell never participates in the scrolling paint path. */
+.task-detail {
+  display: flex;
+  flex-direction: column;
+  width: min(900px, 100%);
+  max-height: min(680px, 100%);
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  box-shadow: var(--elev-popover);
+}
+
+.task-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+  border-radius: var(--r-xl) var(--r-xl) 0 0;
+  background: var(--panel);
+}
+
+.task-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--subtle);
+  font-size: 11px;
+}
+
+.task-breadcrumb code {
+  color: var(--placeholder);
+  font-size: 10.5px;
+}
+
+.task-breadcrumb-sep {
+  color: var(--placeholder);
+}
+
+.task-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.task-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 250px;
+  flex: 1;
+  min-height: 0;
+}
+
+.task-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 22px 24px 26px;
+  overflow-y: auto;
+  border-radius: 0 0 0 var(--r-xl);
+  background: var(--panel-soft);
+}
+
+/* A long rendered Markdown field is a flex item. The default `flex-shrink: 1`
+   lets it shrink below the height of its table, heading, or list when the card
+   is shorter than the prose; the overflowing ink then gets painted over the
+   following field. Keep every block at its content height and let this pane —
+   the designated scroller — own the overflow instead. */
+.task-main > * {
+  flex-shrink: 0;
+}
+
+.task-side {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 20px 18px;
+  border-left: 1px solid var(--line-soft);
+  border-radius: 0 0 var(--r-xl) 0;
+  background: var(--panel);
+  overflow-y: auto;
+}
+
+.task-side-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+  flex-shrink: 0;
+}
+
+.task-side-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.task-side-empty,
+.task-side-note {
+  margin: 0;
+  color: var(--subtle);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+/* Two columns, not one row: four stages across 214px squeezed "In progress"
+   onto two lines and gave every option a different width. As a 2×2 grid each
+   cell has the same size and a label fits on one line — and the layout is the
+   workflow: backlog → in progress on the top row, review → done on the bottom.
+   The odd fifth cell (Pending, only on a card already in it) just leads. The
+   1px gap on the line color draws the internal borders. */
+.task-status-picker {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--line-soft);
+  overflow: hidden;
+}
+
+.task-status-option {
+  padding: 7px 4px;
+  border: none;
+  background: var(--input-bg);
+  color: var(--muted);
+  font: inherit;
+  font-size: 10.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.task-status-option:hover {
+  background: var(--panel-hover);
+}
+
+.task-status-option.is-current {
+  background: var(--accent-wash-strong);
+  color: var(--accent-text-hi);
+  font-weight: 650;
+}
+
+/* Sits directly under the column picker and matches its metrics, so the two
+   read as one control: which stage, and whether it is parked. */
+.task-hold-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--input-bg);
+  color: var(--muted);
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+  transition: background var(--motion-enter) var(--motion-ease), color var(--motion-enter) var(--motion-ease);
+}
+
+.task-hold-toggle:hover {
+  background: var(--panel-hover);
+  color: var(--text);
+}
+
+.task-hold-toggle.is-held {
+  border-style: dashed;
+  border-color: var(--line-hi);
+  color: var(--text);
+  font-weight: 650;
+}
+
+.task-section-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.task-section-row,
+.section-tasks-list li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.task-section-open,
+.section-tasks-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 5px 7px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.task-section-open:hover:not(:disabled),
+.section-tasks-row:hover {
+  background: var(--hover-wash);
+}
+
+.task-section-open span,
+.section-tasks-row-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-section-row.is-missing .task-section-open {
+  color: var(--placeholder);
+  cursor: default;
+}
+
+.task-section-unlink {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--placeholder);
+  cursor: pointer;
+}
+
+.task-section-unlink:hover {
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+.task-delete {
+  color: var(--danger-text);
+}
+
+.task-delete:hover {
+  border-color: var(--danger-edge);
+  background: var(--danger-wash);
+}
+
+/* Click-to-edit: the closed state has to sit on exactly the same box as the
+   open one, or the text jumps sideways the moment you click it. */
+.inline-field,
+.inline-field-input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font: inherit;
+  background: transparent;
+}
+
+.inline-field {
+  cursor: text;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.inline-field:hover {
+  background: var(--hover-wash);
+}
+
+.inline-field:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.inline-field.is-empty {
+  color: var(--placeholder);
+}
+
+.inline-field-input {
+  background: var(--input-bg);
+  border-color: var(--accent-edge-strong);
+  resize: vertical;
+}
+
+.inline-field-input:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.task-title {
+  font-size: 19px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+/* The TL;DR. Larger and quieter than the body — a lead paragraph, not a field:
+   it is the one line you read before deciding to read the rest. */
+.task-summary {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.task-description {
+  font-size: 13px;
+  line-height: 1.6;
+  min-height: 96px;
+}
+
+/* Markdown in the closed state: the block layout comes from `.formatted-body`,
+   so the field must stop imposing the raw-text one on top of it. */
+.inline-field.is-rendered {
+  white-space: normal;
+}
+
+.task-metadata {
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 168px;
+  overflow-y: auto;
+}
+
+/* Editing it gets more room than reading it, since this is where a long value
+   is actually worked on. */
+textarea.inline-field-input.task-metadata {
+  max-height: none;
+  min-height: 120px;
+}
+
+/* ---- Evidence and verification: proof a card actually got done ----------
+   The gallery goes at the top of the card, right under the TL;DR, because it
+   answers "did this work?" before the description explains what "this" was.
+   The written note stays at the foot, under the description it qualifies. */
+
+.task-evidence {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 6px 0 10px;
+}
+
+/* The label leads a block here rather than following one, so it loses the
+   top margin `.task-main-label` carries for its use under the description. */
+.task-evidence .task-main-label {
+  margin-top: 0;
+}
+
+.task-main-label {
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.task-verification {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.task-verification-notes {
+  font-size: 12.5px;
+  line-height: 1.55;
+  min-height: 44px;
+}
+
+.task-attachment-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 8px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.task-attachment-thumb-wrap {
+  position: relative;
+}
+
+.task-attachment-thumb {
+  position: relative;
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 0;
+  background: var(--input-bg);
+  cursor: zoom-in;
+  transition:
+    border-color var(--motion-enter) var(--motion-ease),
+    transform var(--motion-enter) var(--motion-ease);
+}
+
+.task-attachment-thumb:hover {
+  border-color: var(--accent-edge-strong);
+  transform: translateY(-1px);
+}
+
+.task-attachment-thumb img,
+.task-attachment-thumb video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  background: var(--input-bg);
+}
+
+.task-attachment-play {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+
+.task-attachment-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--motion-enter) var(--motion-ease);
+}
+
+.task-attachment-thumb-wrap:hover .task-attachment-remove {
+  opacity: 1;
+}
+
+.task-attachment-lightbox-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: var(--scrim);
+  backdrop-filter: blur(10px);
+}
+
+.task-attachment-lightbox-dialog {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  width: min(1120px, 94vw);
+  max-height: 92vh;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--r-lg);
+  padding: 12px;
+  background: var(--input-bg);
+  box-shadow: var(--elev-popover);
+  animation: task-attachment-lightbox-in 180ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+@keyframes task-attachment-lightbox-in {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.task-attachment-lightbox-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.task-attachment-lightbox-toolbar > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.task-attachment-lightbox-toolbar strong,
+.task-attachment-lightbox-toolbar span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-attachment-lightbox-toolbar strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.task-attachment-lightbox-toolbar span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.task-attachment-lightbox-dialog > img,
+.task-attachment-lightbox-dialog > video,
+.task-attachment-lightbox-dialog > .video-player > video {
+  display: block;
+  width: 100%;
+  max-height: calc(92vh - 76px);
+  object-fit: contain;
+  border-radius: var(--r-md);
+  background: #000;
+}
+
+/* ---- A section's tasks --------------------------------------------------
+   The topbar's answer to "what is this section for?", and the only way a
+   card gets attached to a conversation the user started by typing. */
+
+.section-tasks-anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.section-tasks-button.has-tasks {
+  border-color: var(--accent-edge);
+  color: var(--accent-text-hi);
+}
+
+.section-tasks-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 300px;
+  max-height: min(70vh, 460px);
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--panel-soft);
+  box-shadow: var(--elev-popover);
+  overflow-y: auto;
+}
+
+.section-tasks-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.section-tasks-row-column {
+  flex-shrink: 0;
+  color: var(--subtle);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.section-tasks-row-column.is-in_progress {
+  color: var(--accent-text);
+}
+
+/* Review is the column that is waiting on the *user*, so it reads a step
+   louder than in-progress — this chip was unstyled before, and a card handed
+   back for sign-off looked exactly like one nobody had started. */
+.section-tasks-row-column.is-review {
+  color: var(--accent-text-hi);
+  font-weight: 650;
+}
+
+.section-tasks-row-column.is-on-hold {
+  color: var(--placeholder);
+}
+
+.section-tasks-empty {
+  margin: 0;
+  color: var(--subtle);
+  font-size: 11.5px;
+}
+
+.section-tasks-link {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.schedule-board {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, 100%);
+  height: min(700px, 100%);
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  box-shadow: var(--elev-popover);
+  overflow: hidden;
+}
+
+.schedule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  padding: 10px;
+  overflow-y: auto;
+}
+
+.schedule-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  box-shadow: var(--elev-card);
+  cursor: pointer;
+}
+
+.schedule-row:hover {
+  border-color: var(--line-hi);
+  background: var(--panel-hover);
+}
+
+.schedule-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.schedule-row-title {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.schedule-row-prompt {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-row-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.schedule-cadence {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent-text);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.schedule-cadence.is-disabled {
+  color: var(--subtle);
+  font-weight: 500;
+}
+
+.schedule-frequency-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.schedule-frequency-input {
+  flex: 1;
+}
+
+.schedule-enabled-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ---- This machine ---------------------------------------------------------
+   The drawer that answers "can I start a build right now?". It borrows the git
+   drawer's shell (backdrop, head, body) and adds two things of its own: meters,
+   and a process list whose rows can name the section that owns them. */
+
+/* Wider than the git drawer it borrows its chrome from: this one carries argv
+   lines and four meters, and at 560px every one of them was an ellipsis. */
+.git-drawer.machine-drawer {
+  width: min(880px, 96vw);
+}
+
+.machine-tabs {
+  padding: 0;
+  margin: 2px 0 10px;
+}
+
+.machine-tabs .git-drawer-tab em {
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border-radius: var(--r-pill);
+  background: var(--panel-strong);
+  color: var(--subtle);
+}
+
+.machine-verdict {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--panel-strong);
+  padding: 9px 11px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.machine-verdict.quiet {
+  border-color: var(--run-edge);
+  background: var(--run-wash);
+  color: var(--run-text);
+}
+
+.machine-verdict.busy {
+  border-color: var(--warn-edge);
+  background: var(--warn-wash);
+  color: var(--warn-text);
+}
+
+.machine-verdict.loaded {
+  border-color: var(--danger-edge);
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+/* Four one-line facts. Fixed columns, never auto-fit: auto-fit picked three and
+   left the fourth meter stranded on its own row, which is what made the bars
+   look broken. One row of four when the drawer is at full width, 2x2 when it
+   is not. */
+.machine-meters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px 16px;
+  margin: 10px 0 6px;
+}
+
+@media (max-width: 1000px) {
+  .machine-meters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.machine-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.machine-meter-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.machine-meter-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.machine-meter-label svg {
+  color: var(--subtle);
+}
+
+.machine-meter-head strong {
+  font-size: 13px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.machine-meter-track {
+  height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--panel-strong);
+  overflow: hidden;
+}
+
+.machine-meter-fill {
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--muted);
+  transition: width var(--motion-enter) var(--motion-ease);
+}
+
+.machine-meter-fill.ok {
+  background: var(--run-text);
+}
+
+.machine-meter-fill.warn {
+  background: var(--warn-text);
+}
+
+.machine-meter-fill.danger {
+  background: var(--danger-text);
+}
+
+.machine-meter-detail {
+  font-size: 11px;
+  color: var(--subtle);
+}
+
+.machine-process-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* name · share bar · the ranked number · the other number · owner · pid */
+.machine-process {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(64px, 1fr) 62px 56px minmax(0, 1fr) 46px;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px;
+  border-radius: var(--r-sm);
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.machine-process-bar {
+  height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--panel-strong);
+  overflow: hidden;
+}
+
+.machine-process-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--accent-text, var(--muted));
+  opacity: 0.75;
+  transition: width var(--motion-enter) var(--motion-ease);
+}
+
+.machine-process:hover {
+  background: var(--hover-wash);
+}
+
+.machine-process .machine-process-pid {
+  font-size: 10.5px;
+  color: var(--subtle);
+  white-space: nowrap;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.machine-process-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.machine-process-metric {
+  color: var(--subtle);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The axis the list is ranked by, so the eye lands on it and not on the
+   secondary number sitting next to it. */
+strong.machine-process-metric.primary {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.machine-process-owner {
+  min-width: 0;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--accent-text);
+}
+
+/* The two machine-wide levers: pause every section, kill every command. */
+.machine-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.machine-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  flex: 1;
+  padding: 6px 8px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--edge);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.machine-action:not(:disabled):hover {
+  background: var(--hover-wash);
+}
+
+.machine-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Armed = the next click fires it, so it stops looking like the rest of the UI. */
+.machine-action.armed {
+  border-color: var(--danger-edge);
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+.machine-command-group + .machine-command-group {
+  margin-top: 8px;
+}
+
+.machine-command-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 6px;
+  font-size: 11px;
+  color: var(--accent-text);
+}
+
+.machine-command-group-head > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.machine-command-group-head .machine-action {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  font-size: 10.5px;
+}
+
+/* argv, cost, pid, kill — one row, because the section that owns it is already
+   the heading above and repeating it was most of the old row's height. */
+.machine-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto 20px;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px;
+  border-radius: var(--r-sm);
+}
+
+.machine-command:hover {
+  background: var(--hover-wash);
+}
+
+.machine-command-cost {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.machine-command .machine-process-pid {
+  font-size: 10.5px;
+  color: var(--subtle);
+  white-space: nowrap;
+}
+
+/* argv, monospaced and clipped: the useful half of a command is its start. */
+.machine-command-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.machine-command-kill {
+  flex: 0 0 auto;
+  opacity: 0;
+}
+
+.machine-command:hover .machine-command-kill,
+.machine-command-kill:focus-visible {
+  opacity: 1;
+}
+
+/* Shared model browser: identical hierarchy in settings and both session pickers. */
+.model-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.model-panel-heading > div { display: grid; gap: 3px; }
+.model-panel-heading strong { font-size: 13px; font-weight: 650; }
+.model-panel-heading span, .model-browser-count { color: var(--muted); font-size: 10.5px; }
+.model-browser { min-width: 0; }
+.model-browser-search { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); color: var(--muted); background: var(--input-bg); }
+.model-browser-search:focus-within { border-color: var(--accent); }
+.model-browser-search input { flex: 1; min-width: 0; width: 100%; padding: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: 12px; }
+.model-browser-search button { display: flex; padding: 2px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.model-browser .codex-model-options { max-height: min(270px, 32dvh); padding: 4px; gap: 2px; border: 0; background: var(--panel-soft); scrollbar-width: thin; }
+.model-browser .codex-model-option { border: 0; border-radius: var(--r-md); padding: 10px; }
+.model-browser .codex-model-option.selected { box-shadow: none; }
+.model-browser .codex-model-option:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.model-browser .codex-model-title strong { font-size: 12px; }
+.model-browser .codex-model-description { font-size: 11px; line-height: 1.45; }
+.model-browser .codex-model-custom { padding: 3px 0; color: var(--muted); font-size: 11px; }
+.model-browser-empty { padding: 14px 10px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.runtime-defaults .model-browser .codex-model-options { max-height: 270px; }
+
+.model-settings-heading h3 { margin: 0 0 5px; font-size: 15px; }
+.model-settings-heading p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.5; }
+.model-settings-tabs { display: flex; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--panel-soft); }
+.model-settings-tabs button { flex: 1; border: 0; border-radius: var(--r-md); padding: 9px 12px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+.model-settings-tabs button[aria-selected="true"] { background: var(--overlay); color: var(--text); box-shadow: var(--elev-popover); }
+.model-settings-tabs button:focus-visible { outline: 2px solid var(--accent); }

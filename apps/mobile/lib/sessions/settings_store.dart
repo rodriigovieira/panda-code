@@ -1,5 +1,7 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import '../dictation/dictation_service.dart';
+
 /// How long the app may stay in the background before Face ID is required
 /// again on return. [immediate] re-locks the moment the app is left.
 enum AutoLockDelay {
@@ -43,6 +45,9 @@ enum AppThemeMode {
 
 /// Device-local app preferences (not synced through the relay).
 class AppSettings {
+  /// Where the document reader starts: the transcript's 14pt body plus two.
+  static const double defaultDocFontSize = 16;
+
   /// Brass — the shared design system's one accent. When [accentColor] equals this,
   /// the app uses the design tokens verbatim rather than deriving an override, so
   /// the default experience is exactly what was designed.
@@ -51,8 +56,33 @@ class AppSettings {
   /// Multiplier applied to chat transcript text (1.0 = system default).
   final double chatTextScale;
 
+  /// Base point size for the document reader's prose. Its own setting rather
+  /// than the chat scale: a document is read at length, so it starts two points
+  /// above the transcript's 14 and is adjusted from the reader itself.
+  final double docFontSize;
+
   /// When true, Face ID (or the device passcode) is required to view the app.
   final bool appLockEnabled;
+
+  /// When true, starting a full-access (bypass permissions) session requires
+  /// a fresh Face ID (or passcode) confirmation. On by default.
+  final bool bypassBiometricEnabled;
+
+  /// Stream dictation diagnostics to the relay. Off by default. Carries event
+  /// names and character counts only — never transcript text — and exists to
+  /// debug the transcript-erasing bug from a real device.
+  final bool dictationDiagnostics;
+
+  /// Stream frame-jank samples and hand-picked operation timings (decrypt
+  /// batches, tile builds) to the relay. On by default — unlike dictation
+  /// diagnostics, this never carries transcript content, only durations and
+  /// counts, and exists to debug "feels laggy" reports that can't be
+  /// reproduced off-device.
+  final bool perfDiagnostics;
+
+  /// Language dictation decodes speech as, e.g. `en-US`. Deliberately not the
+  /// phone's language — see [DictationLocale].
+  final String dictationLocale;
 
   /// Grace period before a backgrounded app re-locks.
   final AutoLockDelay autoLockDelay;
@@ -89,8 +119,13 @@ class AppSettings {
   final bool notifyOnError;
 
   const AppSettings({
+    this.dictationDiagnostics = false,
+    this.perfDiagnostics = true,
+    this.dictationLocale = DictationLocale.fallback,
     this.chatTextScale = 1.0,
+    this.docFontSize = defaultDocFontSize,
     this.appLockEnabled = true,
+    this.bypassBiometricEnabled = true,
     this.autoLockDelay = AutoLockDelay.immediate,
     this.themeMode = AppThemeMode.dark,
     this.accentColor = defaultAccentColor,
@@ -111,8 +146,13 @@ class AppSettings {
   });
 
   AppSettings copyWith({
+    bool? dictationDiagnostics,
+    bool? perfDiagnostics,
+    String? dictationLocale,
     double? chatTextScale,
+    double? docFontSize,
     bool? appLockEnabled,
+    bool? bypassBiometricEnabled,
     AutoLockDelay? autoLockDelay,
     AppThemeMode? themeMode,
     int? accentColor,
@@ -133,7 +173,14 @@ class AppSettings {
   }) =>
       AppSettings(
         chatTextScale: chatTextScale ?? this.chatTextScale,
+        docFontSize: docFontSize ?? this.docFontSize,
         appLockEnabled: appLockEnabled ?? this.appLockEnabled,
+        bypassBiometricEnabled:
+            bypassBiometricEnabled ?? this.bypassBiometricEnabled,
+        dictationDiagnostics:
+            dictationDiagnostics ?? this.dictationDiagnostics,
+        perfDiagnostics: perfDiagnostics ?? this.perfDiagnostics,
+        dictationLocale: dictationLocale ?? this.dictationLocale,
         autoLockDelay: autoLockDelay ?? this.autoLockDelay,
         themeMode: themeMode ?? this.themeMode,
         accentColor: accentColor ?? this.accentColor,
@@ -162,7 +209,12 @@ class SettingsStore {
   );
 
   static const _kChatTextScale = 'pc.chatTextScale';
+  static const _kDocFontSize = 'pc.docFontSize';
   static const _kAppLockEnabled = 'pc.appLockEnabled';
+  static const _kBypassBiometricEnabled = 'pc.bypassBiometricEnabled';
+  static const _kDictationDiagnostics = 'pc.dictationDiagnostics';
+  static const _kPerfDiagnostics = 'pc.perfDiagnostics';
+  static const _kDictationLocale = 'pc.dictationLocale';
   static const _kAutoLockDelay = 'pc.autoLockDelaySeconds';
   static const _kThemeMode = 'pc.themeMode';
   static const _kAccent = 'pc.accentColor';
@@ -188,6 +240,13 @@ class SettingsStore {
   static double clampChatTextScale(double v) =>
       v.clamp(minChatTextScale, maxChatTextScale);
 
+  /// Allowed document text-size bounds, shared with the reader's adjuster.
+  static const double minDocFontSize = 12;
+  static const double maxDocFontSize = 26;
+
+  static double clampDocFontSize(double v) =>
+      v.roundToDouble().clamp(minDocFontSize, maxDocFontSize);
+
   Future<AppSettings> load() async {
     final all = await _storage.readAll();
     bool flag(String key, bool fallback) {
@@ -198,8 +257,16 @@ class SettingsStore {
     final scale = double.tryParse(all[_kChatTextScale] ?? '');
     return AppSettings(
       chatTextScale: clampChatTextScale(scale ?? 1.0),
+      docFontSize: clampDocFontSize(
+          double.tryParse(all[_kDocFontSize] ?? '') ??
+              AppSettings.defaultDocFontSize),
       // Default ON: the app is protected until the user opts out.
       appLockEnabled: flag(_kAppLockEnabled, true),
+      // Default ON: full-access sessions require Face ID until opted out.
+      bypassBiometricEnabled: flag(_kBypassBiometricEnabled, true),
+      dictationDiagnostics: flag(_kDictationDiagnostics, false),
+      perfDiagnostics: flag(_kPerfDiagnostics, true),
+      dictationLocale: DictationLocale.normalize(all[_kDictationLocale]),
       autoLockDelay:
           AutoLockDelay.fromSeconds(int.tryParse(all[_kAutoLockDelay] ?? '')),
       themeMode: AppThemeMode.fromId(all[_kThemeMode]),
@@ -225,8 +292,23 @@ class SettingsStore {
   Future<void> saveChatTextScale(double scale) => _storage.write(
       key: _kChatTextScale, value: clampChatTextScale(scale).toString());
 
+  Future<void> saveDocFontSize(double size) => _storage.write(
+      key: _kDocFontSize, value: clampDocFontSize(size).toString());
+
   Future<void> saveAppLockEnabled(bool enabled) =>
       _storage.write(key: _kAppLockEnabled, value: enabled.toString());
+
+  Future<void> saveBypassBiometricEnabled(bool enabled) => _storage.write(
+      key: _kBypassBiometricEnabled, value: enabled.toString());
+
+  Future<void> saveDictationDiagnostics(bool enabled) =>
+      _storage.write(key: _kDictationDiagnostics, value: enabled.toString());
+
+  Future<void> savePerfDiagnostics(bool enabled) =>
+      _storage.write(key: _kPerfDiagnostics, value: enabled.toString());
+
+  Future<void> saveDictationLocale(String locale) => _storage.write(
+      key: _kDictationLocale, value: DictationLocale.normalize(locale));
 
   Future<void> saveAutoLockDelay(AutoLockDelay delay) =>
       _storage.write(key: _kAutoLockDelay, value: delay.seconds.toString());

@@ -108,6 +108,7 @@ export async function requireDevice(
   ctx: QueryCtx | MutationCtx,
   deviceId: string,
   token: string,
+  allowPairingReset = false,
 ) {
   const device = await ctx.db
     .query("devices")
@@ -117,6 +118,7 @@ export async function requireDevice(
   if (!(await verifyToken(token, device.tokenHash))) {
     throw new Error("DEVICE_AUTH_FAILED");
   }
+  if (device.resettingPairing && !allowPairingReset) throw new Error("PAIRING_RESET_IN_PROGRESS");
   return device;
 }
 
@@ -134,5 +136,7 @@ export async function requireMobile(
   if (!(await verifyToken(token, mobile.tokenHash))) {
     throw new Error("MOBILE_AUTH_FAILED");
   }
+  const device = await ctx.db.query("devices").withIndex("by_device", q => q.eq("deviceId", mobile.deviceId)).unique();
+  if (!device || device.resettingPairing) throw new Error("PAIRING_RESET_IN_PROGRESS");
   return mobile;
 }

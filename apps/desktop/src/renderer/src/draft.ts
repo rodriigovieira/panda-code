@@ -14,12 +14,48 @@ export function isDraftThread(thread: PersistedThread | undefined): boolean {
 }
 
 /**
+ * Prompt history is a convenience index for `/prompts`, not an archive — the
+ * transcript is the archive. Left uncapped it grew to 6.56 MB across 1690
+ * sections (84% of threads.json), and since the whole store is re-serialized on
+ * every `threads` change, that cost was paid on every keystroke-driven update.
+ * One section had reached 735 prompts; another held 76 prompts in 1.0 MB
+ * because whole pastes were stored verbatim. Hence two limits, not one: a count
+ * and a per-entry text budget.
+ */
+export const MAX_PROMPT_HISTORY_ENTRIES = 50;
+export const MAX_PROMPT_HISTORY_TEXT = 2000;
+
+/**
+ * Applied at the persistence boundary rather than where prompts are appended, so
+ * that sections carrying years of accumulated history shrink on their next write
+ * instead of needing a migration. In-memory state keeps the full list for the
+ * lifetime of the window; only what reaches disk is trimmed.
+ */
+function trimPromptHistory(thread: PersistedThread): PersistedThread {
+  const history = thread.promptHistory;
+  if (!history?.length) return thread;
+
+  const recent = history.length > MAX_PROMPT_HISTORY_ENTRIES ? history.slice(-MAX_PROMPT_HISTORY_ENTRIES) : history;
+  let textTrimmed = false;
+  const trimmed = recent.map((entry) => {
+    if (entry.text.length <= MAX_PROMPT_HISTORY_TEXT) return entry;
+    textTrimmed = true;
+    return { ...entry, text: `${entry.text.slice(0, MAX_PROMPT_HISTORY_TEXT)}…` };
+  });
+
+  // Preserve identity when nothing changed: this runs on every persist, and a
+  // fresh array each time would defeat downstream memoization for no reason.
+  if (!textTrimmed && recent === history) return thread;
+  return { ...thread, promptHistory: trimmed };
+}
+
+/**
  * Persisted state must never carry the draft — it isn't a section yet, and an
  * abandoned composer coming back as a real section after a reload is the exact
  * failure the draft route exists to remove.
  */
 export function persistableThreads(threads: PersistedThread[]): PersistedThread[] {
-  return threads.filter((thread) => !thread.draft);
+  return threads.filter((thread) => !thread.draft).map(trimPromptHistory);
 }
 
 /**

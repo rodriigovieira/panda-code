@@ -14,7 +14,7 @@ function formatTokens(value: number): string {
   return tokenFormatter.format(Math.max(0, Math.round(value)));
 }
 
-const RUNTIME_LABELS: Record<AgentRuntime, string> = { claude: "Claude", codex: "Codex" };
+const RUNTIME_LABELS: Record<AgentRuntime, string> = { claude: "Claude", codex: "Codex", groq: "Groq" };
 
 /** The four token classes, in the order they read best (spend, then cache). */
 function tokenClassRows(

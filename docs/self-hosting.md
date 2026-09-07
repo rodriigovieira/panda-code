@@ -2,7 +2,8 @@
 
 **You do not need this to use Panda Code.** The desktop app is complete on its own:
 it runs your `claude` and `codex` sessions locally, stores everything on your Mac,
-and requires no account, no sign-in, and no server. Nothing leaves the machine.
+and requires no Panda Code account or relay server. Model providers still receive
+the prompts and context you send through their CLIs or the optional Groq runtime.
 
 You need this page only if you want the **optional** extra: controlling your
 sessions from your phone. That works by running a small relay of your own — a
@@ -70,26 +71,35 @@ any time you pull changes that touch the relay.
 
 ### 2. Point the desktop app at it
 
-The relay URL is baked in at build time, because a Finder-launched app does not
-inherit your shell environment.
+Launch Panda Code and open Settings -> Phone. Paste your Convex deployment URL
+into Relay URL:
 
 ```sh
-cd apps/desktop
-PANDA_CODE_RELAY_URL=https://your-deployment.convex.cloud pnpm package:mac
+https://your-deployment.convex.cloud
 ```
 
-The build lands in `apps/desktop/release/mac-arm64/Panda Code.app`. Copy it to
-`/Applications` and launch it.
+Downloaded builds, source builds, and packaged `.app` bundles all use the same
+setting. You can set `PANDA_CODE_RELAY_URL` before `dev` or `package:mac` to seed
+the field on first run, but the saved Settings value wins after launch.
 
-To run from source instead:
+> With the Relay URL empty, the app builds and runs in fully local mode. That is
+> the default and it is a supported configuration, not a broken one — the pairing
+> panel simply says phone pairing is off.
 
-```sh
-PANDA_CODE_RELAY_URL=https://your-deployment.convex.cloud pnpm --dir apps/desktop dev
-```
+Before a new desktop can register, Settings shows an owner-enrollment command.
+Run that exact `pairing:authorizeDevice` command from your authenticated Convex
+CLI in `convex-relay`, using the fingerprint from **your own Mac**. Enrollment
+expires after 15 minutes and is consumed once. Do not approve fingerprints sent
+by strangers. The URL alone no longer permits new devices to register.
 
-> Without `PANDA_CODE_RELAY_URL`, the app builds and runs in fully local mode.
-> That is the default and it is a supported configuration, not a broken one — the
-> pairing panel simply says phone pairing is off.
+When upgrading a relay that previously allowed public registration, audit its
+`devices` table in the owner dashboard. Existing registrations are preserved;
+remove any you do not recognize. The enrollment gate prevents new unapproved
+registrations but does not retroactively establish trust in old rows.
+
+Upgrade the relay, Mac and phone together for command protocol v2. Older phones
+cannot control an updated Mac. Revoking a phone rotates the key and disconnects
+all phones; scan fresh QR codes afterward. Local desktop data is preserved.
 
 ### 3. Build the mobile app
 
@@ -158,6 +168,6 @@ database bandwidth per deployment.
 
 ## Turning it off
 
-Delete the deployment in the Convex dashboard, and rebuild the desktop app without
-`PANDA_CODE_RELAY_URL`. The app returns to fully local mode with your sessions
-intact — they live on your Mac and were never dependent on the relay.
+Delete the deployment in the Convex dashboard, then clear Settings -> Phone ->
+Relay URL. The app returns to fully local mode with your sessions intact — they
+live on your Mac and were never dependent on the relay.

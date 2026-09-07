@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../git/document_screen.dart';
 import '../../state/providers.dart';
 import '../../theme/panda_tokens.dart';
 import '../../widgets/toast/panda_toast.dart';
@@ -185,7 +186,7 @@ class _SessionFilesSheetState extends ConsumerState<_SessionFilesSheet> {
         children: [
           _FilesSummary(changes: changes),
           const SizedBox(height: 14),
-          for (final file in changes.files) _FileRow(file: file),
+          for (final file in changes.files) _FileRow(file: file, cwd: widget.row.cwd),
           if (changes.error != null) ...[
             const SizedBox(height: 10),
             Text('${changes.error} — line counts unavailable.',
@@ -267,23 +268,42 @@ class _FilesSummary extends StatelessWidget {
 }
 
 class _FileRow extends StatelessWidget {
-  const _FileRow({required this.file});
+  const _FileRow({required this.file, this.cwd});
 
   final SessionFileChange file;
+
+  /// The section's workspace, which is what the desktop scopes a read to. Null
+  /// on a row whose session never reported one — then there is nothing to read
+  /// against and the row keeps its old behaviour.
+  final String? cwd;
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
     final meta = _statusMeta(context, file.status);
 
-    // A phone cannot open the file in an editor, so the useful action is the
-    // path itself — tap to copy, which is what gets pasted back into a session.
+    final workspace = cwd;
+    // A document the app can show — most often the one the section was asked to
+    // write — opens in the reader. Everything else keeps the action a phone can
+    // actually use: the path, copied, to paste back into a session. Copy stays
+    // on a long press either way, so it is never lost.
+    final readable = workspace != null &&
+        workspace.isNotEmpty &&
+        file.exists &&
+        !file.binary &&
+        isReadableDocPath(file.path);
+
+    Future<void> copyPath() async {
+      await Clipboard.setData(ClipboardData(text: file.absolutePath));
+      showToast('Copied path', variant: ToastVariant.success);
+    }
+
     return InkWell(
       borderRadius: t.radius.smR,
-      onTap: () async {
-        await Clipboard.setData(ClipboardData(text: file.absolutePath));
-        showToast('Copied path', variant: ToastVariant.success);
-      },
+      onLongPress: copyPath,
+      onTap: readable
+          ? () => openDocument(context, cwd: workspace, path: file.absolutePath)
+          : copyPath,
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 4),
         child: Row(

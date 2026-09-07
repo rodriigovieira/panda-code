@@ -1,29 +1,41 @@
 # Panda Code — Desktop app
 
-## After finishing any change: package and sync to /Applications
+> Finishing a backlog card means getting it to **Review with evidence on it**, not
+> just writing the code. The recipes for capturing that evidence — for this app
+> and for every other surface in the repo — are in the root `AGENTS.md`, under
+> "Evidence: How To Prove It In This Repo". The packaging steps below are the
+> first half of it for desktop work.
 
-Once a change is complete and verified, ALWAYS repackage the app and sync it into
-`/Applications` so the installed build stays current — **without closing the running
-instance**. Do not quit or kill Panda Code; just replace the bundle in place. The
-running process keeps its open file handles, so the next launch picks up the new build.
+## After finishing any change: package; install only while the app is stopped
+
+Once a change is complete and verified, ALWAYS repackage the app. Do not replace
+`/Applications/Panda Code.app` while it is running. Electron can spawn renderer,
+GPU, utility, and webview helpers later; replacing the bundle underneath the old
+main process makes those helpers come from a different build and can crash them.
 
 ```sh
 cd apps/desktop
 pnpm package:mac
-# electron-builder writes to release/mac-arm64/Panda Code.app
-rsync -a --delete "release/mac-arm64/Panda Code.app/" "/Applications/Panda Code.app/"
+# After the user has quit Panda Code completely:
+pnpm sync:mac
 ```
 
 Notes:
+- **This is the most expensive command in the repo, and several sections reach it
+  at once.** It takes the workspace lock (`scripts/with-lock.sh`), so a second
+  section waits rather than thrashing an 8 GB machine — if it says it is waiting,
+  let it wait. Run `pnpm machine` first to see the load and who holds the lock.
+  And note that packaging builds the *working tree*, not just your change: if a
+  peer section packaged after your edits landed, the release bundle already has
+  them and you can skip your own run.
 - `package:mac` runs `pnpm build` (typecheck + electron-vite build) then
   `electron-builder --mac dir --arm64`, so it also serves as a full typecheck gate.
-- **Check the `[relay]` line the build prints.** The relay URL is baked into the
-  bundle at build time; a build without it disables phone pairing entirely and
-  shows up as "Mac offline" on iOS with no error anywhere on the desktop. The
-  build resolves it from `PANDA_CODE_RELAY_URL`, else from `CONVEX_URL` in the
-  gitignored `convex-relay/.env.local`. If it prints `no relay URL` on a machine
-  that pairs with a phone, stop and fix that before syncing — never hardcode the
-  URL in tracked files.
-- Sync with `rsync` (or `ditto`), never by deleting `/Applications/Panda Code.app`
-  first — replacing in place avoids disturbing the running instance.
-- Leave any open Panda Code window running; the user relaunches on their own schedule.
+- **Check the `[relay]` line the build prints.** The relay URL is only a first-run
+  seed now; Settings -> Phone -> Relay URL is authoritative after launch. The
+  build seed resolves only from explicit `PANDA_CODE_RELAY_URL`. If it prints
+  `no relay URL seed`, the app still works and can be pointed at a relay from
+  Settings — never hardcode the URL in tracked files.
+- `sync:mac` refuses to run while any installed-app process remains. Never bypass
+  that check with a direct `rsync` or `ditto`.
+- Leave an open Panda Code window running and report that the packaged update is
+  waiting for a user-controlled quit/install/relaunch.

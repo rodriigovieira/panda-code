@@ -109,9 +109,37 @@ const codexModelOptions = <LaunchOption>[
       hint: 'Use the Codex CLI default',
       badge: 'Default'),
   LaunchOption(
-      value: 'codex-auto-review',
-      label: 'Auto Review',
-      hint: 'Managed review-style coding'),
+      value: 'gpt-6-astra',
+      label: 'GPT-6 Astra',
+      hint: 'Most capable for complex coding and sustained reasoning',
+      badge: 'Recommended'),
+  LaunchOption(
+      value: 'gpt-5.6-sol',
+      label: 'GPT-5.6 Sol',
+      hint: 'Reliable agentic workhorse for everyday tasks'),
+  LaunchOption(
+      value: 'gpt-5.6-terra',
+      label: 'GPT-5.6 Terra',
+      hint: 'Balanced agentic coding model for everyday work'),
+  LaunchOption(
+      value: 'gpt-5.6-luna',
+      label: 'GPT-5.6 Luna',
+      hint: 'Fast and affordable agentic coding model',
+      badge: 'Fast'),
+  LaunchOption(
+      value: 'gpt-5.5',
+      label: 'GPT-5.5',
+      hint: 'Proven previous-generation model for coding and general work'),
+  LaunchOption(
+      value: 'gpt-5.4-mini',
+      label: 'GPT-5.4 Mini',
+      hint: 'Small model being replaced by GPT-5.6 Luna',
+      badge: 'Retiring'),
+  LaunchOption(
+      value: 'gpt-5.3-codex-spark',
+      label: 'GPT-5.3 Codex Spark',
+      hint: 'Ultra-fast coding model',
+      badge: 'Fast'),
 ];
 
 const claudeEffortOptions = <LaunchOption>[
@@ -127,12 +155,15 @@ const claudeEffortOptions = <LaunchOption>[
 const codexEffortOptions = <LaunchOption>[
   LaunchOption(
       value: '', label: 'Default', hint: 'Use your Codex default reasoning'),
-  LaunchOption(
-      value: 'minimal', label: 'Minimal', hint: 'Small mechanical tasks'),
   LaunchOption(value: 'low', label: 'Low', hint: 'Quick scoped work'),
   LaunchOption(value: 'medium', label: 'Medium', hint: 'Balanced planning'),
   LaunchOption(value: 'high', label: 'High', hint: 'Deeper reasoning'),
   LaunchOption(value: 'xhigh', label: 'X-High', hint: 'Hard multi-step work'),
+  LaunchOption(value: 'max', label: 'Max', hint: 'Maximum reasoning depth'),
+  LaunchOption(
+      value: 'ultra',
+      label: 'Ultra',
+      hint: 'Maximum reasoning with automatic task delegation'),
 ];
 
 const claudePermissionOptions = <LaunchOption>[
@@ -179,8 +210,23 @@ bool isFullAccessPermissionMode(String? mode) =>
 List<LaunchOption> modelOptionsFor(AgentRuntime runtime) =>
     runtime == AgentRuntime.codex ? codexModelOptions : claudeModelOptions;
 
-List<LaunchOption> effortOptionsFor(AgentRuntime runtime) =>
-    runtime == AgentRuntime.codex ? codexEffortOptions : claudeEffortOptions;
+List<LaunchOption> effortOptionsFor(AgentRuntime runtime, [String? model]) {
+  if (runtime != AgentRuntime.codex) return claudeEffortOptions;
+
+  // These are the capabilities advertised by Codex CLI 0.153.2. Keep the
+  // selected model's ceiling honest: sending `ultra` to Luna (or `max` to a
+  // previous-generation model) is rejected by app-server rather than silently
+  // falling back. An unknown/custom model keeps the full list so newer models
+  // remain usable without waiting for a mobile release.
+  final maximum = switch (model?.trim()) {
+    'gpt-5.6-luna' => 'max',
+    'gpt-5.5' || 'gpt-5.4-mini' || 'gpt-5.3-codex-spark' => 'xhigh',
+    _ => 'ultra',
+  };
+  final maximumIndex =
+      codexEffortOptions.indexWhere((option) => option.value == maximum);
+  return codexEffortOptions.sublist(0, maximumIndex + 1);
+}
 
 List<LaunchOption> permissionOptionsFor(AgentRuntime runtime) =>
     runtime == AgentRuntime.codex
@@ -223,12 +269,17 @@ class SessionLaunchConfig {
   final String? effort;
   final String? permissionMode;
 
+  /// Open this session as a SUB-THREAD of an existing one, by session id. The
+  /// desktop nests it in the sidebar and mirrors the link back to every phone.
+  final String? parentSessionId;
+
   const SessionLaunchConfig({
     required this.cwd,
     required this.runtime,
     this.model,
     this.effort,
     this.permissionMode,
+    this.parentSessionId,
   });
 
   String get displayModel =>
@@ -251,6 +302,8 @@ class SessionLaunchConfig {
         if ((effort ?? '').trim().isNotEmpty) 'effort': effort!.trim(),
         if ((permissionMode ?? '').trim().isNotEmpty)
           'permissionMode': permissionMode!.trim(),
+        if ((parentSessionId ?? '').trim().isNotEmpty)
+          'parentSessionId': parentSessionId!.trim(),
         if (prompt.trim().isNotEmpty) 'prompt': prompt.trim(),
         if (images.isNotEmpty)
           'attachments': images.map((image) => image.toPayload()).toList(),
@@ -274,6 +327,10 @@ class SessionDraft {
   final String prompt;
   final List<ConversationImage> images;
 
+  /// Set when the draft was opened from "New sub-thread" on an existing
+  /// session: the parent it will hang under once sent.
+  final String? parentSessionId;
+
   const SessionDraft({
     this.workspacePath,
     this.runtime = AgentRuntime.claude,
@@ -283,6 +340,7 @@ class SessionDraft {
     this.permissionMode = '',
     this.prompt = '',
     this.images = const [],
+    this.parentSessionId,
   });
 
   /// True when there is something a user would be annoyed to lose.
@@ -303,6 +361,7 @@ class SessionDraft {
       model: effectiveModel,
       effort: effort,
       permissionMode: permissionMode,
+      parentSessionId: parentSessionId,
     );
   }
 
@@ -315,6 +374,7 @@ class SessionDraft {
     String? permissionMode,
     String? prompt,
     List<ConversationImage>? images,
+    String? parentSessionId,
   }) =>
       SessionDraft(
         workspacePath: workspacePath ?? this.workspacePath,
@@ -325,6 +385,7 @@ class SessionDraft {
         permissionMode: permissionMode ?? this.permissionMode,
         prompt: prompt ?? this.prompt,
         images: images ?? this.images,
+        parentSessionId: parentSessionId ?? this.parentSessionId,
       );
 
   /// Switching runtime resets everything runtime-shaped (a Claude model name is
@@ -335,6 +396,9 @@ class SessionDraft {
         permissionMode: defaultPermissionModeForRuntime(next),
         prompt: prompt,
         images: images,
+        // Survives a provider switch: which section this hangs under has nothing
+        // to do with which agent runs it.
+        parentSessionId: parentSessionId,
       );
 }
 
@@ -659,6 +723,9 @@ class SessionRow {
   final String? title;
   final String? cwd; // decrypted working directory, used to group by workspace
   final SessionStatus status;
+  /// Authoritative lifecycle state from the session row. The independently
+  /// streamed runtime badge may still describe an older turn (including after
+  /// desktop exit/reconnect), so it must not override this for UI or sending.
   final AgentState agentState;
   final String executionMode;
   final int headSeq;
@@ -673,6 +740,16 @@ class SessionRow {
   final int? lastPromptAt;
   final RuntimeBadge? runtime;
   final bool starred;
+
+  /// Archived on the relay — mirrors [ArchiveStore]'s local set so the
+  /// desktop's own archive/unarchive shows up here too. See
+  /// `session_list_screen.dart`'s union of this with the local cache.
+  final bool archived;
+
+  /// The session this one is a SUB-THREAD of, by desktop session id. Null for
+  /// a top-level session. Plaintext on the relay row (it is an opaque id, not
+  /// content), so the list can be nested without decrypting anything first.
+  final String? parentSessionId;
 
   /// Whether THIS phone receives push notifications for this session. The relay
   /// resolves it per phone: the explicit subscription override if set, else the
@@ -691,7 +768,9 @@ class SessionRow {
     required this.updatedAt,
     this.lastPromptAt,
     required this.runtime,
+    this.parentSessionId,
     this.starred = false,
+    this.archived = false,
     this.subscribed = false,
   });
 
@@ -707,7 +786,9 @@ class SessionRow {
         updatedAt: updatedAt,
         lastPromptAt: lastPromptAt,
         runtime: runtime ?? this.runtime,
+        parentSessionId: parentSessionId,
         starred: starred,
+        archived: archived,
         subscribed: subscribed,
       );
 
@@ -718,6 +799,34 @@ class SessionRow {
   SessionRow withRuntime(SessionRuntimeSnapshot? snapshot) => snapshot == null
       ? this
       : copyWith(runtime: snapshot.badge, headSeq: snapshot.headSeq);
+
+  /// Content equality (not identity) — lets `sessions:list` dirty-check a
+  /// freshly decrypted row against the previous one and skip pushing a new
+  /// list (and the Riverpod/rebuild cascade that follows) when nothing
+  /// actually changed. See `RelayApi.watchSessions`.
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is SessionRow &&
+          sessionId == other.sessionId &&
+          title == other.title &&
+          cwd == other.cwd &&
+          status == other.status &&
+          agentState == other.agentState &&
+          executionMode == other.executionMode &&
+          headSeq == other.headSeq &&
+          updatedAt == other.updatedAt &&
+          lastPromptAt == other.lastPromptAt &&
+          runtime == other.runtime &&
+          parentSessionId == other.parentSessionId &&
+          starred == other.starred &&
+          archived == other.archived &&
+          subscribed == other.subscribed);
+
+  @override
+  int get hashCode => Object.hash(sessionId, title, cwd, status, agentState,
+      executionMode, headSeq, updatedAt, lastPromptAt, parentSessionId,
+      starred, archived, subscribed);
 
   /// Stable ordering key for the session list: last prompt time when known,
   /// else the last activity time. See [lastPromptAt].
@@ -983,6 +1092,38 @@ class PendingApproval {
       );
 }
 
+/// A prompt queued behind the session's active turn (from the desktop's
+/// `MirrorState.queuedPrompts`, mirrored inside the runtime payload). Display
+/// copy only — no image bytes, just a count — since the full prompt (and any
+/// attachments) stays on the desktop until it actually sends.
+class QueuedPromptSync {
+  final String id;
+  final String text;
+  final int imageCount;
+  final int queuedAt;
+
+  const QueuedPromptSync({
+    required this.id,
+    required this.text,
+    required this.imageCount,
+    required this.queuedAt,
+  });
+
+  factory QueuedPromptSync.fromDecrypted(Map<String, dynamic> json) =>
+      QueuedPromptSync(
+        id: (json['id'] as String?) ?? '',
+        text: (json['text'] as String?) ?? '',
+        imageCount: (json['imageCount'] as num?)?.toInt() ?? 0,
+        queuedAt: (json['queuedAt'] as num?)?.toInt() ?? 0,
+      );
+
+  String get preview {
+    final trimmed = text.trim();
+    if (trimmed.isNotEmpty) return trimmed;
+    return '$imageCount image${imageCount == 1 ? '' : 's'}';
+  }
+}
+
 /// Low-frequency runtime badge (from `SessionRuntimeEvent`, decrypted).
 class RuntimeBadge {
   final AgentState agentState;
@@ -998,6 +1139,10 @@ class RuntimeBadge {
   final AgentRuntime?
       runtime; // which runtime backs this session (claude/codex)
 
+  /// Prompts queued behind this session's active turn, desktop-owned so they
+  /// survive this phone being killed and reopened. Oldest first.
+  final List<QueuedPromptSync> queuedPrompts;
+
   const RuntimeBadge({
     required this.agentState,
     this.latestTool,
@@ -1010,6 +1155,7 @@ class RuntimeBadge {
     this.model,
     this.lastMessage,
     this.runtime,
+    this.queuedPrompts = const [],
   });
 
   factory RuntimeBadge.fromDecrypted(Map<String, dynamic> json) => RuntimeBadge(
@@ -1024,6 +1170,11 @@ class RuntimeBadge {
         model: json['latestModel'] as String? ?? json['model'] as String?,
         lastMessage: json['latestAssistantText'] as String?,
         runtime: _runtimeFrom(json),
+        queuedPrompts: ((json['queuedPrompts'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((raw) =>
+                QueuedPromptSync.fromDecrypted(Map<String, dynamic>.from(raw)))
+            .toList(),
       );
 
   static PendingApproval? _pendingApprovalFrom(Object? raw) {
@@ -1093,6 +1244,11 @@ class ConversationItem {
   /// sort by the desktop's logical [timestamp], falling back to the envelope
   /// [createdAt] and finally [sequence].
   int get orderMs => timestamp ?? createdAt ?? 0;
+
+  /// Wall-clock time to show the user next to a message bubble. Same
+  /// preference order as [orderMs], but null (rather than 0) when neither
+  /// source is known, so callers can hide the label instead of showing 1970.
+  int? get displayTimestamp => timestamp ?? createdAt;
 
   ConversationItem copyWith({
     ToolData? tool,

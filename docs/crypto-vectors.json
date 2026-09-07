@@ -7,8 +7,29 @@
     {
       "keyBase64": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
       "nonceBase64": "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7",
-      "plaintext": { "hello": "world", "n": 42 },
+      "plaintext": {
+        "hello": "world",
+        "n": 42
+      },
       "envelopeBase64": "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7ml726HZLHoXa+ycbjGc+py90XeG/rzMoBKhVJApIRYsM45DqUup6zA=="
     }
-  ]
+  ],
+  "commandVector": {
+    "keyBase64": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+    "derivedKeyBase64": "dAPc5IcNlpnl61HAYagkBVIQ1xppx8m4kH8mE/IJ0Oo=",
+    "nonceBase64": "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7",
+    "plaintext": {
+      "v": 2,
+      "domain": "panda-code/command/v2",
+      "id": "11111111-1111-4111-8111-111111111111",
+      "deviceId": "device",
+      "mobileId": "phone",
+      "sessionId": "section",
+      "type": "stop",
+      "issuedAt": 1800000000000,
+      "expiresAt": 1800000060000,
+      "payload": null
+    },
+    "envelopeBase64": "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7XVqsaCAyfuPZqfGyi1Dps4yiZ/hS3dlROz2Foyur6dVGpbeEJb1466r784AHDqpKPvwk57XjOE49RDV+HKpODhY7Ax48DO7IJ/hYHcWbRvNFV/7L4eNyn0XVqkACh4mi64jIu8kvwDysH8rg4yxHsg+p1BYo8mF2zt2b3wVYO1oszcPxobqZL6DljRQdNYyduuD2PIXvMJj+SJsl3GO5i1JaFkXWjxnGi21cVSNOGg00D5dPMIDu13XM6d8QC9RklNZEiigikO8OkL2L2XMHIn+RQjeQq/Ij6v8k7W5FRNmMTeOJox5w6Kr8dtTfj7wOTg=="
+  }
 }

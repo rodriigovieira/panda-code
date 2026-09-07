@@ -46,8 +46,9 @@ List<LaunchOption> modelVariantsFor(AgentRuntime runtime) {
       .toList();
 }
 
-/// A slider needs at least three stops to earn its space. Codex ships two
-/// models, so it falls back to pills rather than pretending to be a ramp.
+/// A slider needs at least three stops to earn its space. Codex models are
+/// alternatives with different speed/capability trade-offs, not an ordinal
+/// ladder, so they use the model browser instead.
 bool modelUsesSlider(AgentRuntime runtime) => modelRampFor(runtime).length >= 3;
 
 /// Label + value header shared by both control types, so a slider row and a pill

@@ -63,8 +63,7 @@ class _RuntimeFooterState extends State<RuntimeFooter> {
   // lockstep; DateTime is fine here (this is app code, not a workflow script).
   int _wordIndex = DateTime.now().microsecond % _workingWords.length;
 
-  AgentState get _state =>
-      widget.row.runtime?.agentState ?? widget.row.agentState;
+  AgentState get _state => widget.row.agentState;
 
   @override
   void initState() {

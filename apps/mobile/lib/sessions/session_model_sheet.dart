@@ -4,6 +4,7 @@ import '../security/biometric_auth.dart';
 import '../theme/panda_tokens.dart';
 import '../widgets/toast/panda_toast.dart';
 import 'models.dart';
+import 'session_launch_form.dart' show showOptionPicker;
 import 'widgets/selector_controls.dart';
 
 /// What a user chose for an already-running session. A `null` field means
@@ -43,6 +44,7 @@ Future<LaunchOverride?> showModelSwitchSheet(
   String? currentModel,
   String? currentEffort,
   String? currentPermission,
+  bool requireBiometric = true,
 }) {
   return showModalBottomSheet<LaunchOverride>(
     context: context,
@@ -53,6 +55,7 @@ Future<LaunchOverride?> showModelSwitchSheet(
       currentModel: currentModel,
       currentEffort: currentEffort,
       currentPermission: currentPermission,
+      requireBiometric: requireBiometric,
     ),
   );
 }
@@ -63,12 +66,14 @@ class _ModelSwitchSheet extends StatefulWidget {
     this.currentModel,
     this.currentEffort,
     this.currentPermission,
+    this.requireBiometric = true,
   });
 
   final AgentRuntime runtime;
   final String? currentModel;
   final String? currentEffort;
   final String? currentPermission;
+  final bool requireBiometric;
 
   @override
   State<_ModelSwitchSheet> createState() => _ModelSwitchSheetState();
@@ -117,6 +122,17 @@ class _ModelSwitchSheetState extends State<_ModelSwitchSheet> {
     });
   }
 
+  void _setModel(String value) {
+    setState(() {
+      _model = value;
+      if (_effort != null &&
+          !effortOptionsFor(_runtime, value)
+              .any((option) => option.value == _effort)) {
+        _effort = '';
+      }
+    });
+  }
+
   /// The option value that matches [reported], or null when the reported model
   /// isn't one of the presets (e.g. a pinned full model id). Keeps the picker
   /// from showing a stale highlight.
@@ -150,8 +166,9 @@ class _ModelSwitchSheetState extends State<_ModelSwitchSheet> {
       return;
     }
     // Loosening the sandbox / bypassing permissions grants unrestricted access,
-    // exactly like starting a full-access session — gate it behind Face ID.
-    if (isFullAccessPermissionMode(_permission)) {
+    // exactly like starting a full-access session — gate it behind Face ID,
+    // unless the user opted out in Settings.
+    if (widget.requireBiometric && isFullAccessPermissionMode(_permission)) {
       final ok = await BiometricAuth.authenticate();
       if (!ok) {
         showToast('Face ID required to grant full access',
@@ -254,6 +271,42 @@ class _ModelSwitchSheetState extends State<_ModelSwitchSheet> {
     final all = modelOptionsFor(_runtime);
     final untouched = _model == null;
 
+    if (_isCodex) {
+      final selected = _optionFor(all, _model);
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SelectorHeader(
+            label: 'Model',
+            icon: Icons.memory_outlined,
+            accent: accent,
+            value: selected?.label ?? _modelPlaceholder(),
+            badge: selected?.badge,
+            muted: untouched,
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: () async {
+              final picked = await showOptionPicker(
+                context,
+                title: 'Codex model',
+                icon: Icons.memory_outlined,
+                options: all,
+                selected: _model ?? widget.currentModel?.trim() ?? '',
+              );
+              if (picked != null) _setModel(picked);
+            },
+            icon: const Icon(Icons.search),
+            label: Text(selected?.label ?? _modelPlaceholder()),
+          ),
+          if (selected != null) ...[
+            const SizedBox(height: 8),
+            SelectorHint(selected.hint),
+          ],
+        ],
+      );
+    }
+
     if (!_modelUsesSlider) {
       final selected = _optionFor(all, _model);
       return Column(
@@ -272,7 +325,7 @@ class _ModelSwitchSheetState extends State<_ModelSwitchSheet> {
             options: all,
             value: _model,
             accent: accent,
-            onChanged: (v) => setState(() => _model = v),
+            onChanged: _setModel,
           ),
           if (selected != null) ...[
             const SizedBox(height: 8),
@@ -340,7 +393,7 @@ class _ModelSwitchSheetState extends State<_ModelSwitchSheet> {
               options: variants,
               value: onVariant ? _model : null,
               accent: accent,
-              onChanged: (v) => setState(() => _model = v),
+              onChanged: _setModel,
             ),
           ],
         ],
@@ -354,7 +407,8 @@ class _ModelSwitchSheetState extends State<_ModelSwitchSheet> {
   // control with a gap in it.
 
   Widget _buildEffortRow(PandaTokens t) {
-    final options = effortOptionsFor(_runtime);
+    final options =
+        effortOptionsFor(_runtime, _model ?? widget.currentModel?.trim());
     final index = _indexFor(options, _effort, widget.currentEffort);
     final selected = options[index];
     return Column(

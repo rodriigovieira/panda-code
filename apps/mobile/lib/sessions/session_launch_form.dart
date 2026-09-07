@@ -17,8 +17,12 @@ class WorkspaceOption {
 
 /// Distinct workspaces across the known sessions, most recently active first.
 /// This is the same set the desktop groups its threads into, so the phone can
-/// only pick a folder that already exists on the Mac.
-List<WorkspaceOption> workspaceOptionsFromSessions(Iterable<SessionRow> rows) {
+/// only pick a folder that already exists on the Mac. The desktop's shared
+/// scratch folder is included separately because it may have no live sessions.
+List<WorkspaceOption> workspaceOptionsFromSessions(
+  Iterable<SessionRow> rows, {
+  String? scratchWorkspacePath,
+}) {
   final latestByPath = <String, int>{};
   for (final row in rows) {
     final dir = row.cwd?.trim() ?? '';
@@ -28,7 +32,12 @@ List<WorkspaceOption> workspaceOptionsFromSessions(Iterable<SessionRow> rows) {
   }
   final entries = latestByPath.entries.toList()
     ..sort((a, b) => b.value.compareTo(a.value));
-  return [for (final e in entries) WorkspaceOption(e.key)];
+  final options = [for (final e in entries) WorkspaceOption(e.key)];
+  final scratch = scratchWorkspacePath?.trim() ?? '';
+  if (scratch.isNotEmpty && !latestByPath.containsKey(scratch)) {
+    options.add(WorkspaceOption(scratch));
+  }
+  return options;
 }
 
 /// Optional pre-fill for the create sheet, sourced from user settings.
@@ -83,10 +92,10 @@ class SessionLaunchForm extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final modelHint = _hintFor(modelOptionsFor(runtime), model);
-    final effortHint = _hintFor(effortOptionsFor(runtime), effort);
+    final effortHint = _hintFor(effortOptionsFor(runtime, model), effort);
     final permissionHint =
         _hintFor(permissionOptionsFor(runtime), permissionMode);
-    final effortOptions = effortOptionsFor(runtime);
+    final effortOptions = effortOptionsFor(runtime, model);
     var effortIndex = effortOptions.indexWhere((o) => o.value == effort);
     if (effortIndex < 0) effortIndex = 0;
 
@@ -122,6 +131,10 @@ class SessionLaunchForm extends StatelessWidget {
           value: model,
           onChanged: (value) {
             customModelController.clear();
+            if (!effortOptionsFor(runtime, value)
+                .any((option) => option.value == effort)) {
+              onEffortChanged('');
+            }
             onModelChanged(value);
           },
         ),
@@ -377,6 +390,36 @@ class _ModelSelectorState extends State<ModelSelector> {
     final variants = modelVariantsFor(widget.runtime);
     final all = modelOptionsFor(widget.runtime);
     final selected = all.where((o) => o.value == widget.value).firstOrNull;
+
+    if (widget.runtime == AgentRuntime.codex) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SelectorHeader(
+            label: 'Model',
+            icon: Icons.memory_outlined,
+            accent: accent,
+            value: selected?.label ?? widget.value,
+            badge: selected?.badge,
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: () async {
+              final picked = await showOptionPicker(
+                context,
+                title: 'Codex model',
+                icon: Icons.memory_outlined,
+                options: all,
+                selected: widget.value,
+              );
+              if (picked != null) widget.onChanged(picked);
+            },
+            icon: const Icon(Icons.search),
+            label: Text(selected?.label ?? 'Choose a Codex model'),
+          ),
+        ],
+      );
+    }
 
     if (!modelUsesSlider(widget.runtime)) {
       return Column(

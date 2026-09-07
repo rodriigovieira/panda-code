@@ -320,6 +320,41 @@ Typography _nudgedTypography(Brightness brightness) {
   );
 }
 
+/// The app's own base-text bump: every screen reads ~12% larger by default,
+/// independent of the chat/document text-size sliders (which start from this
+/// already-bumped base and scale further).
+const double kAppBaseTextScale = 1.12;
+
+/// Multiplies [base] by [factor] instead of replacing it, so a screen-local
+/// [TextScaler] (chat text size, document reader size) stacks on top of the
+/// ambient one — which already carries [kAppBaseTextScale] and any OS
+/// accessibility scaling — rather than silently discarding it.
+TextScaler scaleTextScaler(TextScaler base, double factor) =>
+    _ComposedTextScaler(base, factor);
+
+class _ComposedTextScaler extends TextScaler {
+  const _ComposedTextScaler(this._base, this._factor);
+
+  final TextScaler _base;
+  final double _factor;
+
+  @override
+  double scale(double fontSize) => _base.scale(fontSize) * _factor;
+
+  @override
+  // ignore: deprecated_member_use
+  double get textScaleFactor => _base.textScaleFactor * _factor;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _ComposedTextScaler &&
+      other._base == _base &&
+      other._factor == _factor;
+
+  @override
+  int get hashCode => Object.hash(_base, _factor);
+}
+
 OutlineInputBorder _inputBorder(PandaTokens t, Color color, {double? width}) =>
     OutlineInputBorder(
       borderRadius: t.radius.mdR,

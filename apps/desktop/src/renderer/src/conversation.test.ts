@@ -1,6 +1,48 @@
 import { describe, expect, it } from "vitest";
 import type { ConversationItem } from "../../shared/ipc";
-import { groupQuietWork, mergeConversationItems } from "./conversation";
+import {
+  groupQuietWork,
+  COLLAPSIBLE_PROMPT_LENGTH,
+  hiddenTranscriptCount,
+  mergeConversationItems,
+  parsePeerPrompt,
+  selectTranscriptsToDrop,
+  shouldCollapsePrompt,
+  shouldReloadTranscript,
+} from "./conversation";
+
+describe("peer prompts", () => {
+  it("extracts a peer sender and hides the delivery preamble from the bubble body", () => {
+    const prompt = [
+      '[Message from the Panda Code section "Review tests" (id `section-2`) working in this same workspace.',
+      "It was sent by another agent, not by the user.]",
+      "",
+      "The focused suite passes.",
+    ].join("\n");
+
+    expect(parsePeerPrompt(prompt)).toEqual({
+      body: "The focused suite passes.",
+      relation: "peer",
+      senderId: "section-2",
+      senderTitle: "Review tests",
+    });
+  });
+
+  it("recognizes sub-thread reports and delegated tasks", () => {
+    expect(
+      parsePeerPrompt('[Message from "Child" (id `child-1`), a SUB-THREAD you opened in this workspace.]\n\nDone.'),
+    ).toMatchObject({ relation: "subthread", body: "Done." });
+    expect(
+      parsePeerPrompt('[This section was opened by the Panda Code section "Parent" (id `parent-1`), working here.]\n\nInvestigate it.'),
+    ).toMatchObject({ relation: "delegated", body: "Investigate it." });
+  });
+
+  it("does not classify an ordinary user prompt and keeps the threshold exact", () => {
+    expect(parsePeerPrompt("Please mention Panda Code section in the docs.")).toBeNull();
+    expect(shouldCollapsePrompt("x".repeat(COLLAPSIBLE_PROMPT_LENGTH))).toBe(false);
+    expect(shouldCollapsePrompt("x".repeat(COLLAPSIBLE_PROMPT_LENGTH + 1))).toBe(true);
+  });
+});
 
 const localPrompt: ConversationItem = {
   id: "local:thread-1:2026-07-04T20:46:00.000Z",
@@ -573,5 +615,101 @@ describe("groupQuietWork", () => {
 
   it("returns nothing for an empty feed", () => {
     expect(groupQuietWork([], quiet)).toEqual([]);
+  });
+});
+
+describe("hiddenTranscriptCount", () => {
+  it("hides nothing when the transcript fits the window", () => {
+    expect(hiddenTranscriptCount(1500, 2000, 0)).toBe(0);
+    expect(hiddenTranscriptCount(2000, 2000, 0)).toBe(0);
+  });
+
+  it("hides the overflow past the window", () => {
+    expect(hiddenTranscriptCount(2500, 2000, 0)).toBe(500);
+  });
+
+  it("shrinks the hidden count as the user reveals more", () => {
+    expect(hiddenTranscriptCount(5000, 2000, 2000)).toBe(1000);
+    expect(hiddenTranscriptCount(5000, 2000, 3000)).toBe(0);
+  });
+
+  it("never goes negative once everything has been revealed", () => {
+    expect(hiddenTranscriptCount(2500, 2000, 99_999)).toBe(0);
+  });
+
+  it("treats a window of 0 as no limit", () => {
+    // A big machine can afford to mount everything, and the setting says so.
+    expect(hiddenTranscriptCount(50_000, 0, 0)).toBe(0);
+  });
+});
+
+describe("selectTranscriptsToDrop", () => {
+  const resident = (id: string, viewedMinutesAgo: number, running = false) => ({
+    id,
+    viewedAt: 1_700_000_000_000 - viewedMinutesAgo * 60_000,
+    running,
+  });
+
+  it("drops nothing while under the limit", () => {
+    const loaded = [resident("a", 1), resident("b", 90)];
+    expect(selectTranscriptsToDrop({ loaded, activeId: "a", keep: 10 })).toEqual([]);
+  });
+
+  it("drops the least recently viewed first", () => {
+    const loaded = [resident("fresh", 1), resident("stale", 300), resident("middle", 60)];
+    expect(selectTranscriptsToDrop({ loaded, activeId: "fresh", keep: 2 })).toEqual(["stale"]);
+  });
+
+  it("drops as many as the limit requires", () => {
+    const loaded = [resident("a", 5), resident("b", 200), resident("c", 100), resident("d", 400)];
+    expect(selectTranscriptsToDrop({ loaded, activeId: "a", keep: 2 })).toEqual(["d", "b"]);
+  });
+
+  it("never drops the section on screen, however long since it was opened", () => {
+    // viewedAt is only refreshed on activation, so the section you have been
+    // reading for an hour looks stale by this measure.
+    const loaded = [resident("onscreen", 600), resident("other", 1)];
+    expect(selectTranscriptsToDrop({ loaded, activeId: "onscreen", keep: 1 })).toEqual(["other"]);
+  });
+
+  it("never drops a running section", () => {
+    // Its streamed items are not on disk yet — dropping would blank a live turn.
+    const loaded = [resident("running", 900, true), resident("idle", 5)];
+    expect(selectTranscriptsToDrop({ loaded, activeId: null, keep: 1 })).toEqual(["idle"]);
+  });
+
+  it("exceeds the limit rather than dropping something it must not", () => {
+    const loaded = [resident("active", 500), resident("running", 900, true)];
+    expect(selectTranscriptsToDrop({ loaded, activeId: "active", keep: 1 })).toEqual([]);
+  });
+
+  it("treats a limit of 0 as keep everything", () => {
+    const loaded = [resident("a", 1), resident("b", 900), resident("c", 800)];
+    expect(selectTranscriptsToDrop({ loaded, activeId: "a", keep: 0 })).toEqual([]);
+  });
+
+  it("treats a never-viewed transcript as the coldest", () => {
+    const loaded = [{ id: "never", viewedAt: 0, running: false }, resident("old", 999)];
+    expect(selectTranscriptsToDrop({ loaded, activeId: null, keep: 1 })).toEqual(["never"]);
+  });
+});
+
+describe("shouldReloadTranscript", () => {
+  it("reads from disk for a section with no live process", () => {
+    expect(shouldReloadTranscript({ status: "idle", transcriptDropped: false })).toBe(true);
+    expect(shouldReloadTranscript({ status: "exited", transcriptDropped: false })).toBe(true);
+  });
+
+  it("leaves a normal running section alone", () => {
+    // Its stream owns the feed; a disk read would only duplicate work.
+    expect(shouldReloadTranscript({ status: "running", transcriptDropped: false })).toBe(false);
+  });
+
+  it("still reads when a parked section was resumed by something other than opening it", () => {
+    // The regression: a sub-thread reporting back, or a prompt to a parked
+    // section, restarts the process — status flips back to "running" while the
+    // dropped history is still missing. Opening it then showed only the items
+    // streamed since the resume.
+    expect(shouldReloadTranscript({ status: "running", transcriptDropped: true })).toBe(true);
   });
 });

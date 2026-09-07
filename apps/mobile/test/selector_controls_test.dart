@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:panda_code_mobile/sessions/models.dart';
+import 'package:panda_code_mobile/sessions/session_launch_form.dart';
 import 'package:panda_code_mobile/sessions/widgets/selector_controls.dart';
 import 'package:panda_code_mobile/theme/panda_theme.dart';
 
@@ -9,7 +10,8 @@ Widget _wrap(Widget child) => MaterialApp(
         brightness: Brightness.dark,
         density: VisualDensity.standard,
       ),
-      home: Scaffold(body: Padding(padding: const EdgeInsets.all(20), child: child)),
+      home: Scaffold(
+          body: Padding(padding: const EdgeInsets.all(20), child: child)),
     );
 
 const _ramp = <LaunchOption>[
@@ -21,6 +23,38 @@ const _ramp = <LaunchOption>[
 ];
 
 void main() {
+  group('ModelSelector', () {
+    testWidgets('Codex opens a scrollable model browser', (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      var picked = '';
+      await tester.pumpWidget(_wrap(ModelSelector(
+        runtime: AgentRuntime.codex,
+        value: picked,
+        onChanged: (value) => picked = value,
+      )));
+
+      await tester.tap(find.text('Default').last);
+      await tester.pumpAndSettle();
+
+      expect(find.text('Codex model'), findsOneWidget);
+      expect(find.text('GPT-6 Astra'), findsOneWidget);
+      await tester.scrollUntilVisible(
+        find.text('GPT-5.3 Codex Spark'),
+        250,
+        scrollable: find.byType(Scrollable).last,
+      );
+      await tester.tap(find.text('GPT-5.3 Codex Spark'));
+      await tester.pumpAndSettle();
+
+      expect(picked, 'gpt-5.3-codex-spark');
+      expect(tester.takeException(), isNull);
+    });
+  });
+
   group('SelectorSlider', () {
     testWidgets('tapping the far right snaps to the last stop', (tester) async {
       var picked = -1;

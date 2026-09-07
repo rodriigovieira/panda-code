@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   applyStreamJsonEvent,
   createStreamJsonState,
+  hasBackgroundWork,
   isTurnSummaryItem,
+  parseCommandOutputPlan,
   parseStreamJsonLine,
   streamRuntimeEvent,
   toolInputBody,
@@ -92,6 +94,196 @@ describe("applyStreamJsonEvent", () => {
     expect(summary?.id).toBe("stream:msg-1:summary");
   });
 
+  it("keeps a transient error_during_execution result at waiting, tagged for auto-retry", () => {
+    const state = createStreamJsonState();
+    applyStreamJsonEvent(state, { type: "result", subtype: "error_during_execution", is_error: true }, "2026-07-05T12:00:15.000Z");
+    expect(state.agentState).toBe("waiting");
+    expect(state.lastResultError).toEqual({ subtype: "error_during_execution" });
+  });
+
+  it("surfaces a terminal error result (max turns) as needs_action", () => {
+    const state = createStreamJsonState();
+    applyStreamJsonEvent(state, { type: "result", subtype: "error_max_turns", is_error: true }, "2026-07-05T12:00:15.000Z");
+    expect(state.agentState).toBe("needs_action");
+    expect(state.lastResultError).toEqual({ subtype: "error_max_turns" });
+  });
+
+  it("clears lastResultError once a later turn succeeds", () => {
+    const state = createStreamJsonState();
+    applyStreamJsonEvent(state, { type: "result", subtype: "error_during_execution", is_error: true }, "2026-07-05T12:00:15.000Z");
+    expect(state.lastResultError).toBeDefined();
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, "2026-07-05T12:00:20.000Z");
+    expect(state.lastResultError).toBeUndefined();
+    expect(state.agentState).toBe("waiting");
+  });
+
+  // The failure that made the whole auto-retry path a no-op in practice: the CLI
+  // reports a dropped connection as a `<synthetic>` assistant message and then
+  // closes the turn as `success`, so keying only off `is_error` never fired.
+  const apiErrorEvent = (text: string) => ({
+    type: "assistant",
+    message: { id: "msg-api-error", role: "assistant", model: "<synthetic>", content: [{ type: "text", text }] },
+  });
+
+  it("tags a mid-response connection drop for auto-retry even though the result says success", () => {
+    const state = createStreamJsonState();
+    applyStreamJsonEvent(
+      state,
+      apiErrorEvent("API Error: Connection closed mid-response. The response above may be incomplete."),
+      "2026-07-05T12:00:10.000Z",
+    );
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, "2026-07-05T12:00:15.000Z");
+    expect(state.lastResultError).toEqual({ subtype: "error_during_execution" });
+    expect(state.agentState).toBe("waiting");
+  });
+
+  it("surfaces a non-retryable API error as needs_action instead of retrying it forever", () => {
+    const state = createStreamJsonState();
+    applyStreamJsonEvent(state, apiErrorEvent("API Error: 400 prompt is too long"), "2026-07-05T12:00:10.000Z");
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, "2026-07-05T12:00:15.000Z");
+    expect(state.lastResultError).toEqual({ subtype: "error_api" });
+    expect(state.agentState).toBe("needs_action");
+  });
+
+  it("does not relabel the section's model as <synthetic> when an API error lands", () => {
+    const state = createStreamJsonState();
+    applyStreamJsonEvent(
+      state,
+      { type: "assistant", message: { id: "msg-1", role: "assistant", model: "claude-opus-5", content: [{ type: "text", text: "Working." }] } },
+      "2026-07-05T12:00:05.000Z",
+    );
+    applyStreamJsonEvent(state, apiErrorEvent("API Error: Connection closed mid-response."), "2026-07-05T12:00:10.000Z");
+    expect(state.latestModel).toBe("claude-opus-5");
+  });
+
+  it("does not carry an API error across a turn that never reached its result", () => {
+    const state = createStreamJsonState();
+    applyStreamJsonEvent(state, apiErrorEvent("API Error: Connection closed mid-response."), "2026-07-05T12:00:10.000Z");
+    // No `result` — the CLI was killed. A fresh turn starts and finishes cleanly.
+    applyStreamJsonEvent(state, { type: "user", message: { role: "user", content: "next" } }, "2026-07-05T12:05:00.000Z");
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, "2026-07-05T12:05:30.000Z");
+    expect(state.lastResultError).toBeUndefined();
+    expect(state.agentState).toBe("waiting");
+  });
+
+  it("emits no footer for the bookkeeping turn that follows an interrupt", () => {
+    // Interrupting writes the notice as a user message, which flips the state
+    // back to "working" and starts a fresh turn clock; the CLI's own `result`
+    // lands a heartbeat later. That turn burned nothing — a bare "Worked for
+    // 0.1s" under the interrupt notice reads like a turn that broke.
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      { type: "assistant", message: { id: "msg-1", role: "assistant", content: [{ type: "text", text: "On it." }], usage: { input_tokens: 1200, output_tokens: 300 } } },
+      "2026-07-05T12:00:00.000Z",
+    );
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, "2026-07-05T12:00:15.000Z");
+    expect(state.items.filter((item) => isTurnSummaryItem(item))).toHaveLength(1);
+
+    applyStreamJsonEvent(
+      state,
+      { type: "user", message: { role: "user", content: "[Request interrupted by user for tool use]" } },
+      "2026-07-05T12:00:15.100Z",
+    );
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, "2026-07-05T12:00:15.200Z");
+
+    expect(state.items.filter((item) => isTurnSummaryItem(item))).toHaveLength(1);
+  });
+
+  it("resolves a stuck background command card when the turn is interrupted", () => {
+    // A background-Bash card (no subagent_type) left "running" has nothing left
+    // to resolve it once the CLI injects the interrupt marker — its process was
+    // just killed, and no task_updated/task_notification is coming.
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(state, { type: "assistant", message: { role: "assistant", content: "Investigating" } }, at);
+    applyStreamJsonEvent(
+      state,
+      { type: "system", subtype: "task_started", tool_use_id: "toolu_bg", task_id: "task_bg", description: "sleep 8; cat …" },
+      at,
+    );
+    const card = state.items.find((item) => item.kind === "agent");
+    expect(card?.agent?.status).toBe("running");
+
+    applyStreamJsonEvent(
+      state,
+      { type: "user", message: { role: "user", content: "[Request interrupted by user for tool use]" } },
+      at,
+    );
+
+    expect(card?.agent?.status).toBe("failed");
+    expect(card?.agent?.summary).toBe("Interrupted");
+  });
+
+  it("counts zero tokens for a turn that burned none, instead of the session total", () => {
+    // The bookkeeping turn's token delta is exactly zero, and falling back to the
+    // cumulative counter there reported the whole session — a non-zero count that
+    // walked straight past the guard above and rendered "Worked for 0.1s · 1.5k
+    // tokens" as a second footer, under whatever assistant message came next.
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      { type: "assistant", message: { id: "msg-1", role: "assistant", content: [{ type: "text", text: "On it." }], usage: { input_tokens: 1200, output_tokens: 300 } } },
+      "2026-07-05T12:00:00.000Z",
+    );
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, "2026-07-05T12:00:15.000Z");
+
+    // A new assistant message (so the next footer would anchor elsewhere and not
+    // be deduped away) that consumes nothing, then an immediate result.
+    applyStreamJsonEvent(
+      state,
+      { type: "assistant", message: { id: "msg-2", role: "assistant", content: [{ type: "text", text: "" }] } },
+      "2026-07-05T12:00:15.100Z",
+    );
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, "2026-07-05T12:00:15.200Z");
+
+    const summaries = state.items.filter((item) => isTurnSummaryItem(item));
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.body).toBe("Worked for 15s · 1.5k tokens");
+  });
+
+  it("still reports the whole total when the turn's start was never seen", () => {
+    // Resuming mid-turn leaves no `turnStartTokens`; the cumulative counter is
+    // then the only estimate available and must still be reported.
+    const state = createStreamJsonState();
+    state.tokenUsage.totalTokens = 1500;
+    state.agentState = "waiting";
+
+    applyStreamJsonEvent(state, { type: "result", subtype: "success", duration_ms: 9000 }, "2026-07-05T12:00:15.000Z");
+
+    const summaries = state.items.filter((item) => isTurnSummaryItem(item));
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.body).toBe("Worked for 9.0s · 1.5k tokens");
+  });
+
+  it("ignores a subagent's result so it can't rebaseline the parent turn's footer", () => {
+    // A subagent ends its own turn with a `result` carrying `parent_tool_use_id`.
+    // Treating it as the turn ending reset `turnStartedAt`/`turnStartTokens`, so
+    // the real footer reported only the time since the last child finished — a
+    // 9-minute turn rendering as "Worked for 0.1s" with no token count.
+    const started = "2026-07-05T12:00:00.000Z";
+    const childEnded = "2026-07-05T12:08:59.900Z";
+    const ended = "2026-07-05T12:09:00.000Z";
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      { type: "assistant", message: { id: "msg-1", role: "assistant", content: [{ type: "text", text: "Sweeping." }], usage: { input_tokens: 1200, output_tokens: 300 } } },
+      started,
+    );
+    applyStreamJsonEvent(state, { type: "result", subtype: "success", parent_tool_use_id: "toolu_child" }, childEnded);
+    expect(state.items.some((item) => isTurnSummaryItem(item))).toBe(false);
+
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, ended);
+
+    const summaries = state.items.filter((item) => isTurnSummaryItem(item));
+    expect(summaries).toHaveLength(1);
+    // Full 9m wall clock and the whole turn's tokens, not the 0.1s sliver.
+    expect(summaries[0]?.body).toBe("Worked for 9m · 1.5k tokens");
+  });
+
   it("tracks status transitions for work, waiting, and needs-action events", () => {
     const state = createStreamJsonState();
 
@@ -104,6 +296,52 @@ describe("applyStreamJsonEvent", () => {
 
     applyStreamJsonEvent(state, { type: "permission", subtype: "request" }, at);
     expect(streamRuntimeEvent("thread-1", state).agentState).toBe("needs_action");
+  });
+
+  it("keeps a finished section idle when a late system notice arrives", () => {
+    // The CLI rescans skills/commands on disk and emits `system:commands_changed`
+    // to every live session, including ones idle since their `result`. That used
+    // to read as "working" and wedge the sidebar spinner forever.
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(state, { type: "assistant", message: { role: "assistant", content: "Done" } }, at);
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, at);
+    expect(state.agentState).toBe("waiting");
+
+    applyStreamJsonEvent(state, { type: "system", subtype: "commands_changed" }, at);
+    expect(streamRuntimeEvent("thread-1", state).agentState).toBe("waiting");
+  });
+
+  it("keeps a finished section idle when a background shell reports its lifecycle", () => {
+    // A turn that launches a `run_in_background` Bash gets a `command_lifecycle`
+    // event milliseconds after its `result`, and more of them whenever that
+    // shell later changes state. Treating those as activity wedged the section
+    // at "Puzzling…" long after the agent had finished and answered.
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(state, { type: "assistant", message: { role: "assistant", content: "Watching CI." } }, at);
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, at);
+    expect(state.agentState).toBe("waiting");
+
+    applyStreamJsonEvent(state, { type: "command_lifecycle" }, at);
+    expect(streamRuntimeEvent("thread-1", state).agentState).toBe("waiting");
+  });
+
+  it("does not drop a live turn back to idle when the CLI announces its boot", () => {
+    // The exec path relaunches the CLI per prompt, so `system:init` lands a beat
+    // *after* the prompt is already in flight. Reporting "waiting" there killed
+    // the spinner (sidebar and status bar) until the first real event — seconds
+    // of a section that looks idle while the transcript already says "Thinking…".
+    const state = createStreamJsonState();
+    state.agentState = "working";
+
+    applyStreamJsonEvent(state, { type: "system", subtype: "init", session_id: "11111111-1111-4111-8111-111111111111" }, at);
+    expect(streamRuntimeEvent("thread-1", state).agentState).toBe("working");
+
+    // A section that boots without a prompt still reads as idle.
+    const idle = createStreamJsonState();
+    applyStreamJsonEvent(idle, { type: "system", subtype: "init", session_id: "11111111-1111-4111-8111-111111111111" }, at);
+    expect(streamRuntimeEvent("thread-2", idle).agentState).toBe("waiting");
   });
 
   it("settles to waiting when a background-Bash task never reports completion", () => {
@@ -165,6 +403,169 @@ describe("applyStreamJsonEvent", () => {
     expect(card?.agent?.outputFile).toBe("/tmp/claude-501/proj/tasks/b7zlif8ss.output");
     // The acknowledgement itself is still suppressed — the card replaces it.
     expect(state.items.some((item) => item.title === "Tool result")).toBe(false);
+  });
+
+  it("puts a foreground shell's output on its card instead of dropping it", () => {
+    // Repro of the silent commit: Claude reuses the task_* lifecycle for plain
+    // Bash calls, so `git commit` got an agent card, and the card registered its
+    // tool_use_id as an agent — which made the tool_result get suppressed as a
+    // redundant subagent echo. With no children and no output file the card then
+    // read "No output yet…" while the gates' output was thrown away.
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      { type: "system", subtype: "task_started", tool_use_id: "toolu_git", task_id: "task_git", description: "Push to origin main" },
+      at,
+    );
+    applyStreamJsonEvent(
+      state,
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_git",
+              content: "Enumerating objects: 42, done.\nTo github.com:acme/repo.git\n   4021a5d..9f31c0e  main -> main",
+            },
+          ],
+        },
+      },
+      at,
+    );
+
+    const card = state.items.find((item) => item.kind === "agent");
+    expect(card?.agent?.outputTail).toContain("main -> main");
+    // Still only one place to read it — no duplicate row beside the card.
+    expect(state.items.some((item) => item.title === "Tool result")).toBe(false);
+  });
+
+  it("reads a command's output sink out of its shell syntax", () => {
+    // The table is the parser's contract: every case below is a form that
+    // actually appears in this repo's own transcripts, and the negative ones
+    // are the two mistakes a looser regex makes — treating `2>&1` as a filename
+    // and treating `/dev/null` as one. Both would produce a path that exists in
+    // the type system and never in the filesystem, so the card would silently
+    // stay empty and look exactly like the bug this all fixes.
+    const plan = (command: string) => parseCommandOutputPlan(command);
+
+    expect(plan("pnpm build 2>&1 | tee /tmp/build.log | tail -20")).toEqual({
+      file: "/tmp/build.log",
+      bufferedBy: "tail",
+    });
+    // `2>&1` is a stream dup, not a file — the old trap for a naive redirect parse.
+    expect(plan("pnpm build 2>&1").file).toBeUndefined();
+    expect(plan("pnpm build > /tmp/out.log 2>&1").file).toBe("/tmp/out.log");
+    expect(plan('pnpm build | tee "/tmp/with space.log"').file).toBe("/tmp/with space.log");
+    expect(plan("pnpm build | tee -a /tmp/appended.log").file).toBe("/tmp/appended.log");
+    // A redirect wins over tee: everything ends up in the redirect's target.
+    expect(plan("pnpm build | tee /tmp/t.log > /tmp/final.log").file).toBe("/tmp/final.log");
+    // /dev/null names no readable file, so tee's target is still the best tail.
+    expect(plan("pnpm build | tee /tmp/t.log > /dev/null").file).toBe("/tmp/t.log");
+    // `tail -f` streams; only a waiting stage counts as buffering.
+    expect(plan("pnpm build & tail -f /tmp/x.log").bufferedBy).toBeUndefined();
+    expect(plan("grep -c foo src | wc -l").bufferedBy).toBe("wc");
+    expect(plan("pnpm build")).toEqual({ file: undefined, bufferedBy: undefined });
+  });
+
+  it("tails the file the command itself writes when a pipe swallows stdout", () => {
+    // The push that started this: `| tee log | tail -20` sent 71KB to the log
+    // while the CLI's own output file stayed empty for 20 minutes, so the card
+    // read "No output yet…" for the whole run. The command text says where the
+    // output really went; record it so the main process can tail that instead.
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      {
+        type: "assistant",
+        message: {
+          id: "msg_1",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_push",
+              name: "Bash",
+              input: {
+                command: "cd /tmp/wt && git push origin HEAD:main 2>&1 | tee /tmp/push.log | tail -20",
+                description: "Push to origin main",
+                run_in_background: true,
+              },
+            },
+          ],
+        },
+      },
+      at,
+    );
+    applyStreamJsonEvent(
+      state,
+      { type: "system", subtype: "task_started", tool_use_id: "toolu_push", task_id: "t1", description: "Push to origin main" },
+      at,
+    );
+
+    const agent = state.items.find((item) => item.kind === "agent")?.agent;
+    expect(agent?.commandOutputFile).toBe("/tmp/push.log");
+    expect(agent?.outputBufferedBy).toBe("tail");
+  });
+
+  it("resolves the output sink when task_started arrives before the tool_use", () => {
+    // The two events race; the card must end up the same either way.
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      { type: "system", subtype: "task_started", tool_use_id: "toolu_b", task_id: "t2", description: "Build" },
+      at,
+    );
+    applyStreamJsonEvent(
+      state,
+      {
+        type: "assistant",
+        message: {
+          id: "msg_2",
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_b", name: "Bash", input: { command: "pnpm build > /tmp/build.log 2>&1" } },
+          ],
+        },
+      },
+      at,
+    );
+
+    expect(state.items.find((item) => item.kind === "agent")?.agent?.commandOutputFile).toBe("/tmp/build.log");
+  });
+
+  it("leaves a real subagent's card to its nested children", () => {
+    const state = createStreamJsonState();
+
+    applyStreamJsonEvent(
+      state,
+      {
+        type: "system",
+        subtype: "task_started",
+        tool_use_id: "toolu_ag",
+        task_id: "task_ag",
+        subagent_type: "Explore",
+        description: "Research",
+      },
+      at,
+    );
+    applyStreamJsonEvent(
+      state,
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_ag", content: "Found it in src/app.ts" }],
+        },
+      },
+      at,
+    );
+
+    expect(state.items.find((item) => item.kind === "agent")?.agent?.outputTail).toBeUndefined();
   });
 
   it("takes the output file from task_notification for a shell task only", () => {
@@ -276,6 +677,39 @@ describe("applyStreamJsonEvent", () => {
     );
     expect(card()?.agent?.status).toBe("completed");
     expect(card()?.agent?.totalTokens).toBe(41_000);
+    expect(hasBackgroundWork(state)).toBe(false);
+  });
+
+  // The section reads as `waiting` for the whole run above — which is what the
+  // reaper reads too. Without this signal it hibernates the process and the
+  // background work dies with it.
+  it("reports background work to the reaper for as long as the card runs", () => {
+    const state = createStreamJsonState();
+    expect(hasBackgroundWork(state)).toBe(false);
+
+    applyStreamJsonEvent(
+      state,
+      {
+        type: "system",
+        subtype: "task_started",
+        tool_use_id: "toolu_push",
+        task_id: "task_push",
+        description: "git push --progress",
+      },
+      at,
+    );
+    applyStreamJsonEvent(state, { type: "result", subtype: "success" }, at);
+
+    // A background shell, not a subagent: the turn is over, the push is not.
+    expect(streamRuntimeEvent("thread-1", state).agentState).toBe("waiting");
+    expect(hasBackgroundWork(state)).toBe(true);
+
+    applyStreamJsonEvent(
+      state,
+      { type: "system", subtype: "task_updated", task_id: "task_push", patch: { status: "completed" } },
+      at,
+    );
+    expect(hasBackgroundWork(state)).toBe(false);
   });
 
   it("keeps working while a genuine subagent runs, then reaps a dropped terminal event", () => {

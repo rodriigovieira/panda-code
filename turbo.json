@@ -1,5 +1,9 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  // Turbo runs tasks in a filtered environment. `scripts/with-lock.sh` sets
+  // PANDA_LOCK_HELD so a package script nested inside an already-locked root
+  // run passes straight through instead of waiting on its own parent.
+  "globalPassThroughEnv": ["PANDA_LOCK_HELD"],
   "tasks": {
     "typecheck": {
       "dependsOn": ["^typecheck"]

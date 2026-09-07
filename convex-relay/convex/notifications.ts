@@ -1,7 +1,7 @@
-import { internalAction, internalQuery, mutation } from "./_generated/server";
+import { internalAction, internalQuery, mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { internal } from "./_generated/api";
-import { requireMobile } from "./lib/auth";
+import { requireDevice, requireMobile } from "./lib/auth";
 
 type PushTokenRow = {
   token: string;
@@ -199,6 +199,20 @@ export const prefsForMobile = internalQuery({
   },
 });
 
+/** Mobile: read the relay copy so desktop-made preference changes sync back. */
+export const getNotificationPrefs = query({
+  args: { mobileId: v.string(), token: v.string() },
+  handler: async (ctx, { mobileId, token }): Promise<NotificationPrefs> => {
+    const mobile = await requireMobile(ctx, mobileId, token);
+    return {
+      muted: mobile.notifMuted === true,
+      notifyOnDone: mobile.notifyOnDone !== false,
+      notifyOnNeedsApproval: mobile.notifyOnNeedsApproval !== false,
+      notifyOnError: mobile.notifyOnError !== false,
+    };
+  },
+});
+
 /// Mobile: update this phone's notification preferences.
 export const setNotificationPrefs = mutation({
   args: {
@@ -258,6 +272,47 @@ export const setSessionSubscription = mutation({
       updatedAt: now,
     });
     return null;
+  },
+});
+
+/** Desktop: read how many paired phones are subscribed to one session. */
+export const sessionSubscriptionForDevice = query({
+  args: { deviceId: v.string(), token: v.string(), sessionId: v.string() },
+  handler: async (ctx, { deviceId, token, sessionId }) => {
+    await requireDevice(ctx, deviceId, token);
+    const [mobiles, session, overrides] = await Promise.all([
+      ctx.db.query("mobileClients").withIndex("by_device", (q) => q.eq("deviceId", deviceId)).collect(),
+      ctx.db.query("sessions").withIndex("by_device_session", (q) => q.eq("deviceId", deviceId).eq("sessionId", sessionId)).unique(),
+      ctx.db.query("sessionSubs").withIndex("by_device_session", (q) => q.eq("deviceId", deviceId).eq("sessionId", sessionId)).collect(),
+    ]);
+    const byMobile = new Map(overrides.map((row) => [row.mobileId, row.subscribed]));
+    const subscribedPhones = mobiles.filter((mobile) =>
+      byMobile.get(mobile.mobileId) ?? session?.startedByMobileId === mobile.mobileId,
+    ).length;
+    return { available: true, phoneCount: mobiles.length, subscribedPhones };
+  },
+});
+
+/** Desktop: subscribe or unsubscribe every paired phone to one session. */
+export const setSessionSubscriptionByDevice = mutation({
+  args: { deviceId: v.string(), token: v.string(), sessionId: v.string(), subscribed: v.boolean() },
+  handler: async (ctx, { deviceId, token, sessionId, subscribed }) => {
+    await requireDevice(ctx, deviceId, token);
+    const [mobiles, overrides] = await Promise.all([
+      ctx.db.query("mobileClients").withIndex("by_device", (q) => q.eq("deviceId", deviceId)).collect(),
+      ctx.db.query("sessionSubs").withIndex("by_device_session", (q) => q.eq("deviceId", deviceId).eq("sessionId", sessionId)).collect(),
+    ]);
+    const byMobile = new Map(overrides.map((row) => [row.mobileId, row]));
+    const now = Date.now();
+    await Promise.all(mobiles.map(async (mobile) => {
+      const existing = byMobile.get(mobile.mobileId);
+      if (existing) {
+        await ctx.db.patch(existing._id, { subscribed, updatedAt: now });
+      } else {
+        await ctx.db.insert("sessionSubs", { deviceId, sessionId, mobileId: mobile.mobileId, subscribed, updatedAt: now });
+      }
+    }));
+    return { available: true, phoneCount: mobiles.length, subscribedPhones: subscribed ? mobiles.length : 0 };
   },
 });
 

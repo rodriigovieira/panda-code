@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../relay/relay_api.dart';
 import '../../state/providers.dart';
 import '../../theme/panda_tokens.dart';
+import '../../widgets/toast/panda_toast.dart';
 import '../models.dart';
 
 /// Bottom sheet showing the account's plan-usage rate-limit windows. The numbers
@@ -28,6 +29,7 @@ class _UsageSheet extends ConsumerStatefulWidget {
 class _UsageSheetState extends ConsumerState<_UsageSheet> {
   late Future<DeviceStatus?> _future;
   AgentRuntime _provider = AgentRuntime.claude;
+  bool _refreshing = false;
 
   @override
   void initState() {
@@ -40,7 +42,40 @@ class _UsageSheetState extends ConsumerState<_UsageSheet> {
     return api?.deviceStatus();
   }
 
-  void _refresh() => setState(() => _future = _load());
+  /// Same "force" behavior as the desktop's own Refresh button: ask the desktop
+  /// to bypass its periodic cache floor and query plan usage right now, rather
+  /// than re-reading whatever the relay already has cached (which, within the
+  /// cache window, is exactly what tapping this used to do — nothing visibly
+  /// changed). See [RelayApi.refreshUsage].
+  Future<void> _refresh() async {
+    if (_refreshing) return;
+    final api = await ref.read(relayApiProvider.future);
+    if (api == null) {
+      showToast('Not paired with a desktop.', variant: ToastVariant.error);
+      return;
+    }
+    setState(() => _refreshing = true);
+    try {
+      final usage = await api.refreshUsage();
+      if (!mounted) return;
+      final previous = await _future;
+      setState(() {
+        _future = Future.value(DeviceStatus(
+          online: previous?.online ?? true,
+          name: previous?.name,
+          lastHeartbeatAt: previous?.lastHeartbeatAt,
+          usageClaude: usage.claude ?? previous?.usageClaude,
+          usageCodex: usage.codex ?? previous?.usageCodex,
+        ));
+      });
+    } catch (error) {
+      if (!mounted) return;
+      showToast('$error'.replaceFirst('Exception: ', ''),
+          variant: ToastVariant.error);
+    } finally {
+      if (mounted) setState(() => _refreshing = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -64,9 +99,15 @@ class _UsageSheetState extends ConsumerState<_UsageSheet> {
                   ),
                   const Spacer(),
                   IconButton(
-                    icon: const Icon(Icons.refresh, size: 20),
+                    icon: _refreshing
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.refresh, size: 20),
                     tooltip: 'Refresh',
-                    onPressed: _refresh,
+                    onPressed: _refreshing ? null : _refresh,
                   ),
                 ],
               ),

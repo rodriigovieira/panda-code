@@ -68,11 +68,15 @@ class _AppLockGateState extends ConsumerState<AppLockGate>
 
   @override
   Widget build(BuildContext context) {
-    final paired = ref.watch(pairingProvider).valueOrNull != null;
+    final pairing = ref.watch(pairingProvider);
+    // Do not briefly expose restored routes while credentials are loading.
+    if (pairing.isLoading || pairing.hasError) return const _PrivacyCover();
+    final paired = pairing.valueOrNull != null;
     if (!paired) return widget.child;
 
-    final settings =
-        ref.watch(settingsProvider).valueOrNull ?? const AppSettings();
+    final settingsState = ref.watch(settingsProvider);
+    if (settingsState.isLoading || settingsState.hasError) return const _PrivacyCover();
+    final settings = settingsState.valueOrNull ?? const AppSettings();
     // Keep the controller in sync with the latest preferences.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
@@ -95,7 +99,10 @@ class _AppLockGateState extends ConsumerState<AppLockGate>
 
     return Stack(
       children: [
-        widget.child,
+        ExcludeFocus(
+          excluding: showLock || showPrivacyCover,
+          child: Offstage(offstage: showLock || showPrivacyCover, child: widget.child),
+        ),
         if (showPrivacyCover) const _PrivacyCover(),
         if (showLock) LockScreen(authInProgress: lock.authInProgress),
       ],

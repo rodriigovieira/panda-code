@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { requireDevice, requireMobile } from "./lib/auth";
 import { deletePayload, readPayloadCipher } from "./lib/commandPayloads";
+import { deleteResult, readResultCipher, writeResultCipher } from "./lib/commandResults";
 import {
   COMMAND_RATE_LIMIT_MAX,
   COMMAND_RATE_LIMIT_WINDOW_MS,
@@ -19,18 +20,28 @@ export const enqueue = mutation({
     type: v.union(
       v.literal("start"),
       v.literal("input"),
+      v.literal("queue"),
       v.literal("stop"),
+      v.literal("notification-settings"), // encrypted per-section desktop/agent routing preferences
       v.literal("switch"),
       v.literal("approve"),
       v.literal("deny"),
       v.literal("btw"),
       v.literal("usage-cost"),
       v.literal("session-files"),
+      v.literal("usage-refresh"),
+      v.literal("backlog"),
+      v.literal("schedule"),
+      v.literal("git-status"),
+      v.literal("machine-stats"),
+      v.literal("scratch-workspace"),
+      v.literal("media"),
     ),
     payloadCipher: v.optional(v.string()),
   },
   handler: async (ctx, { mobileId, token, sessionId, type, payloadCipher }) => {
     const mobile = await requireMobile(ctx, mobileId, token);
+    if (!payloadCipher) throw new Error("AUTHENTICATED_COMMAND_REQUIRED: Update Panda Code on your phone.");
     const now = Date.now();
     // Count only rows inside the window, via the (mobileId, createdAt) index.
     // Taking the last N rows regardless of age meant re-reading the last N
@@ -115,7 +126,22 @@ export const ack = mutation({
     await requireDevice(ctx, deviceId, token);
     const cmd = await ctx.db.get(commandId);
     if (!cmd || cmd.deviceId !== deviceId) throw new Error("COMMAND_NOT_FOUND");
-    await ctx.db.patch(commandId, { status, resultCipher });
+    // A failure message is one sentence and is the whole point of `watchMine`,
+    // so it stays inline. A successful result is a board / git status / process
+    // list and goes out of line, where only the phone waiting on THIS command
+    // reads it (see `lib/commandResults.ts`).
+    if (status === "error") {
+      await ctx.db.patch(commandId, { status, resultCipher, hasResult: false });
+    } else {
+      if (resultCipher !== undefined) {
+        await writeResultCipher(ctx, commandId, resultCipher);
+      }
+      await ctx.db.patch(commandId, {
+        status,
+        resultCipher: undefined,
+        hasResult: resultCipher !== undefined,
+      });
+    }
     // The request has been executed; nothing will read the payload again. Freeing
     // it here is what keeps attachments from sitting in the table for a week
     // (`CLOSED_COMMAND_RETENTION_MS`) being re-read by the prune sweep.
@@ -127,8 +153,11 @@ export const ack = mutation({
  * Mobile watches its own recent commands' status (pending → claimed → done/error).
  *
  * Deliberately projects the routing/outcome fields only, and never the request
- * payload: this query re-fires on every transition of every row it reads, so a
- * single attached screenshot would otherwise be re-shipped on each one.
+ * payload or a successful result: this query re-fires on every transition of
+ * every row it reads, so a single attached screenshot — or one kanban board —
+ * would otherwise be re-shipped on each one. `resultCipher` here is an ERROR
+ * message and nothing else; a phone waiting on an answer subscribes to
+ * {@link result} for its own command instead.
  */
 export const watchMine = query({
   args: { mobileId: v.string(), token: v.string() },
@@ -148,8 +177,52 @@ export const watchMine = query({
       type: row.type,
       status: row.status,
       resultCipher: row.resultCipher,
+      hasResult: row.hasResult ?? false,
       createdAt: row.createdAt,
       claimedAt: row.claimedAt,
     }));
+  },
+});
+
+/**
+ * Mobile waits on ONE command it issued: its status, and its result once the
+ * desktop has answered.
+ *
+ * This is what a request/response round trip subscribes to. It replaces a
+ * 350 ms poll of `watchMine` that re-read the phone's last ten commands — with
+ * their full results — sixty times per request; here the read set is a single
+ * command row plus at most one result row, and it re-fires once per transition.
+ */
+export const result = query({
+  args: { mobileId: v.string(), token: v.string(), commandId: v.id("commands") },
+  handler: async (ctx, { mobileId, token, commandId }) => {
+    await requireMobile(ctx, mobileId, token);
+    const cmd = await ctx.db.get(commandId);
+    if (!cmd || cmd.mobileId !== mobileId) return null;
+    const settled = cmd.status === "done" || cmd.status === "error";
+    return {
+      status: cmd.status,
+      // Only read the result table once the command has actually settled, so the
+      // pending/claimed re-fires never touch it.
+      resultCipher: settled ? await readResultCipher(ctx, cmd) : undefined,
+    };
+  },
+});
+
+/**
+ * Mobile drops a result it has read. The phone reads each result exactly once,
+ * so holding the row for the full `CLOSED_COMMAND_RETENTION_MS` would leave a
+ * week of boards and process lists for the sweep to re-read on every pass.
+ * Best-effort: anything not consumed is swept with its command.
+ */
+export const consumeResult = mutation({
+  args: { mobileId: v.string(), token: v.string(), commandId: v.id("commands") },
+  handler: async (ctx, { mobileId, token, commandId }) => {
+    await requireMobile(ctx, mobileId, token);
+    const cmd = await ctx.db.get(commandId);
+    if (!cmd || cmd.mobileId !== mobileId) return null;
+    await deleteResult(ctx, commandId);
+    if (cmd.hasResult) await ctx.db.patch(commandId, { hasResult: false });
+    return null;
   },
 });

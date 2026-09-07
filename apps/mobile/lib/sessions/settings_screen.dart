@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../dictation/dictation_service.dart';
 import '../state/providers.dart';
 import '../theme/panda_tokens.dart';
 import 'models.dart';
@@ -56,6 +57,13 @@ class SettingsScreen extends ConsumerWidget {
             onDelayChanged: (v) =>
                 ref.read(settingsProvider.notifier).setAutoLockDelay(v),
           ),
+          const SizedBox(height: 12),
+          _BypassBiometricCard(
+            enabled: settings.bypassBiometricEnabled,
+            onToggle: (v) => ref
+                .read(settingsProvider.notifier)
+                .setBypassBiometricEnabled(v),
+          ),
           const SizedBox(height: 24),
           const _SectionLabel('Device'),
           _UnpairCard(
@@ -104,8 +112,7 @@ class SettingsScreen extends ConsumerWidget {
 class _UsageCostCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return Card(
-      clipBehavior: Clip.antiAlias,
+    return _Section(
       child: ListTile(
         leading: const Icon(Icons.savings_outlined),
         title: const Text('Usage & cost'),
@@ -130,12 +137,36 @@ class _SectionLabel extends StatelessWidget {
       padding: const EdgeInsets.only(left: 4, bottom: 8),
       child: Text(
         text.toUpperCase(),
-        style: Theme.of(context).textTheme.labelMedium?.copyWith(
-              color: context.tokens.subtle,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0.8,
-            ),
+        style: TextStyle(
+          color: context.tokens.muted,
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0.6,
+        ),
       ),
+    );
+  }
+}
+
+/// One rounded, bordered panel — the same container `backlog`, `schedule` and
+/// `git status` build cards from, so a settings section reads as the same
+/// surface rather than Material's generic [Card].
+class _Section extends StatelessWidget {
+  const _Section({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final tokens = context.tokens;
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: tokens.panel,
+        borderRadius: tokens.radius.mdR,
+        border: Border.all(color: tokens.lineSoft),
+      ),
+      child: child,
     );
   }
 }
@@ -149,9 +180,9 @@ class _ChatTextSizeCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final tokens = context.tokens;
     final percent = (scale * 100).round();
-    return Card(
-      margin: EdgeInsets.zero,
+    return _Section(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
         child: Column(
@@ -159,9 +190,11 @@ class _ChatTextSizeCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(Icons.text_fields, size: 18),
+                Icon(Icons.text_fields, size: 18, color: tokens.muted),
                 const SizedBox(width: 10),
-                Text('Text size', style: theme.textTheme.titleMedium),
+                Text('Text size',
+                    style: TextStyle(
+                        fontSize: 14, fontWeight: FontWeight.w600, color: tokens.text)),
                 const Spacer(),
                 Text('$percent%',
                     style: theme.textTheme.bodyMedium
@@ -231,8 +264,7 @@ class _AppLockCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Card(
-      margin: EdgeInsets.zero,
+    return _Section(
       child: Column(
         children: [
           SwitchListTile(
@@ -280,6 +312,31 @@ class _AppLockCard extends StatelessWidget {
   }
 }
 
+class _BypassBiometricCard extends StatelessWidget {
+  const _BypassBiometricCard({required this.enabled, required this.onToggle});
+
+  final bool enabled;
+  final ValueChanged<bool> onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return _Section(
+      child: SwitchListTile(
+        secondary: Icon(Icons.gpp_maybe_outlined,
+            color: theme.colorScheme.primary),
+        title: const Text('Face ID for full-access sessions'),
+        subtitle: const Text(
+          'Require Face ID (or passcode) before starting a session that '
+          'bypasses permission checks on the desktop.',
+        ),
+        value: enabled,
+        onChanged: onToggle,
+      ),
+    );
+  }
+}
+
 class _AppearanceCard extends StatelessWidget {
   const _AppearanceCard({required this.settings, required this.notifier});
 
@@ -300,14 +357,16 @@ class _AppearanceCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      margin: EdgeInsets.zero,
+    final tokens = context.tokens;
+    final headingStyle =
+        TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: tokens.text);
+    return _Section(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Theme', style: Theme.of(context).textTheme.titleSmall),
+            Text('Theme', style: headingStyle),
             SizedBox(height: 8),
             SegmentedButton<AppThemeMode>(
               segments: const [
@@ -321,7 +380,7 @@ class _AppearanceCard extends StatelessWidget {
               onSelectionChanged: (s) => notifier.setThemeMode(s.first),
             ),
             SizedBox(height: 16),
-            Text('Accent', style: Theme.of(context).textTheme.titleSmall),
+            Text('Accent', style: headingStyle),
             const SizedBox(height: 8),
             Wrap(
               spacing: 12,
@@ -376,8 +435,7 @@ class _ChatBehaviorCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      margin: EdgeInsets.zero,
+    return _Section(
       child: Column(
         children: [
           SwitchListTile(
@@ -400,6 +458,44 @@ class _ChatBehaviorCard extends StatelessWidget {
                 'Show only messages and the final answer; fold the work away'),
             value: settings.focusMode,
             onChanged: notifier.setFocusMode,
+          ),
+          const Divider(height: 1),
+          ListTile(
+            leading: const Icon(Icons.mic_none),
+            title: const Text('Dictation language'),
+            subtitle: const Text(
+                'What the microphone expects to hear — independent of your '
+                'phone’s language'),
+            trailing: TextButton(
+              onPressed: () async {
+                final picked = await showLabeledOptionSheet<String>(
+                  context,
+                  title: 'Dictation language',
+                  items: DictationLocale.options,
+                  selected: settings.dictationLocale,
+                );
+                if (picked != null) notifier.setDictationLocale(picked);
+              },
+              child: Text(DictationLocale.label(settings.dictationLocale)),
+            ),
+          ),
+          const Divider(height: 1),
+          SwitchListTile(
+            title: const Text('Dictation diagnostics'),
+            subtitle: const Text(
+                'Send dictation timing to your Mac to debug the microphone. '
+                'Event counts only — never what you said.'),
+            value: settings.dictationDiagnostics,
+            onChanged: notifier.setDictationDiagnostics,
+          ),
+          const Divider(height: 1),
+          SwitchListTile(
+            title: const Text('Performance diagnostics'),
+            subtitle: const Text(
+                'Send dropped-frame and timing samples to your Mac to debug '
+                'lag. Durations and counts only — never message content.'),
+            value: settings.perfDiagnostics,
+            onChanged: notifier.setPerfDiagnostics,
           ),
           const Divider(height: 1),
           SwitchListTile(
@@ -468,8 +564,7 @@ class _DefaultsCard extends StatelessWidget {
             ? settings.defaultPermission
             : permissions.first.value;
 
-    return Card(
-      margin: EdgeInsets.zero,
+    return _Section(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
         child: Column(
@@ -668,8 +763,7 @@ class _NotificationsCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final muted = settings.notificationsMuted;
-    return Card(
-      margin: EdgeInsets.zero,
+    return _Section(
       child: Column(
         children: [
           SwitchListTile(
@@ -723,8 +817,7 @@ class _UnpairCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Card(
-      margin: EdgeInsets.zero,
+    return _Section(
       child: ListTile(
         leading: Icon(Icons.link_off, color: theme.colorScheme.error),
         title: const Text('Unsync this Mac'),

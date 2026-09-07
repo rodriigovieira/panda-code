@@ -6,6 +6,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:pasteboard/pasteboard.dart';
 import 'package:uuid/uuid.dart';
 
+import '../dictation/dictation_button.dart';
 import '../security/biometric_auth.dart';
 import '../state/providers.dart';
 import '../theme/panda_tokens.dart';
@@ -20,9 +21,32 @@ import 'widgets/image_attachment_view.dart';
 /// Shows a fresh create-session bottom sheet.
 ///
 /// The sheet edits a local draft; no relay row or desktop process is created
-/// until the first prompt is sent.
-Future<void> showNewSessionSheet(BuildContext context, WidgetRef ref) {
-  ref.read(sessionDraftProvider.notifier).clear();
+/// until the first prompt is sent. [workspacePath] pre-selects a workspace —
+/// used by the per-workspace "new session" shortcut in the session list — and
+/// falls back to the form's own most-recently-active default when omitted.
+Future<void> showNewSessionSheet(
+  BuildContext context,
+  WidgetRef ref, {
+  String? workspacePath,
+  /// Opens the draft as a sub-thread of this session. The link travels in the
+  /// `start` payload, so it exists from the moment the section does rather than
+  /// being patched on afterwards (which would show it top-level for a beat).
+  String? parentSessionId,
+  /// Seeds the composer — e.g. a backlog item's title + description — ready to
+  /// edit and send. Nothing is sent automatically.
+  String? prompt,
+}) {
+  final notifier = ref.read(sessionDraftProvider.notifier);
+  notifier.clear();
+  if ((workspacePath != null && workspacePath.isNotEmpty) ||
+      (parentSessionId != null && parentSessionId.isNotEmpty) ||
+      (prompt != null && prompt.isNotEmpty)) {
+    notifier.update(SessionDraft(
+      workspacePath: workspacePath,
+      parentSessionId: parentSessionId,
+      prompt: prompt ?? '',
+    ));
+  }
   return showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
@@ -55,6 +79,7 @@ class NewSessionScreen extends ConsumerStatefulWidget {
 
 class _NewSessionScreenState extends ConsumerState<NewSessionScreen> {
   final _promptController = TextEditingController();
+  final _promptFocus = FocusNode();
   final _customModelController = TextEditingController();
   final _imagePicker = ImagePicker();
   final _uuid = const Uuid();
@@ -77,6 +102,7 @@ class _NewSessionScreenState extends ConsumerState<NewSessionScreen> {
   @override
   void dispose() {
     _promptController.dispose();
+    _promptFocus.dispose();
     _customModelController.dispose();
     super.dispose();
   }
@@ -107,7 +133,11 @@ class _NewSessionScreenState extends ConsumerState<NewSessionScreen> {
 
   List<WorkspaceOption> _workspaces() {
     final rows = ref.watch(sessionsStreamProvider).valueOrNull ?? const [];
-    return workspaceOptionsFromSessions(rows);
+    final scratchPath = ref.watch(scratchWorkspaceProvider).valueOrNull;
+    return workspaceOptionsFromSessions(
+      rows,
+      scratchWorkspacePath: scratchPath,
+    );
   }
 
   /// The draft's workspace, defaulting to the most recently active one so the
@@ -288,8 +318,12 @@ class _NewSessionScreenState extends ConsumerState<NewSessionScreen> {
     }
 
     // Starting a full-access session bypasses every permission check on the
-    // desktop, so require a fresh Face ID (or passcode) confirmation first.
-    if (isFullAccessPermissionMode(draft.permissionMode)) {
+    // desktop, so require a fresh Face ID (or passcode) confirmation first —
+    // unless the user has opted out in Settings.
+    final requireBiometric =
+        ref.read(settingsProvider).valueOrNull?.bypassBiometricEnabled ??
+            true;
+    if (requireBiometric && isFullAccessPermissionMode(draft.permissionMode)) {
       final ok = await BiometricAuth.authenticate();
       if (!ok) {
         showToast('Face ID required to start a full-access session',
@@ -372,7 +406,8 @@ class _NewSessionScreenState extends ConsumerState<NewSessionScreen> {
     if (draft.permissionMode.isEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        if (ref.read(sessionDraftProvider).permissionMode.isNotEmpty) return;
+        final current = ref.read(sessionDraftProvider);
+        if (current.permissionMode.isNotEmpty) return;
         ref.read(sessionDraftProvider.notifier).update(
               draftFromDefaults(
                 SessionDefaults(
@@ -383,7 +418,13 @@ class _NewSessionScreenState extends ConsumerState<NewSessionScreen> {
                   permissionMode: settings.defaultPermission,
                 ),
                 workspace?.path,
-              ).copyWith(prompt: _promptController.text),
+              ).copyWith(
+                prompt: _promptController.text,
+                // draftFromDefaults() builds a brand-new draft with no parent —
+                // without this, hydrating defaults on the first frame silently
+                // turned every "New sub-thread" sheet into a top-level session.
+                parentSessionId: current.parentSessionId,
+              ),
             );
       });
     }
@@ -516,6 +557,7 @@ class _NewSessionScreenState extends ConsumerState<NewSessionScreen> {
                 ),
                 _DraftComposer(
                   controller: _promptController,
+                  focusNode: _promptFocus,
                   images: draft.images,
                   enabled: !_starting,
                   starting: _starting,
@@ -567,12 +609,15 @@ class _OfflineNotice extends StatelessWidget {
   }
 }
 
-/// The draft's composer. Same shape as the session composer, but its action
-/// starts the session rather than sending into one — and it can never "queue",
-/// because there is no turn in flight to queue behind.
-class _DraftComposer extends StatelessWidget {
+/// The draft's composer. Same shape and behaviour as the live session
+/// composer — including the dictation-aware expansion and the mic/action
+/// overlay anchored inside the field — but its action starts the session
+/// rather than sending into one, and it can never "queue", because there is
+/// no turn in flight to queue behind.
+class _DraftComposer extends StatefulWidget {
   const _DraftComposer({
     required this.controller,
+    required this.focusNode,
     required this.images,
     required this.enabled,
     required this.starting,
@@ -584,6 +629,7 @@ class _DraftComposer extends StatelessWidget {
   });
 
   final TextEditingController controller;
+  final FocusNode focusNode;
   final List<ConversationImage> images;
   final bool enabled;
   final bool starting;
@@ -594,8 +640,21 @@ class _DraftComposer extends StatelessWidget {
   final VoidCallback onStart;
 
   @override
+  State<_DraftComposer> createState() => _DraftComposerState();
+}
+
+class _DraftComposerState extends State<_DraftComposer> {
+  /// Dictation gets a taller field, mirroring the live session composer.
+  bool _dictating = false;
+
+  final _micKey = GlobalKey<DictationButtonState>();
+
+  @override
   Widget build(BuildContext context) {
     final t = context.tokens;
+    final controller = widget.controller;
+    final enabled = widget.enabled;
+    final images = widget.images;
     return SafeArea(
       top: false,
       child: DecoratedBox(
@@ -611,54 +670,86 @@ class _DraftComposer extends StatelessWidget {
             children: [
               if (images.isNotEmpty) ...[
                 ImageAttachmentStrip(
-                    images: images, onRemove: onRemoveImage, compact: true),
+                    images: images,
+                    onRemove: widget.onRemoveImage,
+                    compact: true),
                 const SizedBox(height: 8),
               ],
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  IconButton(
-                    onPressed: enabled ? onAttach : null,
-                    tooltip: 'Attach or paste image',
-                    icon: const Icon(Icons.add_photo_alternate_outlined),
-                    constraints: t.control.tapTarget,
-                  ),
-                  const SizedBox(width: 4),
-                  Expanded(
-                    child: TextField(
-                      controller: controller,
-                      enabled: enabled,
-                      autofocus: true,
-                      minLines: 1,
-                      maxLines: 6,
-                      keyboardType: TextInputType.multiline,
-                      textInputAction: TextInputAction.newline,
-                      decoration: InputDecoration(
-                        hintText: hint,
-                        border: const OutlineInputBorder(),
-                        isDense: true,
-                      ),
+                  // Attach lives outside the field. Hidden while dictating,
+                  // same as the live composer: the taller field should show
+                  // as much of the transcript as possible.
+                  if (!_dictating) ...[
+                    IconButton(
+                      onPressed: enabled ? widget.onAttach : null,
+                      tooltip: 'Attach or paste image',
+                      icon: const Icon(Icons.add_photo_alternate_outlined),
+                      constraints: t.control.tapTarget,
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  IconButton.filled(
-                    onPressed: canStart ? onStart : null,
-                    tooltip: 'Start session',
-                    icon: starting
-                        ? SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(
-                                strokeWidth: 2, color: t.accent.on),
-                          )
-                        : const Icon(Icons.arrow_upward),
-                    constraints: t.control.tapTarget,
-                    style: IconButton.styleFrom(
-                      backgroundColor: t.accent.solid,
-                      foregroundColor: t.accent.on,
-                      disabledBackgroundColor: t.panelStrong,
-                      disabledForegroundColor: t.subtle,
-                      shape: RoundedRectangleBorder(borderRadius: t.radius.lgR),
+                    const SizedBox(width: 4),
+                  ],
+                  Expanded(
+                    child: AnimatedSize(
+                      duration: const Duration(milliseconds: 200),
+                      curve: Curves.easeOutCubic,
+                      alignment: Alignment.bottomCenter,
+                      // The controls sit *inside* the field, anchored to its
+                      // bottom-right corner and stacked vertically, matching
+                      // the live session composer.
+                      child: Stack(
+                        alignment: Alignment.bottomRight,
+                        children: [
+                          TextField(
+                            controller: controller,
+                            focusNode: widget.focusNode,
+                            enabled: enabled,
+                            autofocus: true,
+                            minLines: _dictating ? 5 : 1,
+                            maxLines: _dictating ? 12 : 6,
+                            keyboardType: TextInputType.multiline,
+                            textInputAction: TextInputAction.newline,
+                            decoration: InputDecoration(
+                              hintText: _dictating ? 'Listening…' : widget.hint,
+                              border: const OutlineInputBorder(),
+                              isDense: true,
+                              // Stacked vertically, so only one control's
+                              // width needs reserving, in both states.
+                              contentPadding: const EdgeInsets.only(
+                                left: 12,
+                                top: 12,
+                                bottom: 12,
+                                right: 46,
+                              ),
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.all(5),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                // Mic on top, so start keeps the corner in
+                                // both states and never moves under your
+                                // thumb.
+                                if (_dictating) ...[
+                                  _mic(enabled: enabled),
+                                  const SizedBox(height: 4),
+                                  _start(t),
+                                ] else
+                                  ValueListenableBuilder<TextEditingValue>(
+                                    valueListenable: controller,
+                                    builder: (context, value, _) =>
+                                        value.text.trim().isEmpty &&
+                                                images.isEmpty
+                                            ? _mic(enabled: enabled)
+                                            : _start(t),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ],
@@ -666,6 +757,55 @@ class _DraftComposer extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// One instance for the whole composer. The key carries recording state
+  /// across rebuilds and lets start stop the recogniser before submitting.
+  Widget _mic({required bool enabled}) => DictationButton(
+        key: _micKey,
+        controller: widget.controller,
+        focusNode: widget.focusNode,
+        enabled: enabled,
+        onNotice: (message, {bool isError = false}) => showToast(
+          message,
+          variant: isError ? ToastVariant.error : ToastVariant.info,
+        ),
+        onListeningChanged: (listening) =>
+            setState(() => _dictating = listening),
+      );
+
+  /// Stop the mic, then start. Starting under a live dictation refills the
+  /// composer, same reasoning as the live composer's send.
+  Future<void> _stopThenStart() async {
+    await _micKey.currentState?.stopDictation();
+    widget.onStart();
+  }
+
+  Widget _start(PandaTokens t) {
+    return IconButton.filled(
+      onPressed: widget.canStart
+          ? (_dictating ? _stopThenStart : widget.onStart)
+          : null,
+      tooltip: 'Start session',
+      icon: widget.starting
+          ? SizedBox(
+              width: 18,
+              height: 18,
+              child:
+                  CircularProgressIndicator(strokeWidth: 2, color: t.accent.on),
+            )
+          : const Icon(Icons.arrow_upward, size: 20),
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+      padding: EdgeInsets.zero,
+      style: IconButton.styleFrom(
+        backgroundColor: t.accent.solid,
+        foregroundColor: t.accent.on,
+        disabledBackgroundColor: t.panelStrong,
+        disabledForegroundColor: t.subtle,
+        shape: RoundedRectangleBorder(borderRadius: t.radius.lgR),
       ),
     );
   }

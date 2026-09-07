@@ -70,7 +70,8 @@ function formatStamp(iso: string): string {
 
 function headerFor(meta: ExportMeta, items: ConversationItem[]): string {
   const lines = [`# ${meta.title?.trim() || "Panda Code session"}`, ""];
-  const agent = [meta.runtime === "codex" ? "Codex" : "Claude Code", meta.model].filter(Boolean).join(" · ");
+  const agentName = meta.runtime === "codex" ? "Codex" : meta.runtime === "groq" ? "Groq" : "Claude Code";
+  const agent = [agentName, meta.model].filter(Boolean).join(" · ");
   lines.push(`- Exported: ${formatStamp(meta.exportedAt ?? new Date().toISOString())}`);
   if (meta.cwd) lines.push(`- Workspace: ${meta.cwd}`);
   lines.push(`- Agent: ${agent}`);

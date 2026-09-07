@@ -32,6 +32,11 @@ describe("findModelRate", () => {
     expect(findModelRate("gpt-5-codex")?.label).toBe("GPT-5 Codex");
   });
 
+  it("does not price a newer dotted model id as an older prefix", () => {
+    expect(findModelRate("gpt-5.5")).toBeNull();
+    expect(modelDisplayLabel("gpt-5.5")).toBe("gpt-5.5");
+  });
+
   it("returns null for an unknown or missing model", () => {
     expect(findModelRate("")).toBeNull();
     expect(findModelRate(undefined)).toBeNull();

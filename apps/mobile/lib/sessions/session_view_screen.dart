@@ -11,11 +11,13 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:uuid/uuid.dart';
 
+import '../diagnostics/perf_trace.dart';
 import '../relay/relay_api.dart';
 import '../relay/relay_client.dart';
 import '../state/providers.dart';
 import '../widgets/toast/panda_toast.dart';
 import 'export.dart';
+import '../dictation/dictation_button.dart';
 import 'image_prep.dart';
 import 'models.dart';
 import 'remote_image_store.dart';
@@ -23,16 +25,42 @@ import 'session_model_sheet.dart';
 import 'scroll_position_store.dart';
 import 'settings_store.dart';
 import 'slash_commands.dart';
+import '../theme/panda_theme.dart';
+import '../backlog/backlog_item_screen.dart';
+import '../backlog/backlog_models.dart';
+import '../backlog/card_mentions.dart';
+import 'new_session_screen.dart';
 import 'widgets/approval_bar.dart';
+import 'widgets/notification_channels_sheet.dart';
 import 'widgets/btw_sheet.dart';
 import 'widgets/conversation_item_view.dart';
 import 'widgets/image_attachment_view.dart';
+import 'widgets/media_viewer_screen.dart';
 import 'widgets/prompt_sheet.dart';
 import 'widgets/runtime_header.dart';
 import 'widgets/session_files_sheet.dart';
 import 'widgets/session_info_sheet.dart';
 import 'widgets/work_group_view.dart';
+import 'widgets/card_mention_palette.dart';
 import 'widgets/slash_command_palette.dart';
+
+/// Is this section blocked on an approval we can actually answer?
+///
+/// `needs_action` means "this section wants the operator", which covers both a
+/// real approval AND a terminal failure — a Codex usage limit, a crashed turn —
+/// where the desktop parks the section at `needs_action` with nothing pending.
+/// Only a real approval carries a promptId, and without one the Approve/Deny
+/// buttons can never resolve. Since the bar replaces the composer, treating
+/// every `needs_action` as an approval left a rate-limited session
+/// unrecoverable from the phone: buttons that did nothing, no way to type.
+bool sessionAwaitsApproval(SessionRow row) {
+  if (row.agentState != AgentState.needsAction) {
+    return false;
+  }
+  final promptId =
+      row.runtime?.pendingApproval?.promptId ?? row.runtime?.pendingPromptId;
+  return promptId != null && promptId.isNotEmpty;
+}
 
 /// Live session view: a real Claude Code transcript. Subscribes to the relay
 /// TAIL (seq cursor) for conversation deltas and to the live session row for
@@ -54,6 +82,9 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
   // growth is a new seq under the same id) instead of rendering each partial.
   final _indexById = <String, int>{};
   final _promptController = TextEditingController();
+  // Held here so the mic button can hand focus straight back to the field:
+  // dictation and typing are meant to be usable in the same breath.
+  final _promptFocus = FocusNode();
   final _scrollController = ScrollController();
   final _imagePicker = ImagePicker();
 
@@ -69,7 +100,6 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
   int _cursor =
       0; // highest seq we've appended (tail advances forward from here)
   bool _sending = false; // a send network call is currently in flight
-  bool _autoFlushing = false; // guards the queued auto-flush against re-entry
   bool _approving = false;
   String? _error;
 
@@ -93,9 +123,27 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
   bool _historyDone = false;
   bool _loadingMore = false;
 
+  /// When the auto-trigger in [_onScroll] last fired [_loadEarlier]. A
+  /// reversed `ListView.builder`'s `maxScrollExtent` is only an estimate for
+  /// unbuilt children, and inserting a page of history changes it — which
+  /// re-fires this controller's listener (any metrics change does, not just a
+  /// real drag) before the new items have actually been laid out and measured.
+  /// Without a cooldown, an estimate that doesn't clear the trigger margin on
+  /// the first pass re-triggers immediately, page after page, as fast as the
+  /// network round-trip allows — confirmed via the perf trace: one session hit
+  /// ~4 `history()` calls/sec, back to back, with no sign of stopping. The
+  /// cooldown gives layout a moment to settle before the next auto-check.
+  DateTime? _lastAutoLoadEarlierAt;
+
   // Scroll affordances.
   bool _atBottom = true;
   int _unseen = 0;
+  // True while a [_scrollToBottom] animation is in flight (own send, or a
+  // live update that landed mid-animation). A live update that arrives while
+  // this is set retargets the same animation instead of firing a competing
+  // `jumpTo` — two callbacks landing in the same frame otherwise cut the
+  // glide short with a visible snap. See [_scrollToBottom].
+  bool _scrollAnimating = false;
   // Restore the user's last read position on open; persist it (debounced) as
   // they scroll. Null once restored / when pinned to the bottom.
   double? _savedOffset;
@@ -132,7 +180,12 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
 
   // Broadcast expand/collapse-all to every ToolCallView: (epoch, expand).
   final _toolExpand = ValueNotifier<(int, bool)>((0, false));
-  final _queuedMessages = <_QueuedPrompt>[];
+
+  // Queue add/remove/send-now are relay round trips — the desktop owns the
+  // queue (see [RelayApi.queuePrompt]), not this screen, so it survives the
+  // app being killed and reopened. This just disables a row's buttons while
+  // its own action is in flight, so a double-tap can't fire it twice.
+  final _pendingQueueActions = <String>{};
 
   // /btw side-chat turns for this session. Persisted here (not in the sheet) so
   // the aside survives closing/reopening the sheet; answers resolve live from
@@ -145,6 +198,12 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     WidgetsBinding.instance.addObserver(this);
     _scrollController.addListener(_onScroll);
     _attach();
+    // Opening the session is "looking at it" — drop its just-finished dot.
+    ref.read(attentionSessionIdsProvider.notifier).clear(widget.row.sessionId);
+    // Load the board eagerly (not just on the composer's first `#`): a `#12`
+    // already sitting in history needs the same card index to render as a
+    // link, and nothing else in the transcript prompts the user to type one.
+    _ensureCardsLoaded();
   }
 
   /// Merge [incoming] into [_items], coalescing by id (a later, higher-seq copy
@@ -356,6 +415,13 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     final fresh =
         items.where((e) => (e.sequence ?? 0) > _cursor).map(_hydrate).toList();
     final atBottom = _isAtBottom();
+    // Snapshot the extent before ingest so a reader who has scrolled away
+    // from the bottom can be held exactly in place — see the compensation
+    // below. Skipped when at the bottom: that path re-pins to offset 0
+    // regardless of extent, so there's nothing to compensate for.
+    final extentBefore = (!atBottom && _scrollController.hasClients)
+        ? _scrollController.position.maxScrollExtent
+        : null;
     setState(() {
       _connected = true;
       _timedOut = false;
@@ -379,51 +445,90 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     // Follow the live tail with a jump (not an animation): streaming deltas
     // arrive faster than a 200ms animateTo can finish, so animating here is what
     // produced the "scroll stops, then snaps to the bottom" jank. Animation is
-    // reserved for the user's own send in [_dispatch].
-    if (fresh.isNotEmpty && atBottom && _autoScroll) _scrollToBottom();
+    // reserved for the user's own send in [_dispatch]. This no longer has to
+    // stand down while history is loading: [_loadEarlierPage] does not touch
+    // the scroll position any more, so there is nothing left to race.
+    if (fresh.isNotEmpty && atBottom && _autoScroll) {
+      _scrollToBottom();
+    } else if (fresh.isNotEmpty && extentBefore != null) {
+      _compensateForTailGrowth(extentBefore);
+    }
+  }
+
+  /// Holds a scrolled-up reader's view exactly in place while the live tail
+  /// grows underneath them.
+  ///
+  /// The reversed list's newest item sits at builder index 0, and every
+  /// other item's absolute scroll offset is the cumulative height of the
+  /// items ahead of it — i.e. of everything newer. Appending a token to the
+  /// in-progress message (or landing a whole new message) grows that
+  /// prefix, which pushes every older item's offset forward by the same
+  /// amount even though nothing the reader is looking at changed. Leaving
+  /// `pixels` untouched — which is what "not at bottom, so do nothing" used
+  /// to mean — therefore isn't neutral: the fixed [pixels, pixels+viewport]
+  /// window silently slides to show content that many pixels closer to the
+  /// newest message on every delta, worst on a turn's last (often largest)
+  /// chunk. This is the mirror image of [_loadEarlierPage], which needs no
+  /// such correction because older pages are appended *beyond* the current
+  /// view rather than *ahead of* it.
+  void _compensateForTailGrowth(double extentBefore) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final p = _scrollController.position;
+      final delta = p.maxScrollExtent - extentBefore;
+      if (delta == 0) return;
+      p.jumpTo((p.pixels + delta).clamp(0.0, p.maxScrollExtent));
+    });
   }
 
   Future<void> _loadEarlier() async {
-    if (_loadingMore ||
-        _historyDone ||
-        _api == null ||
-        _nextBeforeSeq == null) {
-      return;
-    }
+    if (_loadingMore || _historyDone) return;
     setState(() => _loadingMore = true);
     try {
-      final page = await _api!.history(
-        widget.row.sessionId,
-        beforeSeq: _nextBeforeSeq,
-        limit: _pageSize,
-      );
-      if (!mounted) return;
-      // Preserve the visual scroll position across the prepend.
-      final hadClients = _scrollController.hasClients;
-      final oldMax =
-          hadClients ? _scrollController.position.maxScrollExtent : 0.0;
-      final oldOffset = hadClients ? _scrollController.offset : 0.0;
-      setState(() {
-        // Older events sort above the current head by logical time; _ingest
-        // dedups any that overlap what we already hold.
-        _ingest(page.items.map(_hydrate));
-        _nextBeforeSeq = page.nextBeforeSeq;
-        _historyDone = page.isDone;
-        _loadingMore = false;
-      });
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_scrollController.hasClients) {
-          final newMax = _scrollController.position.maxScrollExtent;
-          _scrollController.jumpTo(oldOffset + (newMax - oldMax));
-        }
-      });
+      await _loadEarlierPage();
     } catch (e) {
       if (mounted) {
-        setState(() => _loadingMore = false);
         _showSnack('Could not load earlier messages.',
             variant: ToastVariant.error);
       }
+    } finally {
+      if (mounted) setState(() => _loadingMore = false);
     }
+  }
+
+  /// Fetch and ingest one older page. Caller owns [_loadingMore]; this only
+  /// touches the data + scroll position so it can be looped (see
+  /// [_openPromptSheet], which backfills every page to build a complete
+  /// prompt history instead of whatever happens to already be loaded).
+  Future<void> _loadEarlierPage() async {
+    if (_api == null) return;
+    if (_nextBeforeSeq == null) {
+      // No cursor left to page from. Without this, a caller that loops until
+      // `_historyDone` (see `_openPromptSheet`'s full-session backfill) would
+      // spin forever calling straight back into this early return if `isDone`
+      // and a null `nextBeforeSeq` were ever set inconsistently — this keeps
+      // that loop's termination independent of the server getting both right.
+      if (mounted) setState(() => _historyDone = true);
+      return;
+    }
+    final page = await _api!.history(
+      widget.row.sessionId,
+      beforeSeq: _nextBeforeSeq,
+      limit: _pageSize,
+    );
+    if (!mounted) return;
+    // No scroll correction, deliberately. In the reversed list the older page
+    // lands beyond the current offset, so the viewport keeps showing exactly
+    // the messages it was showing — there is nothing to compensate for, and
+    // the corrective `jumpTo` this used to do is precisely what made loading
+    // history feel like being dragged back to the beginning.
+    setState(() {
+      // Older events sort above the current head by logical time; _ingest
+      // dedups any that overlap what we already hold.
+      _ingest(page.items.map(_hydrate));
+      _nextBeforeSeq = page.nextBeforeSeq;
+      _historyDone = page.isDone;
+    });
   }
 
   void _onScroll() {
@@ -435,9 +540,24 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
         if (atBottom) _unseen = 0;
       });
     }
-    if (_scrollController.position.pixels <= 140 &&
+    // Near the far end of the reversed list — i.e. approaching the oldest
+    // message we hold. `maxScrollExtent` is still an estimate for unbuilt
+    // children, but it is only a trigger now: being a screen early or late
+    // just starts the fetch sooner or later, and no longer misplaces the view.
+    //
+    // The cooldown guards against that same estimate: inserting a page changes
+    // it, which re-fires this listener before the new items are laid out and
+    // measured, and if the still-stale estimate hasn't cleared the margin yet
+    // this would otherwise fire again immediately — see [_lastAutoLoadEarlierAt].
+    final p = _scrollController.position;
+    final since = _lastAutoLoadEarlierAt == null
+        ? null
+        : DateTime.now().difference(_lastAutoLoadEarlierAt!);
+    if (p.pixels >= p.maxScrollExtent - 400 &&
         !_loadingMore &&
-        !_historyDone) {
+        !_historyDone &&
+        (since == null || since > const Duration(milliseconds: 600))) {
+      _lastAutoLoadEarlierAt = DateTime.now();
       _loadEarlier();
     }
     _persistScrollDebounced();
@@ -542,7 +662,9 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
       }
       if (!_scrollController.hasClients) return;
       final n = _matchKeys.length;
-      final frac = n <= 1 ? 0.0 : index / (n - 1);
+      // Reversed axis: result 0 is the oldest match and therefore the *far*
+      // end, so the proportion runs backwards from the newest.
+      final frac = n <= 1 ? 1.0 : (n - 1 - index) / (n - 1);
       final max = _scrollController.position.maxScrollExtent;
       _scrollController.jumpTo((frac * max).clamp(0.0, max));
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -569,6 +691,9 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     int activeIndex, {
     required bool showHeader,
   }) {
+    final cardNumbers = _cards.isEmpty
+        ? null
+        : _cards.map((card) => card.number).where((n) => n > 0).toSet();
     Widget itemView(ConversationItem item, {bool active = false}) =>
         ConversationItemView(
           item: item,
@@ -577,51 +702,88 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
           highlightQuery: query,
           activeMatch: active,
           onRetrySend: _deliver,
+          cardNumbers: cardNumbers,
+          onCardTap: _openCardMention,
+          onOpenMedia: (path, isVideo) => openBrowserMedia(
+            context,
+            sessionId: widget.row.sessionId,
+            path: path,
+            isVideo: isVideo,
+          ),
         );
 
     final entries = _focusMode && !searching
         ? groupQuietWork(visible)
         : visible.map<TranscriptEntry>(TranscriptMessage.new).toList();
 
+    // Reversed: index 0 is the newest message and scroll offset 0 is the
+    // bottom. This is what makes loading history seamless — older messages are
+    // appended at the far end of the scroll axis, away from the anchor, so the
+    // viewport does not move at all and needs no correction. The old forward
+    // list had to guess how tall the prepended page was (unbuilt children are
+    // only *estimated* by ListView, and a transcript's items range from a
+    // one-line prompt to a 200-line tool dump) and jump by that guess, which is
+    // what yanked the view toward the beginning on every page.
     return ListView.builder(
       controller: _scrollController,
+      reverse: true,
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
       itemCount: entries.length + (showHeader ? 1 : 0),
       itemBuilder: (context, i) {
-        if (showHeader && i == 0) return _buildHistoryHeader();
-        final index = i - (showHeader ? 1 : 0);
-        final entry = entries[index];
-        final previous = index > 0 ? entries[index - 1].lastItem : null;
-        final Widget content;
-        switch (entry) {
-          case TranscriptWorkGroup(:final items):
-            content = WorkGroupView(
-              items: items,
-              // Only the trailing group of a live turn is still in progress.
-              running: _agentWorking && index == entries.length - 1,
-              buildItem: itemView,
-            );
-          case TranscriptMessage(:final item):
-            content = itemView(item,
-                active: searching && index == activeIndex);
+        // Timed end-to-end (including the branch below) rather than wrapped
+        // around a call, so this catches the actual cost of whatever a tile
+        // turns out to be — a plain message or a whole collapsed work group.
+        // Only logged past the threshold: an itemBuilder fires constantly
+        // while scrolling, and most calls are sub-millisecond.
+        final stopwatch = Stopwatch()..start();
+        final Widget result;
+        // The history affordance sits at the far end of a reversed list: last
+        // to be built, visually at the top, above the oldest message.
+        if (showHeader && i == entries.length) {
+          result = _buildHistoryHeader();
+        } else {
+          final index = entries.length - 1 - i;
+          final entry = entries[index];
+          final previous = index > 0 ? entries[index - 1].lastItem : null;
+          final Widget content;
+          switch (entry) {
+            case TranscriptWorkGroup(:final items):
+              content = WorkGroupView(
+                items: items,
+                // Only the trailing group of a live turn is still in progress.
+                running: _agentWorking && index == entries.length - 1,
+                buildItem: itemView,
+              );
+            case TranscriptMessage(:final item):
+              content = itemView(item, active: searching && index == activeIndex);
+          }
+          final first = entry is TranscriptMessage ? entry.item : null;
+          final row = Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (first != null && _needsRoleDivider(previous, first))
+                _RoleDivider(userSide: first.kind == 'user'),
+              content,
+            ],
+          );
+          // Attach a stable key per result so next/prev can scroll to it.
+          result = (searching && index < _matchKeys.length)
+              ? KeyedSubtree(key: _matchKeys[index], child: row)
+              : row;
         }
-        final first = entry is TranscriptMessage ? entry.item : null;
-        final row = Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (first != null && _needsRoleDivider(previous, first))
-              _RoleDivider(userSide: first.kind == 'user'),
-            content,
-          ],
-        );
-        // Attach a stable key per result so next/prev can scroll to it.
-        if (searching && index < _matchKeys.length) {
-          return KeyedSubtree(key: _matchKeys[index], child: row);
+        stopwatch.stop();
+        final ms = stopwatch.elapsedMicroseconds / 1000;
+        if (ms > _tileJankThresholdMs) {
+          ref.read(perfTraceProvider).add('tile.build', durationMs: ms);
         }
-        return row;
+        return result;
       },
     );
   }
+
+  // A single tile taking longer than this is worth knowing about even if the
+  // frame it landed in didn't drop (several tiles can build in one frame).
+  static const _tileJankThresholdMs = 4.0;
 
   Widget _buildTranscript(double chatTextScale) {
     if (_items.isNotEmpty) {
@@ -635,9 +797,13 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
           visible.isEmpty ? -1 : _matchIndex.clamp(0, visible.length - 1);
       return MediaQuery(
         // Scale only the transcript text, not the app chrome, so the user's
-        // chat text-size preference applies here alone.
-        data: MediaQuery.of(context)
-            .copyWith(textScaler: TextScaler.linear(chatTextScale)),
+        // chat text-size preference applies here alone — stacked on top of
+        // the ambient scaler (app base bump + OS accessibility), not instead
+        // of it.
+        data: MediaQuery.of(context).copyWith(
+          textScaler: scaleTextScaler(
+              MediaQuery.textScalerOf(context), chatTextScale),
+        ),
         child: searching && visible.isEmpty
             ? _TranscriptNotice(
                 icon: Icons.search_off,
@@ -727,43 +893,55 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     );
   }
 
+  /// In the reversed list the bottom is offset 0 — an exact number rather than
+  /// the estimated `maxScrollExtent` the forward list had to compare against.
+  /// That also retires the old two-band problem: "near the bottom" and "near
+  /// the oldest message" now sit at opposite ends of the axis and can never
+  /// both read true, however short the transcript is.
   bool _isAtBottom() {
     if (!_scrollController.hasClients) return true;
-    final p = _scrollController.position;
-    return p.pixels >= p.maxScrollExtent - 80;
+    return _scrollController.position.pixels <= 80;
   }
 
   /// Pin to the bottom. Defaults to an instant [jumpTo] (used to follow the live
   /// tail, where animating each streaming delta fights the next one); pass
-  /// [animated] for a one-off glide after the user's own action.
+  /// [animated] for a one-off glide after the user's own action. A live update
+  /// that lands mid-glide retargets the same animation (via [_scrollAnimating])
+  /// rather than issuing its own `jumpTo` — two scroll callbacks landing in the
+  /// same frame otherwise cut the glide short with a visible snap.
   void _scrollToBottom({bool animated = false}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
-      final max = _scrollController.position.maxScrollExtent;
-      if (animated && !_reduceMotion) {
-        _scrollController.animateTo(max,
-            duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
+      // Offset 0 in the reversed list, so following the tail no longer depends
+      // on an extent that is only an estimate until every item has been built.
+      if ((animated || _scrollAnimating) && !_reduceMotion) {
+        _scrollAnimating = true;
+        unawaited(_scrollController
+            .animateTo(0,
+                duration: const Duration(milliseconds: 200),
+                curve: Curves.easeOut)
+            .whenComplete(() => _scrollAnimating = false));
       } else {
-        _scrollController.jumpTo(max);
+        _scrollController.jumpTo(0);
       }
     });
     if (_unseen != 0) setState(() => _unseen = 0);
   }
 
   /// On first open, land where the user left off if we saved a position;
-  /// otherwise snap to the bottom to follow the live tail.
+  /// otherwise stay at the bottom to follow the live tail. The saved value is
+  /// a distance back from the newest message, which is what the reversed list
+  /// already scrolls in — no conversion, and no dependence on a total extent
+  /// that history loading keeps changing.
   void _restoreInitialScroll() {
     if (_restoredScroll) return;
     _restoredScroll = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
-      final max = _scrollController.position.maxScrollExtent;
       final saved = _savedOffset;
-      if (saved != null && saved < max - 80) {
-        _scrollController.jumpTo(saved.clamp(0.0, max));
-      } else {
-        _scrollController.jumpTo(max);
-      }
+      if (saved == null || saved <= 80) return;
+      final max = _scrollController.position.maxScrollExtent;
+      _scrollController.jumpTo(saved.clamp(0.0, max));
     });
   }
 
@@ -805,7 +983,7 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
       return false;
     }
     _promptController.clear();
-    _openPromptSheet();
+    unawaited(_openPromptSheet());
     return true;
   }
 
@@ -830,7 +1008,8 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
       return;
     }
 
-    final row = ref.read(sessionRowProvider(widget.row.sessionId)) ?? widget.row;
+    final row =
+        ref.read(sessionRowProvider(widget.row.sessionId)) ?? widget.row;
     final content = serializeConversation(
       items,
       header: ExportMeta(
@@ -867,6 +1046,95 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     }
   }
 
+  /// This workspace's board — for `#` mentions in the composer, and for
+  /// turning a `#12` already in the transcript into a link.
+  ///
+  /// Loaded eagerly (once per screen, from [initState]) rather than only when
+  /// the composer sees a `#`: a mention already sitting in history needs the
+  /// same index to render as a link, and reading a transcript never types
+  /// anything. A session whose working directory never came through, or a
+  /// load that fails, leaves the list empty — every `#12` simply stays plain
+  /// text, and typing one from memory into the composer still works, which
+  /// is the whole point of the number.
+  List<BacklogItem> _cards = const [];
+  bool _cardsRequested = false;
+
+  Map<int, BacklogItem> get _cardsByNumber => {
+        for (final card in _cards)
+          if (card.number > 0) card.number: card,
+      };
+
+  void _ensureCardsLoaded() {
+    if (_cardsRequested) return;
+    final cwd = widget.row.cwd;
+    if (cwd == null || cwd.isEmpty) return;
+    _cardsRequested = true;
+    unawaited(() async {
+      try {
+        final api = await ref.read(relayApiProvider.future);
+        if (api == null) return;
+        final board = await api.backlog(cwd, op: 'list');
+        if (!mounted) return;
+        setState(() => _cards = board.items);
+      } catch (_) {
+        // Silent: nothing was asked for out loud, and the composer is mid-word.
+      }
+    }());
+  }
+
+  /// Open the card a tapped `#12` names. Stale by construction is fine here:
+  /// [_cardsByNumber] only has entries for numbers the board actually loaded
+  /// with, so an unreachable number simply never gets this far — the link
+  /// itself only renders for numbers on that same list (see
+  /// [MarkdownView.cardNumbers]).
+  Future<void> _openCardMention(int number) async {
+    final card = _cardsByNumber[number];
+    if (card == null) return;
+    final result = await Navigator.of(context).push<BacklogEditorResult>(
+      MaterialPageRoute(
+        builder: (_) => BacklogItemScreen(item: card, column: card.column),
+      ),
+    );
+    if (result == null || !mounted) return;
+    final cwd = widget.row.cwd;
+    if (cwd == null || cwd.isEmpty) return;
+
+    if (result.createSession) {
+      final draft = result.draft!;
+      await showNewSessionSheet(
+        context,
+        ref,
+        workspacePath: cwd,
+        prompt: draft.description.isEmpty
+            ? draft.title
+            : '${draft.title}\n\n${draft.description}',
+      );
+      return;
+    }
+
+    try {
+      await persistBacklogEditorResult(ref,
+          cwd: cwd, result: result, item: card);
+      // The board changed — reload so this and any other `#N` in the
+      // transcript reflect it (a rename, a delete, a move off the list).
+      _cardsRequested = false;
+      _ensureCardsLoaded();
+    } catch (error) {
+      if (!mounted) return;
+      final message = '$error'.replaceFirst('Exception: ', '');
+      _showSnack(message, variant: ToastVariant.error);
+    }
+  }
+
+  /// Drop `#12` into the composer in place of the `#query` being typed.
+  void _pickCardMention(BacklogItem card) {
+    final next = applyCardMention(_promptController.text, card);
+    _promptController.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(offset: next.length),
+    );
+  }
+
   /// Fill the composer from the slash palette, running the command straight
   /// away when it takes no argument.
   void _pickSlashCommand(SlashCommand command) {
@@ -877,7 +1145,29 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     if (command.runImmediately) unawaited(_send());
   }
 
-  void _openPromptSheet() {
+  Future<void> _openPromptSheet() async {
+    // The sheet promises "everything typed this session", but [_items] only
+    // holds whatever page(s) happened to load — on a long session that's just
+    // the tail, so the opening prompt (and any others before it) is usually
+    // missing. Backfill every older page first; prompts are sparse so this is
+    // a handful of round trips even on long sessions, and it only runs when
+    // there's actually a gap to fill.
+    if (!_historyDone && !_loadingMore) {
+      setState(() => _loadingMore = true);
+      try {
+        while (!_historyDone) {
+          await _loadEarlierPage();
+        }
+      } catch (e) {
+        if (mounted) {
+          _showSnack('Could not load full prompt history.',
+              variant: ToastVariant.error);
+        }
+      } finally {
+        if (mounted) setState(() => _loadingMore = false);
+      }
+    }
+    if (!mounted) return;
     String normalize(String value) =>
         value.replaceAll(RegExp(r'\s+'), ' ').trim();
     // Sent prompts, newest first, with the optimistic echo collapsed against
@@ -898,10 +1188,13 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
         queued: false,
       ));
     }
-    final queued = _queuedMessages
+    final liveQueue =
+        ref.read(sessionRowProvider(widget.row.sessionId))?.runtime?.queuedPrompts ??
+            const <QueuedPromptSync>[];
+    final queued = liveQueue
         .map((q) => PromptEntry(
               text: q.text,
-              imageCount: q.images.length,
+              imageCount: q.imageCount,
               timeMs: null,
               queued: true,
             ))
@@ -951,19 +1244,23 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
       return;
     }
     if (_isWorking()) {
+      final api = _api;
+      if (api == null) return;
+      final id = _uuid.v4();
+      // Cache thumbnails now, same as a real send — by the time this queued
+      // entry actually goes out (desktop-side, once the turn ends) there is no
+      // local `_dispatch` call to do it, and the relay never sends bytes back.
+      for (final image in images) {
+        _storedImages[image.id] = image;
+        unawaited(RemoteImageStore.put(widget.row.sessionId, image));
+      }
       setState(() {
-        _queuedMessages.add(
-          _QueuedPrompt(
-            id: DateTime.now().microsecondsSinceEpoch.toString(),
-            text: text,
-            images: images,
-          ),
-        );
         _promptController.clear();
         _attachedImages.clear();
       });
       HapticFeedback.selectionClick();
       _showSnack('Queued. Tap send now to steer the current turn.');
+      unawaited(_queuePrompt(api, id, text, images));
       return;
     }
     // Optimistic: clear the composer NOW and show the bubble before the network
@@ -1085,53 +1382,60 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
   /// session. No prompt yet and no transcript means the composer sends.
   bool _isWorking() {
     final row = ref.read(sessionRowProvider(widget.row.sessionId));
-    final state = row?.runtime?.agentState ?? widget.row.agentState;
+    final state = row?.agentState ?? widget.row.agentState;
     if (state != AgentState.working) return false;
     final promptedAt = row?.lastPromptAt ?? widget.row.lastPromptAt;
     if (promptedAt == null && _items.isEmpty) return false;
     return true;
   }
 
-  /// Promote a queued message to a real send: drop it from the queue strip and
-  /// dispatch it optimistically (so it becomes a user bubble). A failed delivery
-  /// surfaces as a tap-to-retry bubble via [_dispatch], not a lost message.
-  Future<void> _sendQueuedNow(_QueuedPrompt entry) async {
-    if (_api == null) return;
-    if (!_queuedMessages.any((item) => item.id == entry.id)) return;
-    setState(() => _queuedMessages.removeWhere((item) => item.id == entry.id));
-    await _dispatch(entry.text, entry.images);
-  }
-
-  void _removeQueuedMessage(String id) {
-    setState(() => _queuedMessages.removeWhere((item) => item.id == id));
-  }
-
-  void _flushQueuedIfReady(SessionRow live, bool canInteract) {
-    final state = live.runtime?.agentState ?? live.agentState;
-    if (!canInteract ||
-        state != AgentState.waiting ||
-        _sending ||
-        _autoFlushing ||
-        _queuedMessages.isEmpty) {
-      return;
+  /// Queue [text]/[images] behind the active turn. The desktop is the durable
+  /// owner of the queue (see [RelayApi.queuePrompt]) — this only reports a
+  /// failure to enqueue; the composer already cleared optimistically.
+  Future<void> _queuePrompt(
+      RelayApi api, String id, String text, List<ConversationImage> images) async {
+    try {
+      await api.queuePrompt(widget.row.sessionId, id, text, images: images);
+    } catch (_) {
+      if (!mounted) return;
+      _showSnack('Could not queue the message — check your connection.',
+          variant: ToastVariant.error);
     }
-    final next = _queuedMessages.first;
-    // _autoFlushing latches until the dispatch settles so the many rebuilds that
-    // fire while state==waiting can't schedule this same entry twice.
-    _autoFlushing = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      if (!mounted ||
-          _queuedMessages.isEmpty ||
-          _queuedMessages.first.id != next.id) {
-        _autoFlushing = false;
-        return;
+  }
+
+  /// Promote a queued message to a real send right now, steering the current
+  /// turn. The desktop delivers it and the resulting user bubble arrives
+  /// through the normal transcript sync — no local echo needed here.
+  Future<void> _sendQueuedNow(QueuedPromptSync entry) async {
+    final api = _api;
+    if (api == null) return;
+    setState(() => _pendingQueueActions.add(entry.id));
+    try {
+      await api.sendQueuedPromptNow(widget.row.sessionId, entry.id);
+    } catch (_) {
+      if (mounted) {
+        _showSnack('Could not send now — check your connection.',
+            variant: ToastVariant.error);
       }
-      try {
-        await _sendQueuedNow(next);
-      } finally {
-        if (mounted) _autoFlushing = false;
+    } finally {
+      if (mounted) setState(() => _pendingQueueActions.remove(entry.id));
+    }
+  }
+
+  Future<void> _removeQueuedMessage(String id) async {
+    final api = _api;
+    if (api == null) return;
+    setState(() => _pendingQueueActions.add(id));
+    try {
+      await api.removeQueuedPrompt(widget.row.sessionId, id);
+    } catch (_) {
+      if (mounted) {
+        _showSnack('Could not remove — check your connection.',
+            variant: ToastVariant.error);
       }
-    });
+    } finally {
+      if (mounted) setState(() => _pendingQueueActions.remove(id));
+    }
   }
 
   Future<void> _pickImages() async {
@@ -1364,16 +1668,16 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  SwitchListTile(
-                    secondary: Icon(current.subscribed
-                        ? Icons.notifications_active_outlined
-                        : Icons.notifications_off_outlined),
-                    title: const Text('Notifications'),
-                    subtitle: Text(current.subscribed
-                        ? 'You’ll be notified about this session'
-                        : 'Muted for this session'),
-                    value: current.subscribed,
-                    onChanged: (_) => _toggleSubscription(current),
+                  ListTile(
+                    leading: const Icon(Icons.notifications_outlined),
+                    title: const Text('Notification channels'),
+                    subtitle: const Text('Mobile, desktop, and agent attention'),
+                    onTap: () => run(() => showModalBottomSheet<void>(
+                      context: this.context,
+                      showDragHandle: true,
+                      isScrollControlled: true,
+                      builder: (_) => NotificationChannelsSheet(row: current),
+                    )),
                   ),
                   const Divider(height: 1),
                   if (canInteract)
@@ -1487,10 +1791,13 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
   Future<void> _switchModel(SessionRow live) async {
     if (_api == null) return;
     final runtime = live.runtime?.runtime ?? AgentRuntime.claude;
+    final requireBiometric =
+        ref.read(settingsProvider).valueOrNull?.bypassBiometricEnabled ?? true;
     final override = await showModelSwitchSheet(
       context,
       runtime: runtime,
       currentModel: live.runtime?.model,
+      requireBiometric: requireBiometric,
     );
     if (override == null || !override.hasChanges || _api == null) return;
     HapticFeedback.selectionClick();
@@ -1524,30 +1831,6 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     }
   }
 
-  Future<void> _toggleSubscription(SessionRow live) async {
-    if (_api == null) return;
-    final next = !live.subscribed;
-    HapticFeedback.selectionClick();
-    try {
-      await _api!
-          .setSessionSubscription(widget.row.sessionId, subscribed: next);
-      // sessions:list re-fires reactively with the new state; just confirm.
-      if (mounted) {
-        _showSnack(
-            next
-                ? 'Subscribed — you’ll be notified about this session.'
-                : 'Unsubscribed from this session.',
-            variant: ToastVariant.success);
-      }
-    } catch (e) {
-      if (mounted) {
-        _showSnack('Could not update notifications. Try again.',
-            variant: ToastVariant.error,
-            actionLabel: 'Retry',
-            onAction: () => _toggleSubscription(live));
-      }
-    }
-  }
 
   Future<void> _respond(
     SessionRow live,
@@ -1620,6 +1903,7 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     _sub?.cancel();
     _scrollController.removeListener(_onScroll);
     _promptController.dispose();
+    _promptFocus.dispose();
     _scrollController.dispose();
     _searchController.dispose();
     _toolExpand.dispose();
@@ -1629,6 +1913,7 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
 
   @override
   Widget build(BuildContext context) {
+    PerfRoute.mark('SessionView');
     // Prefer the live row (status/runtime updates in real time); fall back to the
     // one we navigated in with.
     final live =
@@ -1642,16 +1927,13 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
     _confirmStop = settings.confirmBeforeStop;
     _reduceMotion = settings.reduceMotion;
     _focusMode = settings.focusMode;
-    _agentWorking =
-        (live.runtime?.agentState ?? live.agentState) == AgentState.working;
-    final needsApproval =
-        (live.runtime?.agentState ?? live.agentState) == AgentState.needsAction;
+    _agentWorking = live.agentState == AgentState.working;
+    final needsApproval = sessionAwaitsApproval(live);
     final canInteract = online && live.status != SessionStatus.exited;
     // Sending outlives the agent process: a prompt for a section whose process
     // has exited restarts that section on the Mac (the desktop composer works
     // the same way), so the only hard requirement is a reachable Mac.
     final canSend = online;
-    _flushQueuedIfReady(live, canInteract);
     // The desktop's verdict on prompts already sent from this screen.
     ref.listen<AsyncValue<List<CommandOutcome>>>(
       commandOutcomesProvider,
@@ -1727,9 +2009,9 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
               ]
             : [
                 IconButton(
-                  icon: Icon(Icons.chat_bubble_outline),
-                  tooltip: 'By the way (/btw)',
-                  onPressed: _openBtwSheet,
+                  icon: Icon(Icons.history),
+                  tooltip: 'Prompt history',
+                  onPressed: () => unawaited(_openPromptSheet()),
                 ),
                 IconButton(
                   icon: Icon(Icons.more_vert),
@@ -1809,16 +2091,16 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
           else
             _Composer(
               controller: _promptController,
+              focusNode: _promptFocus,
               sending: _sending,
               enabled: canSend,
-              queueing: (live.runtime?.agentState ?? live.agentState) ==
-                  AgentState.working,
-              queuedMessages: _queuedMessages,
+              queueing: live.agentState == AgentState.working,
+              queuedMessages: live.runtime?.queuedPrompts ?? const [],
+              queueActionsPending: _pendingQueueActions,
               images: _attachedImages,
               hint: !canSend
                   ? 'Mac offline'
-                  : ((live.runtime?.agentState ?? live.agentState) ==
-                          AgentState.working
+                  : (live.agentState == AgentState.working
                       ? 'Queue a follow-up…'
                       : live.status == SessionStatus.exited
                           ? 'Restart with a follow-up…'
@@ -1829,6 +2111,14 @@ class _SessionViewScreenState extends ConsumerState<SessionViewScreen>
               onSendQueuedNow: _sendQueuedNow,
               onRemoveQueued: _removeQueuedMessage,
               onPickSlashCommand: _pickSlashCommand,
+              cards: _cards,
+              onCardMentionTyped: _ensureCardsLoaded,
+              onPickCard: _pickCardMention,
+              onNotice: (message, {bool isError = false}) => _showSnack(
+                message,
+                variant: isError ? ToastVariant.error : ToastVariant.info,
+              ),
+              onPasteImage: _pasteImage,
             ),
         ],
       ),
@@ -1861,24 +2151,6 @@ class _PendingSend {
   /// of reconciliation (they'd otherwise be consumed by a later identical
   /// message's echo) while still retaining text/images for retry.
   bool failed = false;
-}
-
-class _QueuedPrompt {
-  const _QueuedPrompt({
-    required this.id,
-    required this.text,
-    required this.images,
-  });
-
-  final String id;
-  final String text;
-  final List<ConversationImage> images;
-
-  String get preview {
-    final trimmed = text.trim();
-    if (trimmed.isNotEmpty) return trimmed;
-    return '${images.length} image${images.length == 1 ? '' : 's'}';
-  }
 }
 
 /// The find-in-transcript results strip: match count + previous/next steppers.
@@ -2076,13 +2348,15 @@ class _TranscriptNotice extends StatelessWidget {
   }
 }
 
-class _Composer extends StatelessWidget {
+class _Composer extends StatefulWidget {
   const _Composer({
     required this.controller,
+    required this.focusNode,
     required this.sending,
     required this.enabled,
     required this.queueing,
     required this.queuedMessages,
+    this.queueActionsPending = const {},
     required this.images,
     required this.hint,
     required this.onRemoveImage,
@@ -2091,25 +2365,90 @@ class _Composer extends StatelessWidget {
     required this.onSendQueuedNow,
     required this.onRemoveQueued,
     required this.onPickSlashCommand,
+    required this.cards,
+    required this.onCardMentionTyped,
+    required this.onPickCard,
+    required this.onNotice,
+    required this.onPasteImage,
   });
 
   final TextEditingController controller;
+  final FocusNode focusNode;
   final bool sending;
   final bool enabled;
   final bool queueing;
-  final List<_QueuedPrompt> queuedMessages;
+  final List<QueuedPromptSync> queuedMessages;
+  /// Queued-entry ids with an add/remove/send-now round trip in flight.
+  final Set<String> queueActionsPending;
   final List<ConversationImage> images;
   final String hint;
   final void Function(int index) onRemoveImage;
   final VoidCallback onAttach;
   final VoidCallback onSend;
-  final void Function(_QueuedPrompt entry) onSendQueuedNow;
+  final void Function(QueuedPromptSync entry) onSendQueuedNow;
   final void Function(String id) onRemoveQueued;
   final void Function(SlashCommand command) onPickSlashCommand;
+
+  /// The workspace's board, empty until a `#` has been typed once.
+  final List<BacklogItem> cards;
+
+  /// Fired the first time the text ends in a `#`, so the board can be fetched.
+  final VoidCallback onCardMentionTyped;
+  final void Function(BacklogItem card) onPickCard;
+  final void Function(String message, {bool isError}) onNotice;
+  final VoidCallback onPasteImage;
+
+  @override
+  State<_Composer> createState() => _ComposerState();
+}
+
+class _ComposerState extends State<_Composer> with TickerProviderStateMixin {
+  /// Dictation gets a taller field. You cannot proof-read speech through a
+  /// two-line slot, and spoken prompts run far longer than typed ones.
+  bool _dictating = false;
+
+  /// Identity for the mic across its two homes — see [_mic].
+  final _micKey = GlobalKey<DictationButtonState>();
+
+  /// Bounce on tap, same shape as the mic's, so a send visibly registers the
+  /// instant it's pressed rather than waiting on the network round trip.
+  late final AnimationController _sendTapController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 260),
+  );
+  late final Animation<double> _sendTapScale = TweenSequence<double>([
+    TweenSequenceItem(
+      weight: 35,
+      tween: Tween(begin: 1.0, end: 0.8).chain(CurveTween(curve: Curves.easeOut)),
+    ),
+    TweenSequenceItem(
+      weight: 65,
+      tween:
+          Tween(begin: 0.8, end: 1.0).chain(CurveTween(curve: Curves.easeOutBack)),
+    ),
+  ]).animate(_sendTapController);
+
+  @override
+  void dispose() {
+    _sendTapController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final t = context.tokens;
+    final controller = widget.controller;
+    final enabled = widget.enabled;
+    final sending = widget.sending;
+    final queueing = widget.queueing;
+    final queuedMessages = widget.queuedMessages;
+    final images = widget.images;
+    final hint = widget.hint;
+    final onRemoveImage = widget.onRemoveImage;
+    final onAttach = widget.onAttach;
+    final onSendQueuedNow = widget.onSendQueuedNow;
+    final onRemoveQueued = widget.onRemoveQueued;
+    final onPickSlashCommand = widget.onPickSlashCommand;
     return SafeArea(
       top: false,
       child: DecoratedBox(
@@ -2128,12 +2467,24 @@ class _Composer extends StatelessWidget {
               ValueListenableBuilder<TextEditingValue>(
                 valueListenable: controller,
                 builder: (context, value, _) {
-                  final matches =
-                      filterSlashCommands(slashQueryOf(value.text));
-                  if (matches.isEmpty) return const SizedBox.shrink();
-                  return SlashCommandPalette(
-                    commands: matches,
-                    onPick: onPickSlashCommand,
+                  final matches = filterSlashCommands(slashQueryOf(value.text));
+                  if (matches.isNotEmpty) {
+                    return SlashCommandPalette(
+                      commands: matches,
+                      onPick: onPickSlashCommand,
+                    );
+                  }
+                  // `#` opens the board's palette on the same rule, and asks
+                  // for the board the first time it is typed. A slash command
+                  // owns the whole text, so the two can never both be up.
+                  final query = cardMentionQuery(value.text);
+                  if (query == null) return const SizedBox.shrink();
+                  widget.onCardMentionTyped();
+                  final cards = filterCardMentions(query, widget.cards);
+                  if (cards.isEmpty) return const SizedBox.shrink();
+                  return CardMentionPalette(
+                    cards: cards,
+                    onPick: widget.onPickCard,
                   );
                 },
               ),
@@ -2141,6 +2492,7 @@ class _Composer extends StatelessWidget {
                 _QueuedMessageStrip(
                   queuedMessages: queuedMessages,
                   sending: sending,
+                  busyIds: widget.queueActionsPending,
                   onSendNow: onSendQueuedNow,
                   onRemove: onRemoveQueued,
                 ),
@@ -2154,48 +2506,119 @@ class _Composer extends StatelessWidget {
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  // Attach/paste lives here because iOS's native text paste menu
-                  // can't offer image paste — this is the discoverable entry point.
-                  IconButton(
-                    onPressed: enabled && !sending ? onAttach : null,
-                    tooltip: 'Attach or paste image',
-                    icon: const Icon(Icons.add_photo_alternate_outlined),
-                    constraints: t.control.tapTarget,
-                  ),
-                  const SizedBox(width: 4),
                   Expanded(
-                    child: TextField(
-                      controller: controller,
-                      enabled: enabled,
-                      minLines: 1,
-                      maxLines: 6,
-                      keyboardType: TextInputType.multiline,
-                      textInputAction: TextInputAction.newline,
-                      decoration: InputDecoration(
-                        hintText: hint,
-                        border: const OutlineInputBorder(),
-                        isDense: true,
+                    child: AnimatedSize(
+                      duration: const Duration(milliseconds: 200),
+                      curve: Curves.easeOutCubic,
+                      alignment: Alignment.bottomCenter,
+                      // The controls sit *inside* the field, overlaid on its
+                      // corners like the desktop composer: attach bottom-left,
+                      // mic/send bottom-right. The field reserves padding on
+                      // both sides so text can never slide underneath them.
+                      child: Stack(
+                        alignment: Alignment.bottomRight,
+                        children: [
+                          TextField(
+                            controller: controller,
+                            focusNode: widget.focusNode,
+                            enabled: enabled,
+                            minLines: _dictating ? 5 : 1,
+                            maxLines: _dictating ? 12 : 6,
+                            keyboardType: TextInputType.multiline,
+                            textInputAction: TextInputAction.newline,
+                            // Always offer image paste in the selection
+                            // toolbar. iOS drops its own Paste when it believes
+                            // the clipboard is empty, and it cannot paste an
+                            // image into a text field at all — so ours is added
+                            // unconditionally and the system permission prompt
+                            // happens on tap, which is what every other app
+                            // does.
+                            contextMenuBuilder: (context, editableState) {
+                              final items = <ContextMenuButtonItem>[
+                                ...editableState.contextMenuButtonItems,
+                                ContextMenuButtonItem(
+                                  label: 'Paste image',
+                                  onPressed: () {
+                                    ContextMenuController.removeAny();
+                                    widget.onPasteImage();
+                                  },
+                                ),
+                              ];
+                              return AdaptiveTextSelectionToolbar.buttonItems(
+                                anchors: editableState.contextMenuAnchors,
+                                buttonItems: items,
+                              );
+                            },
+                            decoration: InputDecoration(
+                              hintText: _dictating ? 'Listening…' : hint,
+                              border: const OutlineInputBorder(),
+                              isDense: true,
+                              // Stacked vertically now (mic above send) so
+                              // both states reserve just one control's width,
+                              // leaving the field's full width for text. The
+                              // left gutter matches it, reserved for the
+                              // attach button — hidden while dictating, when
+                              // the taller field should show as much of the
+                              // transcript as possible.
+                              contentPadding: EdgeInsets.only(
+                                left: _dictating ? 12 : 46,
+                                top: 12,
+                                bottom: 12,
+                                right: 46,
+                              ),
+                            ),
+                          ),
+                          if (!_dictating)
+                            Align(
+                              alignment: Alignment.bottomLeft,
+                              child: Padding(
+                                padding: const EdgeInsets.all(5),
+                                child: IconButton(
+                                  onPressed:
+                                      enabled && !sending ? onAttach : null,
+                                  tooltip: 'Attach image',
+                                  icon: const Icon(
+                                      Icons.add_photo_alternate_outlined,
+                                      size: 20),
+                                  visualDensity: VisualDensity.compact,
+                                  constraints: const BoxConstraints.tightFor(
+                                      width: 36, height: 36),
+                                  padding: EdgeInsets.zero,
+                                ),
+                              ),
+                            ),
+                          Padding(
+                            padding: const EdgeInsets.all(5),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                // Mic on top, so send keeps the corner in both
+                                // states and never moves under your thumb.
+                                if (_dictating) ...[
+                                  _mic(enabled: enabled && !sending),
+                                  const SizedBox(height: 4),
+                                  _send(t,
+                                      enabled: enabled, queueing: queueing),
+                                ] else
+                                  ValueListenableBuilder<TextEditingValue>(
+                                    valueListenable: controller,
+                                    // Empty field means the mic, even while
+                                    // the agent is mid-turn — dictating a
+                                    // follow-up is exactly when you want it.
+                                    // Type anything and it becomes send, which
+                                    // goes amber to say it will queue.
+                                    builder: (context, value, _) =>
+                                        value.text.trim().isEmpty
+                                            ? _mic(enabled: enabled && !sending)
+                                            : _send(t,
+                                                enabled: enabled,
+                                                queueing: queueing),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ],
                       ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  // No blocking spinner: the composer clears the instant you tap
-                  // and the sent bubble carries its own "sending" affordance, so
-                  // the button stays live and ready for the next message.
-                  // Brass to send, amber to queue — the same two states the desktop
-                  // composer FAB uses, so the colour tells you which one will happen
-                  // before you commit to the tap.
-                  IconButton.filled(
-                    onPressed: enabled ? onSend : null,
-                    tooltip: queueing ? 'Queue message' : 'Send message',
-                    icon: Icon(queueing ? Icons.schedule_send : Icons.send),
-                    constraints: t.control.tapTarget,
-                    style: IconButton.styleFrom(
-                      backgroundColor: queueing ? t.warn.solid : t.accent.solid,
-                      foregroundColor: queueing ? t.warn.on : t.accent.on,
-                      disabledBackgroundColor: t.panelStrong,
-                      disabledForegroundColor: t.subtle,
-                      shape: RoundedRectangleBorder(borderRadius: t.radius.lgR),
                     ),
                   ),
                 ],
@@ -2206,19 +2629,70 @@ class _Composer extends StatelessWidget {
       ),
     );
   }
+
+  /// One instance for the whole composer. The key is load-bearing twice over:
+  /// it carries recording state across rebuilds, and it lets send stop the
+  /// recogniser before clearing the field.
+  Widget _mic({required bool enabled}) => DictationButton(
+        key: _micKey,
+        controller: widget.controller,
+        focusNode: widget.focusNode,
+        enabled: enabled,
+        onNotice: widget.onNotice,
+        onListeningChanged: (listening) =>
+            setState(() => _dictating = listening),
+      );
+
+  /// Stop the mic, then send. Sending under a live task refills the composer:
+  /// the clear looks like a manual edit, and the next partial carries the whole
+  /// utterance back in.
+  Future<void> _stopThenSend() async {
+    HapticFeedback.mediumImpact();
+    _sendTapController.forward(from: 0);
+    await _micKey.currentState?.stopDictation();
+    widget.onSend();
+  }
+
+  Widget _send(PandaTokens t, {required bool enabled, required bool queueing}) {
+    // Brass to send, amber to queue — the same two states the desktop composer
+    // FAB uses, so the colour says which will happen before you commit.
+    final button = IconButton.filled(
+      onPressed: enabled ? _stopThenSend : null,
+      tooltip: queueing ? 'Queue message' : 'Send message',
+      icon: Icon(queueing ? Icons.schedule_send : Icons.send, size: 20),
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+      padding: EdgeInsets.zero,
+      style: IconButton.styleFrom(
+        backgroundColor: queueing ? t.warn.solid : t.accent.solid,
+        foregroundColor: queueing ? t.warn.on : t.accent.on,
+        disabledBackgroundColor: t.panelStrong,
+        disabledForegroundColor: t.subtle,
+        shape: RoundedRectangleBorder(borderRadius: t.radius.lgR),
+      ),
+    );
+    return AnimatedBuilder(
+      animation: _sendTapScale,
+      builder: (context, child) =>
+          Transform.scale(scale: _sendTapScale.value, child: child),
+      child: button,
+    );
+  }
 }
 
 class _QueuedMessageStrip extends StatelessWidget {
   const _QueuedMessageStrip({
     required this.queuedMessages,
     required this.sending,
+    this.busyIds = const {},
     required this.onSendNow,
     required this.onRemove,
   });
 
-  final List<_QueuedPrompt> queuedMessages;
+  final List<QueuedPromptSync> queuedMessages;
   final bool sending;
-  final void Function(_QueuedPrompt entry) onSendNow;
+  final Set<String> busyIds;
+  final void Function(QueuedPromptSync entry) onSendNow;
   final void Function(String id) onRemove;
 
   @override
@@ -2238,7 +2712,7 @@ class _QueuedMessageStrip extends StatelessWidget {
             _QueuedMessageRow(
               index: i + 1,
               entry: queuedMessages[i],
-              sending: sending,
+              sending: sending || busyIds.contains(queuedMessages[i].id),
               onSendNow: onSendNow,
               onRemove: onRemove,
             ),
@@ -2261,9 +2735,9 @@ class _QueuedMessageRow extends StatelessWidget {
   });
 
   final int index;
-  final _QueuedPrompt entry;
+  final QueuedPromptSync entry;
   final bool sending;
-  final void Function(_QueuedPrompt entry) onSendNow;
+  final void Function(QueuedPromptSync entry) onSendNow;
   final void Function(String id) onRemove;
 
   @override
@@ -2290,7 +2764,7 @@ class _QueuedMessageRow extends StatelessWidget {
             style: TextStyle(fontSize: 12.5, color: context.tokens.muted),
           ),
         ),
-        if (entry.images.isNotEmpty) ...[
+        if (entry.imageCount > 0) ...[
           SizedBox(width: 6),
           Icon(Icons.image_outlined, size: 15, color: context.tokens.subtle),
         ],
@@ -2303,7 +2777,7 @@ class _QueuedMessageRow extends StatelessWidget {
         IconButton(
           visualDensity: VisualDensity.compact,
           tooltip: 'Remove queued message',
-          onPressed: () => onRemove(entry.id),
+          onPressed: sending ? null : () => onRemove(entry.id),
           icon: const Icon(Icons.close, size: 18),
         ),
       ],

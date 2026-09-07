@@ -1,5 +1,5 @@
 import { convexTest } from "convex-test";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 
 declare global {
@@ -27,7 +27,7 @@ export const relayFixture = {
 
 export async function registerDevice(t: RelayTest): Promise<void> {
   const { deviceId, deviceToken } = relayFixture;
-  await t.mutation(api.pairing.registerDevice, {
+  await enrollDevice(t, {
     deviceId,
     token: deviceToken,
     name: "Fixture Mac",
@@ -62,4 +62,11 @@ export async function upsertSession(t: RelayTest): Promise<void> {
     agentState: "working",
     executionMode: "stream-json",
   });
+}
+
+export async function enrollDevice(t: RelayTest, args: { deviceId: string; token: string; name: string; platform: string }) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(args.token)));
+  const tokenFingerprint = Array.from(digest, value => value.toString(16).padStart(2, "0")).join("");
+  await t.mutation(internal.pairing.authorizeDevice, { deviceId: args.deviceId, tokenFingerprint });
+  return t.mutation(api.pairing.registerDevice, args);
 }
