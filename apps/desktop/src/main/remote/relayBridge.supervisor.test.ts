@@ -15,6 +15,13 @@ import type { SessionService } from "../sessionService";
 let failing = new Set<string>();
 const calls: string[] = [];
 
+// PNG compression uses real asynchronous I/O that advancing fake timers does
+// not await. This suite tests the supervisor, not QR rendering; keep encoding
+// deterministic so a reconnect finishes on the simulated clock in CI too.
+vi.mock("qrcode", () => ({
+  default: { toDataURL: vi.fn(async () => "data:image/png;base64,test") },
+}));
+
 vi.mock("./keychain", () => ({
   readKeychainSecret: vi.fn(async () => null),
   writeKeychainSecret: vi.fn(async () => undefined),
