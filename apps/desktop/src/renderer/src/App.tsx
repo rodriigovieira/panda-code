@@ -12501,7 +12501,7 @@ export default function App(): React.ReactElement {
               <label className="settings-field">
                 <span><input type="checkbox" checked={preferences.remoteAllowFullAccess === true}
                   onChange={(event) => void desktopApi.savePreferences({ remoteAllowFullAccess: event.target.checked }).then(setPreferences)} /> Allow unrestricted agent control and approvals from phones</span>
-                <small>Off by default. Enabling this lets any paired phone run unrestricted agents and grant access on this Mac. Face ID on the phone cannot protect against copied pairing credentials.</small>
+                <small>Off by default. Enabling this lets a paired phone authorize unrestricted work with Face ID. Each current phone signs commands with its own device-bound identity.</small>
               </label>
               <div className="remote-device-list">
                 {remoteDevices.length === 0 ? (
@@ -12512,13 +12512,16 @@ export default function App(): React.ReactElement {
                       <div>
                         <strong>{device.name?.trim() || "Panda Code Mobile"}</strong>
                         <span>{new Date(device.createdAt).toLocaleDateString()}</span>
+                        <span>{device.commandAuthVersion === 3
+                          ? device.commandKeyProtection?.startsWith("secure-enclave") ? "Secure Enclave command identity" : "Device-bound command identity"
+                          : "Legacy command authorization — open the phone app to upgrade"}</span>
                       </div>
                       <button
                         className="ghost-icon-button"
                         type="button"
                         onClick={() => void desktopApi.revokeRemotePairedDevice(device.mobileId).then(setRemoteDevices)}
-                        aria-label="Reset phone access and encryption key"
-                        title="Reset access for all phones and replace encryption key"
+                        aria-label="Revoke this phone"
+                        title="Revoke this phone's command identity"
                       >
                         <Trash2 size={15} aria-hidden="true" />
                       </button>

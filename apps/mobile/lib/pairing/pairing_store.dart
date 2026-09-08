@@ -8,6 +8,7 @@ class PairingCredentials {
   final String mobileId;
   final String mobileToken;
   final String keyBase64;
+  final int? commandAuthVersion;
 
   const PairingCredentials({
     required this.url,
@@ -15,12 +16,17 @@ class PairingCredentials {
     required this.mobileId,
     required this.mobileToken,
     required this.keyBase64,
+    this.commandAuthVersion,
   });
 }
 
 class PairingStore {
   static const _storage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: IOSOptions(
+      accessibility: KeychainAccessibility.unlocked_this_device,
+      synchronizable: false,
+    ),
   );
 
   static const _kUrl = 'pc.url';
@@ -28,6 +34,7 @@ class PairingStore {
   static const _kMobileId = 'pc.mobileId';
   static const _kMobileToken = 'pc.mobileToken';
   static const _kKey = 'pc.k';
+  static const _kCommandAuthVersion = 'pc.commandAuthVersion';
 
   Future<PairingCredentials?> load() async {
     final all = await _storage.readAll();
@@ -49,6 +56,7 @@ class PairingStore {
       mobileId: mobileId,
       mobileToken: token,
       keyBase64: key,
+      commandAuthVersion: int.tryParse(all[_kCommandAuthVersion] ?? ''),
     );
   }
 
@@ -58,6 +66,12 @@ class PairingStore {
     await _storage.write(key: _kMobileId, value: c.mobileId);
     await _storage.write(key: _kMobileToken, value: c.mobileToken);
     await _storage.write(key: _kKey, value: c.keyBase64);
+    if (c.commandAuthVersion != null) {
+      await _storage.write(
+          key: _kCommandAuthVersion, value: '${c.commandAuthVersion}');
+    } else {
+      await _storage.delete(key: _kCommandAuthVersion);
+    }
   }
 
   Future<void> clear() => _storage.deleteAll();

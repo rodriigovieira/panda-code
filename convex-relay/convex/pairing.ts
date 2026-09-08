@@ -1,6 +1,7 @@
 import { internalMutation, mutation, query } from "./_generated/server";
+import { internal } from "./_generated/api";
 import { v } from "convex/values";
-import { hashToken, requireDevice, verifyToken } from "./lib/auth";
+import { hashToken, requireDevice, requireMobile, verifyToken } from "./lib/auth";
 import { deletePayload } from "./lib/commandPayloads";
 import { deleteResult } from "./lib/commandResults";
 
@@ -94,9 +95,33 @@ export const createCode = mutation({
 });
 
 /** Phone claims a pairing code → becomes a paired mobile client. */
+const commandIdentityArgs = {
+  commandAuthVersion: v.optional(v.number()),
+  commandKeyId: v.optional(v.string()),
+  commandPublicKey: v.optional(v.string()),
+  commandKeyProtection: v.optional(v.string()),
+};
+
+function validateCommandIdentity(identity: {
+  commandAuthVersion?: number;
+  commandKeyId?: string;
+  commandPublicKey?: string;
+  commandKeyProtection?: string;
+}): boolean {
+  const values = [identity.commandAuthVersion, identity.commandKeyId, identity.commandPublicKey, identity.commandKeyProtection];
+  if (values.every((value) => value === undefined)) return false;
+  if (identity.commandAuthVersion !== 3 ||
+      !/^[a-f0-9]{64}$/.test(identity.commandKeyId ?? "") ||
+      !/^[A-Za-z0-9+/]{87}=$/.test(identity.commandPublicKey ?? "") ||
+      !["secure-enclave-biometry-current-set", "secure-enclave-user-presence", "keychain-biometry-current-set", "keychain-user-presence"].includes(identity.commandKeyProtection ?? "")) {
+    throw new Error("INVALID_COMMAND_IDENTITY");
+  }
+  return true;
+}
+
 export const claimCode = mutation({
-  args: { code: v.string(), mobileId: v.string(), token: v.string(), name: v.optional(v.string()) },
-  handler: async (ctx, { code, mobileId, token, name }) => {
+  args: { code: v.string(), mobileId: v.string(), token: v.string(), name: v.optional(v.string()), ...commandIdentityArgs },
+  handler: async (ctx, { code, mobileId, token, name, ...identity }) => {
     const pairing = await ctx.db
       .query("pairings")
       .withIndex("by_code", (q) => q.eq("code", code))
@@ -116,14 +141,38 @@ export const claimCode = mutation({
     const existing = await ctx.db.query("mobileClients").withIndex("by_mobile", q => q.eq("mobileId", mobileId)).first();
     if (existing) throw new Error("MOBILE_ALREADY_EXISTS");
     await ctx.db.patch(pairing._id, { status: "claimed", claimedByMobileId: mobileId });
+    const hasIdentity = validateCommandIdentity(identity);
     await ctx.db.insert("mobileClients", {
       mobileId,
       deviceId: pairing.deviceId,
       name,
       tokenHash: await hashToken(token),
       createdAt: Date.now(),
+      ...(hasIdentity ? identity : {}),
     });
     return { deviceId: pairing.deviceId };
+  },
+});
+
+/** One-way migration for a phone paired before command v3. A different key can
+ * never overwrite the enrolled identity: biometric invalidation requires a
+ * fresh QR pairing and therefore a new mobileId. */
+export const registerCommandIdentity = mutation({
+  args: { mobileId: v.string(), token: v.string(), ...commandIdentityArgs },
+  handler: async (ctx, { mobileId, token, ...identity }) => {
+    const mobile = await requireMobile(ctx, mobileId, token);
+    if (!validateCommandIdentity(identity)) throw new Error("COMMAND_IDENTITY_REQUIRED");
+    if (mobile.commandKeyId !== undefined) {
+      if (mobile.commandAuthVersion !== identity.commandAuthVersion ||
+          mobile.commandKeyId !== identity.commandKeyId ||
+          mobile.commandPublicKey !== identity.commandPublicKey ||
+          mobile.commandKeyProtection !== identity.commandKeyProtection) {
+        throw new Error("COMMAND_IDENTITY_CHANGED_REPAIR_REQUIRED");
+      }
+      return { enrolled: true, migrated: false };
+    }
+    await ctx.db.patch(mobile._id, identity);
+    return { enrolled: true, migrated: true };
   },
 });
 
@@ -137,11 +186,15 @@ export const listMobileClients = query({
       .withIndex("by_device", (q) => q.eq("deviceId", deviceId))
       .collect();
     return clients
+      .filter((client) => client.revokedAt === undefined)
       .map((client) => ({
         mobileId: client.mobileId,
         name: client.name,
         createdAt: client.createdAt,
         notificationsEnabled: client.notifMuted !== true,
+        commandAuthVersion: client.commandAuthVersion,
+        commandKeyId: client.commandKeyId,
+        commandKeyProtection: client.commandKeyProtection,
       }))
       .sort((a, b) => b.createdAt - a.createdAt);
   },
@@ -156,8 +209,9 @@ export const setMobileNotifications = mutation({
       .query("mobileClients")
       .withIndex("by_device", (q) => q.eq("deviceId", deviceId))
       .collect();
-    await Promise.all(clients.map((client) => ctx.db.patch(client._id, { notifMuted: !enabled })));
-    return clients
+    const activeClients = clients.filter((client) => client.revokedAt === undefined);
+    await Promise.all(activeClients.map((client) => ctx.db.patch(client._id, { notifMuted: !enabled })));
+    return activeClients
       .map((client) => ({
         mobileId: client.mobileId,
         name: client.name,
@@ -168,12 +222,74 @@ export const setMobileNotifications = mutation({
   },
 });
 
-/** Old desktops cannot revoke safely without rotating their shared key. */
+/** Authorization-first revocation. This transaction only marks the bearer and
+ * command identity unusable, then schedules bounded cleanup. It stays small even
+ * when the phone has thousands of retained commands. */
 export const revokeMobileClient = mutation({
   args: { deviceId: v.string(), token: v.string(), mobileId: v.string() },
-  handler: async (ctx, { deviceId, token }) => {
+  handler: async (ctx, { deviceId, token, mobileId }) => {
     await requireDevice(ctx, deviceId, token);
-    throw new Error("Update Panda Code on your Mac to revoke phones and rotate the encryption key.");
+    const mobile = await ctx.db.query("mobileClients").withIndex("by_mobile", q => q.eq("mobileId", mobileId)).unique();
+    if (!mobile || mobile.deviceId !== deviceId) throw new Error("MOBILE_NOT_FOUND");
+    if (mobile.revokedAt === undefined) {
+      await ctx.db.patch(mobile._id, {
+        revokedAt: Date.now(),
+        commandAuthVersion: undefined,
+        commandKeyId: undefined,
+        commandPublicKey: undefined,
+        commandKeyProtection: undefined,
+      });
+    }
+    await ctx.scheduler.runAfter(0, internal.pairing.cleanupRevokedMobile, { mobileId });
+    const remaining = await ctx.db.query("mobileClients").withIndex("by_device", q => q.eq("deviceId", deviceId)).collect();
+    return remaining.filter(client => client.revokedAt === undefined).map(client => ({
+      mobileId: client.mobileId,
+      name: client.name,
+      createdAt: client.createdAt,
+      notificationsEnabled: client.notifMuted !== true,
+      commandAuthVersion: client.commandAuthVersion,
+      commandKeyId: client.commandKeyId,
+      commandKeyProtection: client.commandKeyProtection,
+    })).sort((a, b) => b.createdAt - a.createdAt);
+  },
+});
+
+const REVOKED_PUSH_BATCH = 100;
+const REVOKED_SUBSCRIPTION_BATCH = 100;
+const REVOKED_COMMAND_BATCH = 25;
+
+/** Idempotent bounded cleanup. The revoked row remains as the fail-closed auth
+ * tombstone until every dependent row is gone. */
+export const cleanupRevokedMobile = internalMutation({
+  args: { mobileId: v.string() },
+  handler: async (ctx, { mobileId }): Promise<{ complete: boolean }> => {
+    const mobile = await ctx.db.query("mobileClients").withIndex("by_mobile", q => q.eq("mobileId", mobileId)).unique();
+    if (!mobile) return { complete: true };
+    if (mobile.revokedAt === undefined) return { complete: true };
+
+    const pushTokens = await ctx.db.query("pushTokens").withIndex("by_mobile", q => q.eq("mobileId", mobileId)).take(REVOKED_PUSH_BATCH);
+    const subscriptions = await ctx.db.query("sessionSubs").withIndex("by_mobile", q => q.eq("mobileId", mobileId)).take(REVOKED_SUBSCRIPTION_BATCH);
+    const commands = await ctx.db.query("commands").withIndex("by_mobile", q => q.eq("mobileId", mobileId)).take(REVOKED_COMMAND_BATCH);
+    for (const row of pushTokens) await ctx.db.delete(row._id);
+    for (const row of subscriptions) await ctx.db.delete(row._id);
+    for (const row of commands) {
+      await deletePayload(ctx, row._id);
+      const results = await ctx.db.query("commandResults").withIndex("by_command", q => q.eq("commandId", row._id)).take(25);
+      for (const result of results) await ctx.db.delete(result._id);
+      // Keep the command as an indexed cleanup cursor until every result chunk
+      // is gone; deleting it earlier would orphan the remaining chunks.
+      if (results.length < 25) await ctx.db.delete(row._id);
+    }
+
+    const more = pushTokens.length === REVOKED_PUSH_BATCH ||
+      subscriptions.length === REVOKED_SUBSCRIPTION_BATCH ||
+      commands.length > 0;
+    if (more) {
+      await ctx.scheduler.runAfter(0, internal.pairing.cleanupRevokedMobile, { mobileId });
+      return { complete: false };
+    }
+    await ctx.db.delete(mobile._id);
+    return { complete: true };
   },
 });
 

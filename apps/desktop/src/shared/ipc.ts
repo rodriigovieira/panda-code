@@ -389,6 +389,9 @@ export type RemotePairedDevice = {
   name?: string;
   createdAt: number;
   notificationsEnabled: boolean;
+  commandAuthVersion?: number;
+  commandKeyId?: string;
+  commandKeyProtection?: string;
 };
 
 export type SessionMobileNotificationStatus = {

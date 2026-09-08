@@ -38,10 +38,24 @@ export const enqueue = mutation({
       v.literal("media"),
     ),
     payloadCipher: v.optional(v.string()),
+    commandAuthVersion: v.optional(v.number()),
+    commandKeyId: v.optional(v.string()),
+    commandSignature: v.optional(v.string()),
   },
-  handler: async (ctx, { mobileId, token, sessionId, type, payloadCipher }) => {
+  handler: async (ctx, { mobileId, token, sessionId, type, payloadCipher, commandAuthVersion, commandKeyId, commandSignature }) => {
     const mobile = await requireMobile(ctx, mobileId, token);
     if (!payloadCipher) throw new Error("AUTHENTICATED_COMMAND_REQUIRED: Update Panda Code on your phone.");
+    const hasEnrolledIdentity = mobile.commandKeyId !== undefined;
+    const authValues = [commandAuthVersion, commandKeyId, commandSignature];
+    const hasAnyAuth = authValues.some(value => value !== undefined);
+    if (hasEnrolledIdentity) {
+      if (mobile.commandAuthVersion !== 3 || commandAuthVersion !== 3 ||
+          commandKeyId !== mobile.commandKeyId || !commandSignature || commandSignature.length > 256) {
+        throw new Error("COMMAND_SIGNATURE_REQUIRED");
+      }
+    } else if (hasAnyAuth) {
+      throw new Error("COMMAND_IDENTITY_NOT_ENROLLED");
+    }
     const now = Date.now();
     // Count only rows inside the window, via the (mobileId, createdAt) index.
     // Taking the last N rows regardless of age meant re-reading the last N
@@ -62,6 +76,7 @@ export const enqueue = mutation({
       type,
       status: "pending",
       createdAt: now,
+      ...(hasEnrolledIdentity ? { commandAuthVersion, commandKeyId, commandSignature } : {}),
     });
     // The payload (which may be a megabyte of base64 screenshot) goes to its own
     // table so the routing row stays tiny for `watchMine` and the rate-limit scan.
@@ -89,9 +104,21 @@ export const pending = query({
       .withIndex("by_device_status", (q) => q.eq("deviceId", deviceId).eq("status", "pending"))
       .filter((q) => q.gte(q.field("createdAt"), minCreatedAt))
       .take(50);
-    return Promise.all(
-      rows.map(async (row) => ({ ...row, payloadCipher: await readPayloadCipher(ctx, row) })),
-    );
+    return Promise.all(rows.map(async (row) => {
+      const mobile = await ctx.db.query("mobileClients").withIndex("by_mobile", q => q.eq("mobileId", row.mobileId)).unique();
+      const signed = row.commandAuthVersion === 3 && row.commandKeyId !== undefined && row.commandSignature !== undefined;
+      const legacy = row.commandAuthVersion === undefined && row.commandKeyId === undefined && row.commandSignature === undefined;
+      return {
+        ...row,
+        payloadCipher: await readPayloadCipher(ctx, row),
+        commandIdentityState: signed && mobile?.commandAuthVersion === 3 && mobile.commandKeyId === row.commandKeyId && mobile.commandPublicKey
+          ? "signed"
+          : legacy && mobile && mobile.commandKeyId === undefined
+            ? "legacy"
+            : "invalid",
+        commandPublicKey: signed && mobile?.commandKeyId === row.commandKeyId ? mobile?.commandPublicKey : undefined,
+      };
+    }));
   },
 });
 
@@ -103,6 +130,17 @@ export const claim = mutation({
     const cmd = await ctx.db.get(commandId);
     if (!cmd || cmd.deviceId !== deviceId) throw new Error("COMMAND_NOT_FOUND");
     if (cmd.status !== "pending") return { claimed: false };
+    const mobile = await ctx.db.query("mobileClients").withIndex("by_mobile", q => q.eq("mobileId", cmd.mobileId)).unique();
+    const identityStillValid = mobile?.revokedAt === undefined && (
+      cmd.commandAuthVersion === 3
+        ? mobile?.commandAuthVersion === 3 && mobile.commandKeyId === cmd.commandKeyId
+        : cmd.commandAuthVersion === undefined && mobile?.commandKeyId === undefined
+    );
+    if (!identityStillValid) {
+      await ctx.db.patch(commandId, { status: "error", claimedAt: Date.now() });
+      await deletePayload(ctx, commandId);
+      return { claimed: false };
+    }
     if (cmd.createdAt < Date.now() - PENDING_COMMAND_TTL_MS) {
       await ctx.db.patch(commandId, { status: "error", claimedAt: Date.now() });
       await deletePayload(ctx, commandId);

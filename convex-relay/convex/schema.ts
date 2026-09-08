@@ -90,6 +90,13 @@ export default defineSchema({
     name: v.optional(v.string()),
     tokenHash: v.string(),
     createdAt: v.number(),
+    revokedAt: v.optional(v.number()),
+    // Independent command identity. The group E2E key is intentionally still
+    // shared for content compatibility; this public key authorizes commands.
+    commandAuthVersion: v.optional(v.number()),
+    commandKeyId: v.optional(v.string()),
+    commandPublicKey: v.optional(v.string()),
+    commandKeyProtection: v.optional(v.string()),
     // Per-phone notification preferences (absent = notify). No content here.
     notifMuted: v.optional(v.boolean()),
     notifyOnDone: v.optional(v.boolean()),
@@ -339,6 +346,9 @@ export default defineSchema({
     // `commandPayloads`. Reads still fall back to it so commands enqueued by an
     // older phone build (or before the split) still execute.
     payloadCipher: v.optional(v.string()),
+    commandAuthVersion: v.optional(v.number()),
+    commandKeyId: v.optional(v.string()),
+    commandSignature: v.optional(v.string()),
     status: v.union(
       v.literal("pending"),
       v.literal("claimed"),

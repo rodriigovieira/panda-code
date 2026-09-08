@@ -133,6 +133,7 @@ export async function requireMobile(
     .withIndex("by_mobile", (query) => query.eq("mobileId", mobileId))
     .unique();
   if (!mobile) throw new Error("MOBILE_NOT_FOUND");
+  if (mobile.revokedAt !== undefined) throw new Error("MOBILE_REVOKED");
   if (!(await verifyToken(token, mobile.tokenHash))) {
     throw new Error("MOBILE_AUTH_FAILED");
   }

@@ -92,6 +92,11 @@ type PendingCommand = {
   sessionId?: string;
   type: CommandType;
   payloadCipher?: string;
+  commandAuthVersion?: number;
+  commandKeyId?: string;
+  commandSignature?: string;
+  commandIdentityState?: "signed" | "legacy" | "invalid";
+  commandPublicKey?: string;
   createdAt: number;
 };
 type RelayCredentials = {
@@ -410,6 +415,7 @@ const listMobileClientsRef = makeFunctionReference<"query", ListMobileClientsArg
 const setMobileNotificationsRef = makeFunctionReference<"mutation", SetMobileNotificationsArgs, RemotePairedDevice[]>(
   "pairing:setMobileNotifications",
 );
+const revokeMobileClientRef = makeFunctionReference<"mutation", RevokeMobileClientArgs, RemotePairedDevice[]>("pairing:revokeMobileClient");
 const sessionMobileNotificationsRef = makeFunctionReference<"query", SessionMobileNotificationsArgs, SessionMobileNotificationStatus>(
   "notifications:sessionSubscriptionForDevice",
 );
@@ -1050,9 +1056,15 @@ export class RelayBridge {
     });
   }
 
-  private rotatingPhones: Promise<RemotePairedDevice[]> | undefined;
-  revokePairedDevice(_mobileId: string): Promise<RemotePairedDevice[]> {
-    return this.rotatingPhones ??= this.resetPhoneAccess().finally(() => { this.rotatingPhones = undefined; });
+  async revokePairedDevice(mobileId: string): Promise<RemotePairedDevice[]> {
+    if (!this.url) return [];
+    if (!this.client || !this.credentials) await this.start();
+    if (!this.client || !this.credentials) throw new Error("Relay credentials are unavailable.");
+    return this.client.mutation(revokeMobileClientRef, {
+      deviceId: this.credentials.deviceId,
+      token: this.credentials.token,
+      mobileId,
+    });
   }
 
   private async resetPhoneAccess(): Promise<RemotePairedDevice[]> {

@@ -13,6 +13,7 @@ import '../git/git_status_models.dart';
 import '../machine/machine_models.dart';
 import '../pairing/pairing_store.dart';
 import '../schedule/schedule_models.dart';
+import '../security/command_identity.dart';
 import '../sessions/models.dart';
 import 'relay_client.dart';
 
@@ -23,6 +24,7 @@ class RelayApi {
   final RelayClient client;
   final PairingCredentials creds;
   final E2ECodec codec;
+  CommandIdentity? _commandIdentity;
 
   /// Where the session-list and history decrypt batches record their
   /// duration — see PerfTrace's doc comment. Defaults to a disabled sink so
@@ -1143,25 +1145,65 @@ class RelayApi {
   }
 
   /// All command producers use one authenticated, destination-bound envelope.
-  Future<dynamic> _enqueueCommand(Map<String, dynamic> args) {
+  Future<dynamic> _enqueueCommand(Map<String, dynamic> args) async {
     final now = DateTime.now().millisecondsSinceEpoch;
     final oldPayload = args['payloadCipher'];
+    final payload = oldPayload is String ? codec.open(oldPayload) : null;
+    if (creds.commandAuthVersion != 3) {
+      final envelope = {
+        'v': 2,
+        'domain': 'panda-code/command/v2',
+        'id': const Uuid().v4(),
+        'deviceId': creds.deviceId,
+        'mobileId': creds.mobileId,
+        'sessionId': args['sessionId'],
+        'type': args['type'],
+        'issuedAt': now,
+        'expiresAt': now + 5 * 60 * 1000,
+        'payload': payload,
+      };
+      return client.mutation('commands:enqueue', {
+        ...args,
+        ..._auth,
+        'payloadCipher': codec.sealCommand(envelope),
+      });
+    }
+    final payloadCanonical = CommandIdentity.payloadCanonical(payload);
+    final payloadDigest = CommandIdentity.payloadDigest(payloadCanonical);
+    final id = const Uuid().v4();
+    final expiresAt = now + 5 * 60 * 1000;
+    final identity = _commandIdentity ??= await CommandIdentity.loadOrCreate();
+    final message = CommandIdentity.signingMessage(
+      id: id,
+      deviceId: creds.deviceId,
+      mobileId: creds.mobileId,
+      sessionId: args['sessionId'] as String?,
+      type: args['type'] as String,
+      issuedAt: now,
+      expiresAt: expiresAt,
+      payloadDigest: payloadDigest,
+    );
+    final signature = await identity.sign(message);
     final envelope = {
-      'v': 2,
-      'domain': 'panda-code/command/v2',
-      'id': const Uuid().v4(),
+      'v': 3,
+      'domain': commandAuthDomain,
+      'id': id,
       'deviceId': creds.deviceId,
       'mobileId': creds.mobileId,
       'sessionId': args['sessionId'],
       'type': args['type'],
       'issuedAt': now,
-      'expiresAt': now + 5 * 60 * 1000,
-      'payload': oldPayload is String ? codec.open(oldPayload) : null,
+      'expiresAt': expiresAt,
+      'payloadCanonical': payloadCanonical,
+      'payloadDigest': payloadDigest,
     };
     return client.mutation('commands:enqueue', {
       ...args,
       ..._auth,
       'payloadCipher': codec.sealCommand(envelope),
+      'commandAuthVersion': 3,
+      'commandKeyId': identity.keyId,
+      'commandSignature': signature,
     });
   }
 

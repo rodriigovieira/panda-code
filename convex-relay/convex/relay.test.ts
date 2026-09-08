@@ -615,19 +615,14 @@ describe("relay protocol", () => {
         token: relayFixture.deviceToken,
         mobileId: relayFixture.mobileId,
       }),
-    ).rejects.toThrow("Update Panda Code");
-    let complete = false;
-    for (let i = 0; i < 30 && !complete; i++) {
-      ({ complete } = await t.mutation(api.pairing.resetPairing, {deviceId: relayFixture.deviceId, token: relayFixture.deviceToken, resetId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}));
-    }
-    expect(complete).toBe(true);
+    ).resolves.toEqual([]);
 
     await expect(
       t.query(api.commands.watchMine, {
         mobileId: relayFixture.mobileId,
         token: relayFixture.mobileToken,
       }),
-    ).rejects.toThrow("MOBILE_NOT_FOUND");
+    ).rejects.toThrow(/MOBILE_(REVOKED|NOT_FOUND)/);
   });
 
   test("desktop can subscribe and unsubscribe all paired phones from notifications", async () => {

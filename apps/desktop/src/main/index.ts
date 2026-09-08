@@ -7607,9 +7607,9 @@ app.whenReady().then(() => {
 
   ipcMain.handle("remote:revoke-device", async (_event, mobileId: unknown) => {
     if (typeof mobileId !== "string" || !remoteBridge) return [];
-    const decision = await dialog.showMessageBox({ type: "warning", buttons: ["Cancel", "Reset phone access"], defaultId: 0, cancelId: 0,
-      message: "Reset access for all paired phones?",
-      detail: "This replaces the shared encryption key and clears the relay copy of your sessions and captures. Local conversations stay on this Mac. Every phone must scan a new QR code.",
+    const decision = await dialog.showMessageBox({ type: "warning", buttons: ["Cancel", "Revoke phone"], defaultId: 0, cancelId: 0,
+      message: "Revoke this paired phone?",
+      detail: "Its relay credential and independent command identity will be removed. Other paired phones remain authorized. Content already downloaded by this phone cannot be recalled.",
     });
     return decision.response === 1 ? remoteBridge.revokePairedDevice(mobileId) : remoteBridge.listPairedDevices();
   });

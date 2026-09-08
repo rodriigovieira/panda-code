@@ -2,16 +2,37 @@
 
 The optional relay is designed to carry encrypted content. Its URL is public
 configuration. Transport credentials and the pairing encryption key have separate
-roles; see [the protocol](protocol.md#authenticated-commands-and-revocation-command-protocol-v2).
+roles; see [the protocol](protocol.md#authenticated-commands-and-per-phone-identity-command-protocols-v2v3).
 Anyone with the QR code can obtain the key, so treat it like an access credential.
 The relay operator sees routing metadata, timing, sizes, device names and push
 tokens. Hosting your own relay does not make its cloud provider invisible.
 
-An authorized phone can read workspace files and ask agents to act. Remote full
-access is disabled by default; enabling it on the Mac can extend the impact of a
-lost phone to the files and accounts available to the local user. Revoking phone
-access rotates the shared key and disconnects all phones. Already downloaded data
-cannot be recalled. Keep the OS, browser runtime and model CLIs updated.
+An authorized phone can read workspace files and ask agents to act. Each current
+phone has an independently enrolled P-256 command identity. iOS uses a
+non-exportable Secure Enclave key when supported and a non-synchronizable,
+ThisDeviceOnly Keychain fallback otherwise. Face ID/user presence occurs on the
+phone at signing time, not at the Mac. Keys made with `biometryCurrentSet` are
+invalidated when biometric enrollment changes and require re-pairing.
+
+Command signatures cover the UUID, desktop and mobile IDs, nullable session ID,
+command type, issued/expiry times, and SHA-256 of canonical payload JSON. The
+desktop additionally verifies secretbox authentication, relay routing, key ID,
+lifetime, and durable replay state. A v3-enrolled phone cannot downgrade to v2;
+partial or contradictory identity metadata is rejected rather than guessed.
+
+Remote full access is disabled by default; enabling it can extend the impact of
+a lost, unlocked phone to files and accounts available to the local user.
+Revoking one phone removes its bearer credential and command public key without
+rotating other phones. Content encryption remains group-key based, so already
+downloaded data and copied historical content keys cannot be recalled. Keep the
+OS, browser runtime and model CLIs updated.
+
+Revocation is authorization-first: a tombstone blocks mobile authentication,
+pending identity lookup, and command claim before bounded background cleanup
+starts. A command that the desktop claimed before that transaction may already
+be executing and is not retroactively cancellable; commands not yet claimed are
+rejected. Cleanup batching is availability work, not part of the authorization
+decision.
 
 The desktop re-evaluates agent authority at each remote delivery. Claude uses the
 more permissive possibility from its saved selector and parsed launcher flags,

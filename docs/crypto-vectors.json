@@ -31,5 +31,18 @@
       "payload": null
     },
     "envelopeBase64": "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7XVqsaCAyfuPZqfGyi1Dps4yiZ/hS3dlROz2Foyur6dVGpbeEJb1466r784AHDqpKPvwk57XjOE49RDV+HKpODhY7Ax48DO7IJ/hYHcWbRvNFV/7L4eNyn0XVqkACh4mi64jIu8kvwDysH8rg4yxHsg+p1BYo8mF2zt2b3wVYO1oszcPxobqZL6DljRQdNYyduuD2PIXvMJj+SJsl3GO5i1JaFkXWjxnGi21cVSNOGg00D5dPMIDu13XM6d8QC9RklNZEiigikO8OkL2L2XMHIn+RQjeQq/Ij6v8k7W5FRNmMTeOJox5w6Kr8dtTfj7wOTg=="
+  },
+  "commandSignatureVector": {
+    "payload": { "z": [3, { "y": true, "x": null }], "a": "hello" },
+    "payloadCanonical": "{\"a\":\"hello\",\"z\":[3,{\"x\":null,\"y\":true}]}",
+    "payloadDigest": "b7fb37bcb3d1fc4be3973929b7c4219bacc8cc8f9d10034b24b7b357df45fda7",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "deviceId": "device",
+    "mobileId": "phone",
+    "sessionId": null,
+    "type": "stop",
+    "issuedAt": 1800000000000,
+    "expiresAt": 1800000060000,
+    "signingMessage": "[\"panda-code/command-auth/v3\",\"11111111-1111-4111-8111-111111111111\",\"device\",\"phone\",null,\"stop\",1800000000000,1800000060000,\"b7fb37bcb3d1fc4be3973929b7c4219bacc8cc8f9d10034b24b7b357df45fda7\"]"
   }
 }

@@ -2,7 +2,7 @@ name: panda_code_mobile
 description: Panda Code mobile companion — pair, trigger, and watch Claude Code sessions on your Mac.
 publish_to: 'none'
 
-version: 1.19.18+202609070506
+version: 1.19.19+202609071759
 
 environment:
   sdk: '>=3.3.0 <4.0.0'

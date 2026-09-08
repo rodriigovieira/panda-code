@@ -11,6 +11,7 @@ import '../dictation/dictation_trace.dart';
 import '../notifications/push_notifications.dart';
 import '../pairing/pairing_payload.dart';
 import '../pairing/pairing_store.dart';
+import '../security/command_identity.dart';
 import '../relay/relay_api.dart';
 import '../relay/relay_client.dart';
 import '../sessions/alias_store.dart';
@@ -36,7 +37,8 @@ final dictationServiceProvider = Provider<DictationService>((ref) {
     await api?.appendDictationTrace(entries);
   });
   ref.listen(
-    settingsProvider.select((s) => s.valueOrNull?.dictationDiagnostics ?? false),
+    settingsProvider
+        .select((s) => s.valueOrNull?.dictationDiagnostics ?? false),
     (_, enabled) => trace.enabled = enabled,
     fireImmediately: true,
   );
@@ -491,7 +493,10 @@ class PairingController extends AsyncNotifier<PairingCredentials?> {
     final creds = await ref.read(pairingStoreProvider).load();
     if (creds != null) {
       await RelayClient.ensureInitialized(creds.url);
-      await PushNotifications.registerForPairing(creds);
+      final migrated = await _enrollCommandIdentity(creds);
+      if (migrated == null) return null;
+      await PushNotifications.registerForPairing(migrated);
+      return migrated;
     }
     return creds;
   }
@@ -503,22 +508,86 @@ class PairingController extends AsyncNotifier<PairingCredentials?> {
     final mobileId = const Uuid().v4();
     final token = _randomToken();
     final client = await RelayClient.ensureInitialized(payload.url);
-    await client.mutation('pairing:claimCode', {
+    final identity = await CommandIdentity.loadOrCreate();
+    final v3Claim = {
       'code': payload.code,
       'mobileId': mobileId,
       'token': token,
       'name': 'Panda Code Mobile',
-    });
+      'commandAuthVersion': 3,
+      'commandKeyId': identity.keyId,
+      'commandPublicKey': identity.publicKeyBase64,
+      'commandKeyProtection': identity.protection,
+    };
+    var commandAuthVersion = 3;
+    try {
+      await client.mutation('pairing:claimCode', v3Claim);
+    } catch (error) {
+      if (!_isLegacyRelay(error)) rethrow;
+      commandAuthVersion = 0;
+      await client.mutation('pairing:claimCode', {
+        'code': payload.code,
+        'mobileId': mobileId,
+        'token': token,
+        'name': 'Panda Code Mobile',
+      });
+    }
     final creds = PairingCredentials(
       url: payload.url,
       deviceId: payload.deviceId,
       mobileId: mobileId,
       mobileToken: token,
       keyBase64: payload.keyBase64,
+      commandAuthVersion: commandAuthVersion == 3 ? 3 : null,
     );
     await store.save(creds);
     state = AsyncData(creds);
     await PushNotifications.registerForPairing(creds);
+  }
+
+  Future<PairingCredentials?> _enrollCommandIdentity(
+      PairingCredentials creds) async {
+    if (creds.commandAuthVersion == 3) return creds;
+    final identity = await CommandIdentity.loadOrCreate();
+    final client = await RelayClient.ensureInitialized(creds.url);
+    try {
+      await client.mutation('pairing:registerCommandIdentity', {
+        'mobileId': creds.mobileId,
+        'token': creds.mobileToken,
+        'commandAuthVersion': 3,
+        'commandKeyId': identity.keyId,
+        'commandPublicKey': identity.publicKeyBase64,
+        'commandKeyProtection': identity.protection,
+      });
+    } catch (error) {
+      if (_isLegacyRelay(error)) return creds;
+      if (error
+          .toString()
+          .contains('COMMAND_IDENTITY_CHANGED_REPAIR_REQUIRED')) {
+        await PushNotifications.reset();
+        await ref.read(pairingStoreProvider).clear();
+        return null;
+      }
+      rethrow;
+    }
+    final migrated = PairingCredentials(
+      url: creds.url,
+      deviceId: creds.deviceId,
+      mobileId: creds.mobileId,
+      mobileToken: creds.mobileToken,
+      keyBase64: creds.keyBase64,
+      commandAuthVersion: 3,
+    );
+    await ref.read(pairingStoreProvider).save(migrated);
+    return migrated;
+  }
+
+  bool _isLegacyRelay(Object error) {
+    final message = error.toString().toLowerCase();
+    return message.contains('could not find') ||
+        message.contains('not a function') ||
+        message.contains('extra field') ||
+        message.contains('unexpected field');
   }
 
   Future<void> unpair() async {
@@ -558,11 +627,13 @@ final Provider<PerfTrace> perfTraceProvider = Provider<PerfTrace>((ref) {
 });
 
 /// The authenticated relay API — available only once paired.
-final FutureProvider<RelayApi?> relayApiProvider = FutureProvider<RelayApi?>((ref) async {
+final FutureProvider<RelayApi?> relayApiProvider =
+    FutureProvider<RelayApi?>((ref) async {
   final creds = ref.watch(pairingProvider).valueOrNull;
   if (creds == null) return null;
   final client = await RelayClient.ensureInitialized(creds.url);
-  return RelayApi(client: client, creds: creds, perfTrace: ref.read(perfTraceProvider));
+  return RelayApi(
+      client: client, creds: creds, perfTrace: ref.read(perfTraceProvider));
 });
 
 /// Live desktop presence (+ the usage snapshot it carries). A subscription, not

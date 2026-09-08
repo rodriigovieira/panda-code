@@ -234,21 +234,56 @@ encrypted. Legacy single rows and inline results remain readable. Consumption,
 replacement, and retention cleanup delete every piece. This removes the per-row
 limit, not Convex's overall function argument, return, or transaction limits.
 
-## Authenticated commands and revocation (command protocol v2)
+## Authenticated commands and per-phone identity (command protocols v2/v3)
 
-Every command, including Stop and empty requests, now requires a secretbox
-ciphertext under a separate command key:
-`HMAC-SHA256(pairingKey, UTF8("panda-code/command/v2"))`.
-The decrypted envelope is `{v:2, domain:"panda-code/command/v2", id, deviceId,
-mobileId, sessionId, type, issuedAt, expiresAt, payload}`. `id` is a fresh UUID;
-`sessionId` is explicitly null when absent. Times are epoch milliseconds. The
-maximum lifetime is five minutes and future clock skew is limited to 30 seconds.
-The desktop verifies all routing fields against the received command and records
-its UUID durably before dispatch. A crash can lose a command but cannot execute
-it twice. Corrupt replay storage disables remote execution. Legacy command
-ciphertexts and payload-free commands fail closed; update both clients together.
-Existing event/result encryption remains unchanged. Payload shapes above describe
-`payload` inside the command envelope, not the whole decrypted command.
+Command v2 is the migration baseline. Every command, including Stop and empty
+requests, requires a secretbox ciphertext under
+`HMAC-SHA256(pairingKey, UTF8("panda-code/command/v2"))`. Its envelope is
+`{v:2, domain:"panda-code/command/v2", id, deviceId, mobileId, sessionId,
+type, issuedAt, expiresAt, payload}`. The desktop binds every routing field,
+allows at most five minutes with 30 seconds of future clock skew, and records the
+UUID durably before dispatch. Pre-v2 and payload-free commands fail closed.
+
+Command v3 adds an independent P-256 identity for each paired phone. On iPhones
+with Secure Enclave support, the private key is generated there and never
+exported. It is a non-synchronizable Keychain item with
+`kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and `biometryCurrentSet` when
+biometrics are enrolled, so an enrollment change invalidates it. Devices and simulators without a
+Secure Enclave use a non-exportable software P-256 Keychain key with the same
+ThisDeviceOnly/biometric policy when available, otherwise device-owner presence.
+Face ID happens on the phone while signing; nobody must be present at the Mac.
+
+The phone canonicalizes the inner payload as UTF-8 JSON (object keys sorted
+recursively, array order preserved), computes
+`payloadDigest = hex(SHA-256(payloadCanonical))`, and signs these UTF-8 bytes:
+
+```text
+JSON.stringify(["panda-code/command-auth/v3", commandUuid, deviceId,
+  mobileId, sessionIdOrNull, commandType, issuedAtMs, expiresAtMs,
+  payloadDigest])
+```
+
+The signature is P-256 ECDSA/SHA-256 in X9.62 DER form. The secretbox-protected
+v3 envelope is `{v:3, domain:"panda-code/command-auth/v3", id, deviceId,
+mobileId, sessionId, type, issuedAt, expiresAt, payloadCanonical,
+payloadDigest}`. The relay row carries the auth version, key ID, and signature.
+The desktop obtains the enrolled X9.63 public point for that exact phone/key ID,
+recomputes the key ID and payload digest, verifies the complete context, and only
+then records the replay UUID and dispatches. Missing, partial, mismatched,
+expired, replayed, or downgraded identity data fails closed. Event and result
+content encryption remains group-key compatible.
+
+### Migration and rollout
+
+Deploy the additive relay schema/functions first, then desktop and mobile. A
+mobile row with no command identity is explicitly legacy and may send only v2.
+On first launch against an updated relay, an existing phone creates its key,
+registers it once, stores version 3 in ThisDeviceOnly storage, and thereafter
+sends only v3. Registration is idempotent only for the exact same key. A changed
+or invalidated key cannot overwrite the enrolled identity and requires a fresh QR
+pairing/new mobile ID. Against an older self-hosted relay, the mobile app keeps
+using v2 until the additive function exists; a row already enrolled as v3 can
+never downgrade.
 
 The relay URL is public configuration, not a credential. New desktop enrollment
 requires the owner's internal `pairing:authorizeDevice` operation with the
@@ -259,18 +294,19 @@ with device identity and bearer token in headers. Bodies are capped at 16 MiB,
 with 60 attempts per device per hour; source captures are capped at 8 MiB. The
 server registers ownership before replying. Old unregistered blobs are pruned.
 
-Revoking a phone now resets **all phones** on that desktop. A new shared key and
-reset ID are saved in OS-protected local storage first. The relay blocks mobile
-access while bounded, retryable batches erase the old relay mirror, pending
-pairing codes, commands and stored media. The desktop republishes from local data
-under the new key after completion. Every remaining phone must scan a fresh QR.
-Local transcripts are preserved. The reset resumes after restart; a completed
-reset ID is idempotent. The legacy single-phone revoke endpoint refuses the
-operation because it cannot rotate the client's encryption key.
-
-A revoked phone may retain content it already downloaded. Rotation protects new
-content; it cannot recall old plaintext or ciphertext copied with an old key.
-A paired phone still holds a key shared with other phones on the same Mac.
+Revocation first marks one phone's bearer credential unusable and removes its
+public command identity in a small transaction. `requireMobile`, pending-command
+identity resolution, and command claiming then fail immediately. Scheduled,
+idempotent cleanup removes at most 100 push tokens, 100 subscriptions, and 25
+commands (with bounded result pieces) per transaction until the tombstone can be
+deleted. This keeps revocation prompt even with thousands of retained commands.
+Other phones continue working without key rotation. A command already claimed by
+the desktop before revocation may finish; pending or merely delivered commands
+must pass the post-revocation claim check and cannot start. The content E2E key remains shared initially for
+compatibility, so revocation cannot recall content already downloaded or a copied
+historical group key. The older bounded all-phone reset remains only to finish a
+reset persisted by an earlier desktop. A phone never holds another phone's
+command-signing private key.
 A stolen bearer token can affect that phone's relay subscriptions and expose
 ciphertext/traffic metadata; it cannot produce a valid new desktop command without
 the pairing key. Notification subscriptions remain bearer-authenticated routing
