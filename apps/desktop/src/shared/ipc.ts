@@ -1,6 +1,6 @@
 import type { NotificationChannelConfig, NotificationChannels } from "./notification-channels";
 import type { PerfSample, PerfSnapshot } from "./perf";
-import type { BacklogColumn, WorkspaceBacklog } from "./backlog";
+import type { BacklogColumn, VerificationOutcome, WorkspaceBacklog } from "./backlog";
 import type { BrowserActivity, BrowserState } from "./browser";
 import type { DictationRendererEvent } from "./dictation";
 import type { MachineStats } from "./machine-stats";
@@ -741,6 +741,10 @@ export type AgentAttentionEvent = {
   threadId: string;
   threadTitle: string;
   summary: string;
+  /** Final response recap for automatic completion alerts. */
+  tldr?: string;
+  /** Exceptional must-read note from the final response. */
+  important?: string;
   detail?: string;
   severity: "important" | "urgent";
   choices: AgentAttentionChoice[];
@@ -1220,6 +1224,19 @@ export type BacklogMutation =
       /** Park it, or bring it back. The card keeps its column either way. */
       onHold?: boolean;
       verificationNotes?: string;
+      epicId?: string | null;
+      addVerificationScenario?: {
+        title: string;
+        setup: string;
+        actions: string;
+        expectedOutcome: string;
+        actualOutcome: string;
+        outcome: VerificationOutcome;
+        verificationType: string;
+        evidenceAttachmentIds?: string[];
+        coverageLimits?: string;
+        createdBySection?: string;
+      };
       /** The renderer never attaches a file itself — only agents do, through the MCP tool. It can drop one, though. */
       removeAttachmentIds?: string[];
     }
@@ -1239,7 +1256,27 @@ export type BacklogMutation =
    */
   | { op: "link"; cwd: string; id: string; sectionId: string }
   | { op: "unlink"; cwd: string; id: string; sectionId: string }
-  | { op: "delete"; cwd: string; id: string };
+  | { op: "delete"; cwd: string; id: string }
+  | {
+      op: "epic-add";
+      cwd: string;
+      title: string;
+      summary?: string;
+      scope?: string;
+      acceptanceCriteria?: string;
+      acceptanceScenario?: string;
+    }
+  | {
+      op: "epic-update";
+      cwd: string;
+      id: string;
+      title?: string;
+      summary?: string;
+      scope?: string;
+      acceptanceCriteria?: string;
+      acceptanceScenario?: string;
+    }
+  | { op: "epic-delete"; cwd: string; id: string };
 
 export type BacklogMutationResult =
   | { ok: true; backlog: WorkspaceBacklog }

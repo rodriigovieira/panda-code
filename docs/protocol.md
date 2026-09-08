@@ -75,7 +75,7 @@ These mirror `apps/desktop/src/shared/ipc.ts`. Keep them aligned.
 | `sessionRuntime.runtimeCipher` | `SessionRuntimeEvent` (minus `id`) |
 | `deviceUsage.usageCipher` | `UsageBundle` |
 | `events.payloadCipher` | `ConversationItem` (see below) |
-| `commandPayloads.payloadCipher` (`type: "backlog"`) | `{ cwd, op: "list"\|"add"\|"update"\|"move"\|"delete", id?, title?, description?, metadata?, column?, index? }` |
+| `commandPayloads.payloadCipher` (`type: "backlog"`) | `{ cwd, op: "list"\|"add"\|"update"\|"move"\|"delete"\|"epic-add"\|"epic-update"\|"epic-delete", id?, title?, summary?, description?, metadata?, column?, onHold?, verificationNotes?, epicId?, scope?, acceptanceCriteria?, acceptanceScenario?, index?, removeAttachmentIds? }` |
 | `commandPayloads.payloadCipher` (`type: "schedule"`) | `{ cwd }` — view-only in V1, no `op` |
 | `commands.resultCipher` | `SessionStartResult` / `{ message }` / `{ backlog: WorkspaceBacklog }` / `{ schedule: WorkspaceSchedule }` |
 
@@ -90,6 +90,10 @@ else, and a phone reconciling a diff against a file it does not own would be
 inventing state. The workspace path travels *inside* the sealed payload, so the
 relay never learns which folder is being read, and the desktop refuses any path
 it does not already know as a workspace (the same gate as a remote start).
+Boards may additionally contain flat `epics`, a card's optional `epicId`, and
+append-only `verificationScenarios`. Scenario records link to attachment ids;
+they do not duplicate the media. Older version-1 boards omit these fields and
+remain valid.
 
 **`sessions.parentSessionId` is plaintext, deliberately.** A section can be a
 *sub-thread* of another one (the desktop's `PersistedThread.parentId`), and the
@@ -143,9 +147,11 @@ The relay is cheap **only** if the desktop respects these. See the README ration
    `sessions.appendEvents`. Never store a whole-conversation blob that gets
    rewritten each tick — that multiplies bandwidth by (doc size × frequency ×
    subscribers) on both read and write.
-2. **Coalesce to ~1/sec or per-transition.** Batch conversation items on the
-   desktop and flush on meaningful transitions (new message, tool start/end, run
-   done, needs-approval). Never per token — nobody reads tokens on a phone.
+2. **Coalesce at meaningful boundaries.** Batch conversation items on the
+   desktop and flush on transitions (new user/tool/marker, tool start/end, run
+   done, needs-approval). Keep the latest growing assistant/reasoning snapshot
+   local between those boundaries; rewriting the complete, ever-larger body once
+   per stream tick is quadratic bandwidth, not delta streaming. Never per token.
 3. **Keep the raw stdout firehose local.** `session:data` is for the desktop
    terminal view only. Only structured `ConversationItem` / runtime badges cross
    the relay.

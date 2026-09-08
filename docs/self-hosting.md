@@ -97,9 +97,11 @@ When upgrading a relay that previously allowed public registration, audit its
 remove any you do not recognize. The enrollment gate prevents new unapproved
 registrations but does not retroactively establish trust in old rows.
 
-Upgrade the relay, Mac and phone together for command protocol v2. Older phones
-cannot control an updated Mac. Revoking a phone rotates the key and disconnects
-all phones; scan fresh QR codes afterward. Local desktop data is preserved.
+Upgrade the relay, Mac and phone together for the current command protocol.
+Older phones cannot control an updated Mac. Revoking a phone immediately blocks
+that phone and removes its command identity; other paired phones remain active.
+Re-pair only the revoked phone if it should regain access. Local desktop data is
+preserved.
 
 ### 3. Build the mobile app
 

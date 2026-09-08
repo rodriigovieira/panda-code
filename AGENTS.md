@@ -146,7 +146,7 @@ scripts/publish-oss.sh --worktree
 
 Work on a backlog card is finished when it reaches **Review** with evidence on
 it, not when the code is written. Panda Code enforces the bar itself — an agent
-moving a card to Done with no `verificationNotes` and no attachments is rejected,
+moving a card to Done with no recorded verification result is rejected,
 and Done is the user's move once they have looked. What Panda Code cannot know is
 *how* to get that evidence here. That is this section.
 

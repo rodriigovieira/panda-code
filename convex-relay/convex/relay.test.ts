@@ -834,6 +834,37 @@ describe("relay protocol", () => {
     });
   });
 
+  test("session list joins archive state only for rows in its visible window", async () => {
+    const t = createRelayTest();
+    await registerDevice(t);
+    await pairMobile(t);
+    await upsertSession(t);
+
+    await t.mutation(api.sessions.setArchivedByDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: relayFixture.sessionId,
+      archived: true,
+    });
+    // Archive flags for dormant/unmirrored sections are legitimate, but must
+    // not be bulk-joined into the mobile's bounded session window.
+    await t.mutation(api.sessions.setArchivedByDevice, {
+      deviceId: relayFixture.deviceId,
+      token: relayFixture.deviceToken,
+      sessionId: "not-in-session-window",
+      archived: true,
+    });
+
+    await expect(
+      t.query(api.sessions.list, {
+        mobileId: relayFixture.mobileId,
+        token: relayFixture.mobileToken,
+      }),
+    ).resolves.toMatchObject([
+      { sessionId: relayFixture.sessionId, archived: true },
+    ]);
+  });
+
   test("the session list windows on recent activity and never drops a pin", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const t = createRelayTest();

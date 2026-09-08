@@ -2,19 +2,24 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync
 import { basename, extname, join } from "node:path";
 import {
   addBacklogItem,
+  addBacklogEpic,
   backlogFileName,
   deleteBacklogItem,
+  deleteBacklogEpic,
   emptyBacklog,
   moveBacklogItem,
   newBacklogId,
   parseBacklog,
   updateBacklogItem,
+  updateBacklogEpic,
   type BacklogAttachment,
   type BacklogAttachmentKind,
   type BacklogColumn,
   type BacklogCreate,
   type BacklogPatch,
   type BacklogResult,
+  type EpicCreate,
+  type EpicPatch,
   type WorkspaceBacklog,
 } from "./backlog";
 
@@ -109,6 +114,18 @@ export function storeUpdate(store: BacklogStore, cwd: string, idOrTitle: string,
 
 export function storeMove(store: BacklogStore, cwd: string, id: string, column: BacklogColumn, index: number): BacklogResult {
   return store.apply(cwd, (backlog) => moveBacklogItem(backlog, id, column, index));
+}
+
+export function storeAddEpic(store: BacklogStore, cwd: string, input: EpicCreate): BacklogResult {
+  return store.apply(cwd, (backlog) => addBacklogEpic(backlog, input));
+}
+
+export function storeUpdateEpic(store: BacklogStore, cwd: string, idOrTitle: string, patch: EpicPatch): BacklogResult {
+  return store.apply(cwd, (backlog) => updateBacklogEpic(backlog, idOrTitle, patch));
+}
+
+export function storeDeleteEpic(store: BacklogStore, cwd: string, idOrTitle: string): BacklogResult {
+  return store.apply(cwd, (backlog) => deleteBacklogEpic(backlog, idOrTitle));
 }
 
 /** Deletes the card, then best-effort deletes whatever attachment files it carried. */

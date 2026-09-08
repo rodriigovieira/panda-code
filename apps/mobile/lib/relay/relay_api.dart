@@ -499,6 +499,11 @@ class RelayApi {
     bool? onHold,
     int? index,
     String? verificationNotes,
+    String? epicId,
+    bool clearEpic = false,
+    String? scope,
+    String? acceptanceCriteria,
+    String? acceptanceScenario,
     // The phone can drop an attachment but not add one — no image bytes ride
     // this channel yet, only the id `BacklogAttachment` carries.
     List<String>? removeAttachmentIds,
@@ -522,6 +527,13 @@ class RelayApi {
         if (onHold != null) 'onHold': onHold,
         if (index != null) 'index': index,
         if (verificationNotes != null) 'verificationNotes': verificationNotes,
+        if (epicId != null) 'epicId': epicId,
+        if (clearEpic) 'epicId': null,
+        if (scope != null) 'scope': scope,
+        if (acceptanceCriteria != null)
+          'acceptanceCriteria': acceptanceCriteria,
+        if (acceptanceScenario != null)
+          'acceptanceScenario': acceptanceScenario,
         if (removeAttachmentIds != null)
           'removeAttachmentIds': removeAttachmentIds,
       }),

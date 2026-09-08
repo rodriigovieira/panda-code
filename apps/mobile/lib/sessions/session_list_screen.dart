@@ -144,12 +144,10 @@ class _SessionBody extends ConsumerStatefulWidget {
   ConsumerState<_SessionBody> createState() => _SessionBodyState();
 }
 
-bool _isNeedsApproval(SessionRow r) =>
-    r.agentState == AgentState.needsAction;
+bool _isNeedsApproval(SessionRow r) => r.agentState == AgentState.needsAction;
 
 bool _isEnded(SessionRow r) =>
-    r.status == SessionStatus.exited ||
-    r.agentState == AgentState.exited;
+    r.status == SessionStatus.exited || r.agentState == AgentState.exited;
 
 bool _isActive(SessionRow r) => !_isEnded(r);
 
@@ -305,7 +303,8 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
     // visible parent and appearing to hang off whatever unrelated session
     // happens to render right before them in the workspace list.
     final hiddenIds = <String>{
-      for (final r in [...needsRows, ...pinnedRows]) ...subtreeIds(base, r.sessionId),
+      for (final r in [...needsRows, ...pinnedRows])
+        ...subtreeIds(base, r.sessionId),
     };
     final grouped = _groupByWorkspace(
         base.where((r) => !hiddenIds.contains(r.sessionId)), workspaceOrder);
@@ -318,7 +317,8 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
     // that happens the group still only appears the ordinary way.
     final scratchPath = ref.watch(scratchWorkspaceProvider).valueOrNull;
     if (scratchPath != null) {
-      grouped.putIfAbsent(workspaceDisplayName(scratchPath), () => <SessionRow>[]);
+      grouped.putIfAbsent(
+          workspaceDisplayName(scratchPath), () => <SessionRow>[]);
     }
 
     // Commit newly discovered workspaces (to the front) and drop vanished ones
@@ -368,6 +368,7 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
             isSubthread: depth > 0,
             subthreadCount: node?.childCount ?? 0,
             runningSubthreads: node?.runningChildCount ?? 0,
+            blockedSubthreads: node?.blockedChildCount ?? 0,
             subthreadsCollapsed: node?.collapsed ?? false,
             onToggleSubthreads: (node?.hasChildren ?? false)
                 ? () => setState(() {
@@ -451,7 +452,8 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
                   count: needsRows.length,
                   color: context.tokens.danger.text),
               const SizedBox(height: 8),
-              ...featuredSubtreeTiles(needsRows, highlightWhen: _isNeedsApproval),
+              ...featuredSubtreeTiles(needsRows,
+                  highlightWhen: _isNeedsApproval),
               const SizedBox(height: 6),
             ],
             if (pinnedRows.isNotEmpty) ...[
@@ -595,7 +597,8 @@ class _SessionBodyState extends ConsumerState<_SessionBody> {
         ? total - visible
         : _visibleSessionsStep;
     return [
-      ...layoutSubthreads(rows, collapsed: _collapsedSubthreads, maxRoots: visible)
+      ...layoutSubthreads(rows,
+              collapsed: _collapsedSubthreads, maxRoots: visible)
           .map((node) => tile(node.row, node: node)),
       if (total > _initialVisibleSessions)
         Padding(
@@ -1499,8 +1502,8 @@ class _WorkspaceHeader extends StatelessWidget {
                   // the handle is a ~44x36 target instead of an 18px icon.
                   child: Container(
                     color: Colors.transparent,
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 9),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
                     child: Icon(Icons.more_vert,
                         size: 18, color: context.tokens.subtle),
                   ),
@@ -1527,6 +1530,7 @@ class _SessionTile extends StatelessWidget {
     this.isSubthread = false,
     this.subthreadCount = 0,
     this.runningSubthreads = 0,
+    this.blockedSubthreads = 0,
     this.subthreadsCollapsed = false,
     this.onToggleSubthreads,
     this.justFinished = false,
@@ -1549,6 +1553,7 @@ class _SessionTile extends StatelessWidget {
   /// a COLLAPSED parent only — expanded, the rows themselves say it better.
   final int subthreadCount;
   final int runningSubthreads;
+  final int blockedSubthreads;
   final bool subthreadsCollapsed;
 
   /// Null when this session has no sub-threads, which is what hides the chevron.
@@ -1628,6 +1633,7 @@ class _SessionTile extends StatelessWidget {
                 _SubthreadCount(
                   count: subthreadCount,
                   running: runningSubthreads,
+                  blocked: blockedSubthreads,
                 ),
               ],
               if (pinned) ...[
@@ -1680,16 +1686,22 @@ class _SessionTile extends StatelessWidget {
 
 /// "3 sub-threads under here, 1 of them running" on a folded parent.
 class _SubthreadCount extends StatelessWidget {
-  const _SubthreadCount({required this.count, required this.running});
+  const _SubthreadCount(
+      {required this.count, required this.running, required this.blocked});
 
   final int count;
   final int running;
+  final int blocked;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final busy = running > 0;
-    final color = busy ? theme.colorScheme.primary : context.tokens.muted;
+    final color = blocked > 0
+        ? context.tokens.warn.text
+        : busy
+            ? theme.colorScheme.primary
+            : context.tokens.muted;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
       decoration: BoxDecoration(
@@ -1702,7 +1714,11 @@ class _SubthreadCount extends StatelessWidget {
           Icon(Icons.account_tree_outlined, size: 11, color: color),
           const SizedBox(width: 3),
           Text(
-            busy ? '$count · $running running' : '$count',
+            blocked > 0
+                ? '$count · $blocked blocked'
+                : busy
+                    ? '$count · $running running'
+                    : '$count',
             style: theme.textTheme.labelSmall?.copyWith(color: color),
           ),
         ],

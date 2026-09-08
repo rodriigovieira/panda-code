@@ -69,8 +69,9 @@ enum BacklogAttachmentKind {
   image,
   video;
 
-  static BacklogAttachmentKind fromWire(Object? value) =>
-      value == 'video' ? BacklogAttachmentKind.video : BacklogAttachmentKind.image;
+  static BacklogAttachmentKind fromWire(Object? value) => value == 'video'
+      ? BacklogAttachmentKind.video
+      : BacklogAttachmentKind.image;
 }
 
 /// A screenshot or recording pinned to a card — usually an agent's proof that
@@ -125,6 +126,87 @@ class BacklogAttachment {
 }
 
 @immutable
+class VerificationScenario {
+  final String id;
+  final String title;
+  final String setup;
+  final String actions;
+  final String expectedOutcome;
+  final String actualOutcome;
+  final String outcome;
+  final String verificationType;
+  final List<String> evidenceAttachmentIds;
+  final String coverageLimits;
+
+  const VerificationScenario(
+      {required this.id,
+      required this.title,
+      this.setup = '',
+      this.actions = '',
+      this.expectedOutcome = '',
+      this.actualOutcome = '',
+      this.outcome = 'not_run',
+      this.verificationType = 'other',
+      this.evidenceAttachmentIds = const [],
+      this.coverageLimits = ''});
+
+  static VerificationScenario? fromDecrypted(Map<String, dynamic> m) {
+    final id = m['id'] as String?;
+    final title = m['title'] as String?;
+    if (id == null || id.isEmpty || title == null || title.isEmpty) return null;
+    return VerificationScenario(
+      id: id,
+      title: title,
+      setup: (m['setup'] as String?) ?? '',
+      actions: (m['actions'] as String?) ?? '',
+      expectedOutcome: (m['expectedOutcome'] as String?) ?? '',
+      actualOutcome: (m['actualOutcome'] as String?) ?? '',
+      outcome: (m['outcome'] as String?) ?? 'not_run',
+      verificationType: (m['verificationType'] as String?) ?? 'other',
+      evidenceAttachmentIds: (m['evidenceAttachmentIds'] is List)
+          ? (m['evidenceAttachmentIds'] as List).whereType<String>().toList()
+          : const [],
+      coverageLimits: (m['coverageLimits'] as String?) ?? '',
+    );
+  }
+}
+
+@immutable
+class BacklogEpic {
+  final String id;
+  final int number;
+  final String title;
+  final String summary;
+  final String scope;
+  final String acceptanceCriteria;
+  final String acceptanceScenario;
+
+  const BacklogEpic(
+      {required this.id,
+      this.number = 0,
+      required this.title,
+      this.summary = '',
+      this.scope = '',
+      this.acceptanceCriteria = '',
+      this.acceptanceScenario = ''});
+  String get ref => number > 0 ? 'E$number' : '';
+
+  static BacklogEpic? fromDecrypted(Map<String, dynamic> m) {
+    final id = m['id'] as String?;
+    final title = m['title'] as String?;
+    if (id == null || id.isEmpty || title == null || title.isEmpty) return null;
+    return BacklogEpic(
+        id: id,
+        number: m['number'] is num ? (m['number'] as num).toInt() : 0,
+        title: title,
+        summary: (m['summary'] as String?) ?? '',
+        scope: (m['scope'] as String?) ?? '',
+        acceptanceCriteria: (m['acceptanceCriteria'] as String?) ?? '',
+        acceptanceScenario: (m['acceptanceScenario'] as String?) ?? '');
+  }
+}
+
+@immutable
 class BacklogItem {
   final String id;
 
@@ -169,6 +251,8 @@ class BacklogItem {
   /// Screenshots and recordings pinned to the card. Metadata only — see
   /// [BacklogAttachment] for why the bytes are not here.
   final List<BacklogAttachment> attachments;
+  final String? epicId;
+  final List<VerificationScenario> verificationScenarios;
 
   const BacklogItem({
     required this.id,
@@ -185,6 +269,8 @@ class BacklogItem {
     this.onHold = false,
     this.verificationNotes = '',
     this.attachments = const [],
+    this.epicId,
+    this.verificationScenarios = const [],
   });
 
   /// `#12`, or an empty string on a board that predates numbering.
@@ -218,8 +304,19 @@ class BacklogItem {
       attachments: switch (m['attachments']) {
         final List raw => raw
             .whereType<Map>()
-            .map((a) => BacklogAttachment.fromDecrypted(Map<String, dynamic>.from(a)))
+            .map((a) =>
+                BacklogAttachment.fromDecrypted(Map<String, dynamic>.from(a)))
             .whereType<BacklogAttachment>()
+            .toList(),
+        _ => const [],
+      },
+      epicId: m['epicId'] as String?,
+      verificationScenarios: switch (m['verificationScenarios']) {
+        final List raw => raw
+            .whereType<Map>()
+            .map((s) => VerificationScenario.fromDecrypted(
+                Map<String, dynamic>.from(s)))
+            .whereType<VerificationScenario>()
             .toList(),
         _ => const [],
       },
@@ -231,8 +328,10 @@ class BacklogItem {
 class WorkspaceBacklog {
   final String cwd;
   final List<BacklogItem> items;
+  final List<BacklogEpic> epics;
 
-  const WorkspaceBacklog({this.cwd = '', this.items = const []});
+  const WorkspaceBacklog(
+      {this.cwd = '', this.items = const [], this.epics = const []});
 
   bool get isEmpty => items.isEmpty;
 
@@ -242,8 +341,12 @@ class WorkspaceBacklog {
   /// Parked cards are left out unless asked for: the point of putting one on
   /// hold is that it stops being in the way, and the phone is the screen with
   /// the least room to waste on work nobody is doing.
-  List<BacklogItem> inColumn(BacklogColumn column, {bool includeOnHold = false}) =>
-      items.where((item) => item.column == column && (includeOnHold || !item.onHold)).toList();
+  List<BacklogItem> inColumn(BacklogColumn column,
+          {bool includeOnHold = false}) =>
+      items
+          .where((item) =>
+              item.column == column && (includeOnHold || !item.onHold))
+          .toList();
 
   /// Every parked card, in board order, whatever column it was parked from.
   List<BacklogItem> get onHold => items.where((item) => item.onHold).toList();
@@ -251,9 +354,11 @@ class WorkspaceBacklog {
   /// The columns worth drawing, in board order — everything except a Pending
   /// with nothing in it. Derived from the same counts the tabs show, so a tab
   /// can never appear with a "(0)" on it.
-  List<BacklogColumn> visibleColumns({bool includeOnHold = false}) => BacklogColumn.values
-      .where((column) => isColumnVisible(column, inColumn(column, includeOnHold: includeOnHold).length))
-      .toList();
+  List<BacklogColumn> visibleColumns({bool includeOnHold = false}) =>
+      BacklogColumn.values
+          .where((column) => isColumnVisible(
+              column, inColumn(column, includeOnHold: includeOnHold).length))
+          .toList();
 
   static WorkspaceBacklog fromDecrypted(Map<String, dynamic> m) {
     // Everything here is defensive rather than trusting: the payload has been
@@ -264,8 +369,15 @@ class WorkspaceBacklog {
       cwd: m['cwd'] is String ? m['cwd'] as String : '',
       items: (items is List ? items : const [])
           .whereType<Map>()
-          .map((raw) => BacklogItem.fromDecrypted(Map<String, dynamic>.from(raw)))
+          .map((raw) =>
+              BacklogItem.fromDecrypted(Map<String, dynamic>.from(raw)))
           .where((item) => item.id.isNotEmpty && item.title.isNotEmpty)
+          .toList(),
+      epics: (m['epics'] is List ? m['epics'] as List : const [])
+          .whereType<Map>()
+          .map((raw) =>
+              BacklogEpic.fromDecrypted(Map<String, dynamic>.from(raw)))
+          .whereType<BacklogEpic>()
           .toList(),
     );
   }

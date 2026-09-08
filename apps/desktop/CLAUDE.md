@@ -6,7 +6,7 @@
 > "Evidence: How To Prove It In This Repo". The packaging steps below are the
 > first half of it for desktop work.
 
-## After finishing any change: package; install only while the app is stopped
+## After finishing any change: package; stage safely, install only while stopped
 
 Once a change is complete and verified, ALWAYS repackage the app. Do not replace
 `/Applications/Panda Code.app` while it is running. Electron can spawn renderer,
@@ -16,7 +16,7 @@ main process makes those helpers come from a different build and can crash them.
 ```sh
 cd apps/desktop
 pnpm package:mac
-# After the user has quit Panda Code completely:
+# Safe while Panda Code is open: stages now and installs after every process exits.
 pnpm sync:mac
 ```
 
@@ -35,7 +35,11 @@ Notes:
   build seed resolves only from explicit `PANDA_CODE_RELAY_URL`. If it prints
   `no relay URL seed`, the app still works and can be pointed at a relay from
   Settings — never hardcode the URL in tracked files.
-- `sync:mac` refuses to run while any installed-app process remains. Never bypass
-  that check with a direct `rsync` or `ditto`.
-- Leave an open Panda Code window running and report that the packaged update is
-  waiting for a user-controlled quit/install/relaunch.
+- `sync:mac` never writes into the live bundle. While Panda Code is open it
+  copies the build to a separate verified staging bundle and registers a
+  per-user installer that waits for every installed-app process to exit before
+  swapping it into place. When Panda Code is already closed, it performs the
+  same verified swap immediately. Never bypass this with a direct `rsync` or
+  `ditto` into `/Applications/Panda Code.app`.
+- Leave an open Panda Code window running and report that the staged update will
+  install after the user's quit, before their next relaunch.

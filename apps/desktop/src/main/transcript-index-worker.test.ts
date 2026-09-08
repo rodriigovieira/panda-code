@@ -115,6 +115,7 @@ describe("persistent transcript index", () => {
         line({ type: "response_item", payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "internal" }] } }),
         line({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "visible question" }] } }),
         line({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "visible answer" }] } }),
+        line({ timestamp: "2026-09-08T08:22:19.094Z", type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1", duration_ms: 954765 } }),
       ].join("\n")}\n`,
     );
     await handleTranscriptIndexRequest({
@@ -132,6 +133,7 @@ describe("persistent transcript index", () => {
     const messages = page.lines.filter((entry) => JSON.parse(entry.text).payload?.type === "message");
     expect(messages.map((entry) => JSON.parse(entry.text).payload.role)).toEqual(["user", "assistant"]);
     expect(messages.at(-1)?.model).toBe("gpt-5.6-sol");
+    expect(page.lines.map((entry) => JSON.parse(entry.text).payload?.type)).toContain("task_complete");
     expect(page.metadata.title).toBe("visible question");
   });
 

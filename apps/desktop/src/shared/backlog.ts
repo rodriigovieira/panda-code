@@ -145,6 +145,42 @@ export type BacklogItem = {
    * the screenshots that back it up.
    */
   verificationNotes?: string;
+  /** Optional outcome this card contributes to. Conversation hierarchy remains independent. */
+  epicId?: string;
+  /** Append-only verification attempts, newest last. Attachments are referenced, never copied. */
+  verificationScenarios?: VerificationScenario[];
+};
+
+export const VERIFICATION_OUTCOMES = ["passed", "failed", "blocked", "not_run"] as const;
+export type VerificationOutcome = (typeof VERIFICATION_OUTCOMES)[number];
+
+export type VerificationScenario = {
+  id: string;
+  title: string;
+  setup: string;
+  actions: string;
+  expectedOutcome: string;
+  actualOutcome: string;
+  outcome: VerificationOutcome;
+  /** live_e2e, mocked, renderer_only, installed_app, unit, api, or another honest label. */
+  verificationType: string;
+  evidenceAttachmentIds?: string[];
+  coverageLimits?: string;
+  createdAt: string;
+  createdBySection?: string;
+};
+
+export type BacklogEpic = {
+  id: string;
+  number: number;
+  title: string;
+  summary: string;
+  scope: string;
+  acceptanceCriteria: string;
+  /** Overall cross-card acceptance scenario, intentionally separate from card evidence attempts. */
+  acceptanceScenario: string;
+  createdAt: string;
+  updatedAt: string;
 };
 
 /** What kind of file an attachment is — the only two the board can show inline. */
@@ -189,6 +225,9 @@ export type WorkspaceBacklog = {
    * written last week should never resolve to a card filed today.
    */
   nextNumber: number;
+  /** Optional for byte-compatible reads of boards written before Epics existed. */
+  epics?: BacklogEpic[];
+  nextEpicNumber?: number;
   updatedAt: string;
 };
 
@@ -212,13 +251,21 @@ export const DESCRIPTION_CAP = 4_000;
 export const METADATA_CAP = 1_000;
 /** A card worked on by more sections than this is a project, not a card. */
 export const MAX_LINKED_SECTIONS = 20;
-/** A card carrying more proof than this is a project, not a card — same reasoning as {@link MAX_LINKED_SECTIONS}. */
-export const MAX_ATTACHMENTS = 20;
+/** Bounded history, but high enough that an active card does not strand its 21st recording. The UI pages it. */
+export const MAX_ATTACHMENTS = 100;
+export const MAX_VERIFICATION_SCENARIOS = 50;
+export const MAX_EPICS = 100;
 export const CAPTION_CAP = 300;
 export const VERIFICATION_NOTES_CAP = 4_000;
+export const EPIC_SCOPE_CAP = 8_000;
+export const EPIC_ACCEPTANCE_CAP = 8_000;
 
 export function emptyBacklog(cwd: string, now = new Date().toISOString()): WorkspaceBacklog {
   return { version: 1, cwd, items: [], nextNumber: 1, updatedAt: now };
+}
+
+export function epicRef(epic: Pick<BacklogEpic, "number">): string {
+  return `E${epic.number}`;
 }
 
 /** How a card is named in prose, in a link, and on its own face. */
@@ -329,6 +376,58 @@ function capAttachments(value: unknown, now: string): BacklogAttachment[] | unde
   return attachments.length > 0 ? attachments : undefined;
 }
 
+function isVerificationOutcome(value: unknown): value is VerificationOutcome {
+  return typeof value === "string" && (VERIFICATION_OUTCOMES as readonly string[]).includes(value);
+}
+
+function sanitizeScenario(raw: unknown, now: string): VerificationScenario | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  const title = cap(record.title, TITLE_CAP);
+  if (!title || !isVerificationOutcome(record.outcome)) return null;
+  const ids = Array.isArray(record.evidenceAttachmentIds)
+    ? record.evidenceAttachmentIds.filter((id): id is string => typeof id === "string" && Boolean(id.trim())).slice(0, MAX_ATTACHMENTS)
+    : [];
+  return {
+    id: typeof record.id === "string" && record.id ? record.id : newBacklogId(),
+    title,
+    setup: cap(record.setup, DESCRIPTION_CAP),
+    actions: cap(record.actions, DESCRIPTION_CAP),
+    expectedOutcome: cap(record.expectedOutcome, DESCRIPTION_CAP),
+    actualOutcome: cap(record.actualOutcome, DESCRIPTION_CAP),
+    outcome: record.outcome,
+    verificationType: cap(record.verificationType, 100) || "other",
+    evidenceAttachmentIds: ids.length ? [...new Set(ids)] : undefined,
+    coverageLimits: cap(record.coverageLimits, DESCRIPTION_CAP) || undefined,
+    createdAt: typeof record.createdAt === "string" ? record.createdAt : now,
+    createdBySection: typeof record.createdBySection === "string" && record.createdBySection ? record.createdBySection : undefined,
+  };
+}
+
+function capScenarios(value: unknown, now: string): VerificationScenario[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const scenarios = value.map((raw) => sanitizeScenario(raw, now)).filter((item): item is VerificationScenario => Boolean(item));
+  return scenarios.length ? scenarios.slice(-MAX_VERIFICATION_SCENARIOS) : undefined;
+}
+
+function sanitizeEpic(raw: unknown, now: string): BacklogEpic | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  const title = cap(record.title, TITLE_CAP);
+  if (!title) return null;
+  return {
+    id: typeof record.id === "string" && record.id ? record.id : newBacklogId(),
+    number: typeof record.number === "number" && Number.isInteger(record.number) && record.number > 0 ? record.number : 0,
+    title,
+    summary: capSummary(record.summary),
+    scope: cap(record.scope, EPIC_SCOPE_CAP),
+    acceptanceCriteria: cap(record.acceptanceCriteria, EPIC_ACCEPTANCE_CAP),
+    acceptanceScenario: cap(record.acceptanceScenario, EPIC_ACCEPTANCE_CAP),
+    createdAt: typeof record.createdAt === "string" ? record.createdAt : now,
+    updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : now,
+  };
+}
+
 function isColumn(value: unknown): value is BacklogColumn {
   return typeof value === "string" && (BACKLOG_COLUMNS as readonly string[]).includes(value);
 }
@@ -412,6 +511,8 @@ function sanitizeItem(raw: unknown, now: string): BacklogItem | null {
     onHold: record.onHold === true ? true : undefined,
     attachments: capAttachments(record.attachments, now),
     verificationNotes: cap(record.verificationNotes, VERIFICATION_NOTES_CAP) || undefined,
+    epicId: typeof record.epicId === "string" && record.epicId ? record.epicId : undefined,
+    verificationScenarios: capScenarios(record.verificationScenarios, now),
   };
 }
 
@@ -454,14 +555,44 @@ export function parseBacklog(text: string, cwd: string, now = new Date().toISOSt
     items,
     typeof record.nextNumber === "number" && Number.isInteger(record.nextNumber) && record.nextNumber > 0 ? record.nextNumber : 1,
   );
+  const epics = (Array.isArray(record.epics) ? record.epics : [])
+    .map((raw) => sanitizeEpic(raw, now))
+    .filter((epic): epic is BacklogEpic => Boolean(epic))
+    .slice(0, MAX_EPICS);
+  const seenEpics = new Set<string>();
+  const uniqueEpics = epics.filter((epic) => {
+    if (seenEpics.has(epic.id)) return false;
+    seenEpics.add(epic.id);
+    return true;
+  });
+  const nextEpicNumber = numberEpics(
+    uniqueEpics,
+    typeof record.nextEpicNumber === "number" && Number.isInteger(record.nextEpicNumber) && record.nextEpicNumber > 0
+      ? record.nextEpicNumber
+      : 1,
+  );
+  const epicIds = new Set(uniqueEpics.map((epic) => epic.id));
+  for (const item of items) {
+    if (item.epicId && !epicIds.has(item.epicId)) item.epicId = undefined;
+  }
 
   return {
     version: 1,
     cwd: typeof record.cwd === "string" && record.cwd ? record.cwd : cwd,
     items,
     nextNumber,
+    epics: uniqueEpics.length ? uniqueEpics : undefined,
+    nextEpicNumber: uniqueEpics.length || record.nextEpicNumber !== undefined ? nextEpicNumber : undefined,
     updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : now,
   };
+}
+
+function numberEpics(epics: BacklogEpic[], startAt: number): number {
+  let next = Math.max(startAt, ...epics.map((epic) => epic.number + 1));
+  for (const epic of [...epics].sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+    if (epic.number === 0) epic.number = next++;
+  }
+  return next;
 }
 
 /**
@@ -507,6 +638,8 @@ export type BacklogCreate = {
   /** Attachments to file alongside the card, already resolved by the store layer. */
   attachments?: BacklogAttachment[];
   verificationNotes?: string;
+  epicId?: string;
+  verificationScenario?: Omit<VerificationScenario, "id" | "createdAt">;
   /** Hold this caller to the evidence bar on `done` — see {@link BacklogPatch.requireEvidence}. */
   requireEvidence?: boolean;
 };
@@ -526,6 +659,10 @@ export type BacklogPatch = {
    */
   linkSection?: string;
   verificationNotes?: string;
+  /** Set to an Epic id; null explicitly removes membership. */
+  epicId?: string | null;
+  /** Appends one immutable attempt, preserving history. */
+  addVerificationScenario?: Omit<VerificationScenario, "id" | "createdAt">;
   /**
    * Attachments to append, already resolved by the store layer (bytes copied,
    * size checked) — this module never touches a file. Additive like
@@ -573,6 +710,9 @@ export function addBacklogItem(
   if (!requested) {
     return { ok: false, message: unknownColumnMessage(input.column) };
   }
+  if (input.epicId && !backlog.epics?.some((epic) => epic.id === input.epicId)) {
+    return { ok: false, message: "That Epic no longer exists." };
+  }
   // Filing straight into Done is the same claim as moving a card there, so it
   // meets the same bar. The number in the message is the one this card is about
   // to get, since it does not have one yet.
@@ -600,6 +740,10 @@ export function addBacklogItem(
     sections: capSections(input.sections),
     attachments: input.attachments && input.attachments.length > 0 ? input.attachments.slice(0, MAX_ATTACHMENTS) : undefined,
     verificationNotes: cap(input.verificationNotes, VERIFICATION_NOTES_CAP) || undefined,
+    epicId: input.epicId && backlog.epics?.some((epic) => epic.id === input.epicId) ? input.epicId : undefined,
+    verificationScenarios: input.verificationScenario
+      ? capScenarios([{ ...input.verificationScenario, id: newBacklogId(), createdAt: now }], now)
+      : undefined,
   };
 
   // New cards land at the top of their column: the thing just filed is the thing
@@ -617,13 +761,17 @@ function unknownColumnMessage(value: unknown): string {
  * Whether a card carries anything that would let a reader check the claim on it,
  * rather than take it on faith.
  *
- * Either half counts. A screenshot with no note is still a thing you can look
- * at; a note saying which command was run and what it printed is still evidence
- * for the large half of the work that has no pixels to capture. Requiring both
- * would only teach agents to write "see attached" next to every screenshot.
+ * An attachment is an artifact, not a verdict. It only becomes evidence when a
+ * verification note explains it or a scenario records an actual result.
  */
-export function hasEvidence(item: Pick<BacklogItem, "attachments" | "verificationNotes">): boolean {
-  return Boolean(item.verificationNotes?.trim()) || (item.attachments?.length ?? 0) > 0;
+export function hasEvidence(item: {
+  verificationNotes?: string;
+  verificationScenarios?: readonly VerificationScenario[];
+  verificationScenario?: Omit<VerificationScenario, "id" | "createdAt">;
+  /** Accepted for legacy callers, deliberately not counted as a verdict. */
+  attachments?: readonly BacklogAttachment[];
+}): boolean {
+  return Boolean(item.verificationNotes?.trim()) || Boolean(item.verificationScenarios?.length) || Boolean(item.verificationScenario);
 }
 
 /**
@@ -674,6 +822,9 @@ export function updateBacklogItem(
   if (!title) {
     return { ok: false, message: "A backlog item needs a non-empty title." };
   }
+  if (typeof patch.epicId === "string" && !backlog.epics?.some((epic) => epic.id === patch.epicId)) {
+    return { ok: false, message: "That Epic no longer exists." };
+  }
 
   const withoutRemoved =
     patch.removeAttachmentIds && patch.removeAttachmentIds.length > 0
@@ -695,6 +846,23 @@ export function updateBacklogItem(
     description: patch.description === undefined ? found.description : cap(patch.description, DESCRIPTION_CAP),
     metadata: patch.metadata === undefined ? found.metadata : cap(patch.metadata, METADATA_CAP),
     verificationNotes: patch.verificationNotes === undefined ? found.verificationNotes : cap(patch.verificationNotes, VERIFICATION_NOTES_CAP) || undefined,
+    epicId:
+      patch.epicId === undefined
+        ? found.epicId
+        : patch.epicId === null
+          ? undefined
+          : backlog.epics?.some((epic) => epic.id === patch.epicId)
+            ? patch.epicId
+            : found.epicId,
+    verificationScenarios: patch.addVerificationScenario
+      ? capScenarios(
+          [
+            ...(found.verificationScenarios ?? []),
+            { ...patch.addVerificationScenario, id: newBacklogId(), createdAt: now },
+          ],
+          now,
+        )
+      : found.verificationScenarios,
     column,
     updatedAt: now,
     sections: patch.linkSection ? withSection(found.sections, patch.linkSection) : found.sections,
@@ -892,6 +1060,135 @@ export function onHoldItems(backlog: WorkspaceBacklog): BacklogItem[] {
   return backlog.items.filter((item) => item.onHold);
 }
 
+export type EpicCreate = {
+  title: string;
+  summary?: string;
+  scope?: string;
+  acceptanceCriteria?: string;
+  acceptanceScenario?: string;
+};
+
+export type EpicPatch = Partial<EpicCreate>;
+
+export function findBacklogEpic(backlog: WorkspaceBacklog, idOrTitle: string): BacklogEpic | undefined {
+  const needle = idOrTitle.trim().toLowerCase();
+  if (!needle) return undefined;
+  const numberMatch = needle.match(/^e?#?(\d+)$/);
+  if (numberMatch) {
+    const number = Number(numberMatch[1]);
+    const matched = backlog.epics?.find((epic) => epic.number === number);
+    if (matched) return matched;
+  }
+  const exact = backlog.epics?.find((epic) => epic.id.toLowerCase() === needle);
+  if (exact) return exact;
+  const candidates = (backlog.epics ?? []).filter(
+    (epic) => epic.id.toLowerCase().startsWith(needle) || epic.title.toLowerCase().includes(needle),
+  );
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+export function addBacklogEpic(
+  backlog: WorkspaceBacklog,
+  input: EpicCreate,
+  now = new Date().toISOString(),
+  id = newBacklogId(),
+): BacklogResult {
+  const title = cap(input.title, TITLE_CAP);
+  if (!title) return { ok: false, message: "An Epic needs a non-empty title." };
+  if ((backlog.epics?.length ?? 0) >= MAX_EPICS) return { ok: false, message: `This board already holds ${MAX_EPICS} Epics.` };
+  const number = Math.max(backlog.nextEpicNumber ?? 1, ...(backlog.epics ?? []).map((epic) => epic.number + 1), 1);
+  const epic: BacklogEpic = {
+    id,
+    number,
+    title,
+    summary: capSummary(input.summary),
+    scope: cap(input.scope, EPIC_SCOPE_CAP),
+    acceptanceCriteria: cap(input.acceptanceCriteria, EPIC_ACCEPTANCE_CAP),
+    acceptanceScenario: cap(input.acceptanceScenario, EPIC_ACCEPTANCE_CAP),
+    createdAt: now,
+    updatedAt: now,
+  };
+  return {
+    ok: true,
+    backlog: { ...backlog, epics: [epic, ...(backlog.epics ?? [])], nextEpicNumber: number + 1, updatedAt: now },
+    message: `Added ${epicRef(epic)} "${epic.title}".`,
+  };
+}
+
+export function updateBacklogEpic(backlog: WorkspaceBacklog, idOrTitle: string, patch: EpicPatch, now = new Date().toISOString()): BacklogResult {
+  const found = findBacklogEpic(backlog, idOrTitle);
+  if (!found) return { ok: false, message: `No Epic matches ${JSON.stringify(idOrTitle)}.` };
+  const title = patch.title === undefined ? found.title : cap(patch.title, TITLE_CAP);
+  if (!title) return { ok: false, message: "An Epic needs a non-empty title." };
+  const epic: BacklogEpic = {
+    ...found,
+    title,
+    summary: patch.summary === undefined ? found.summary : capSummary(patch.summary),
+    scope: patch.scope === undefined ? found.scope : cap(patch.scope, EPIC_SCOPE_CAP),
+    acceptanceCriteria:
+      patch.acceptanceCriteria === undefined ? found.acceptanceCriteria : cap(patch.acceptanceCriteria, EPIC_ACCEPTANCE_CAP),
+    acceptanceScenario:
+      patch.acceptanceScenario === undefined ? found.acceptanceScenario : cap(patch.acceptanceScenario, EPIC_ACCEPTANCE_CAP),
+    updatedAt: now,
+  };
+  return {
+    ok: true,
+    backlog: { ...backlog, epics: backlog.epics?.map((candidate) => (candidate.id === found.id ? epic : candidate)), updatedAt: now },
+    message: `Updated ${epicRef(epic)} "${epic.title}".`,
+  };
+}
+
+export function deleteBacklogEpic(backlog: WorkspaceBacklog, idOrTitle: string, now = new Date().toISOString()): BacklogResult {
+  const found = findBacklogEpic(backlog, idOrTitle);
+  if (!found) return { ok: false, message: `No Epic matches ${JSON.stringify(idOrTitle)}.` };
+  return {
+    ok: true,
+    backlog: {
+      ...backlog,
+      epics: backlog.epics?.filter((epic) => epic.id !== found.id),
+      items: backlog.items.map((item) => (item.epicId === found.id ? { ...item, epicId: undefined } : item)),
+      updatedAt: now,
+    },
+    message: `Deleted ${epicRef(found)} "${found.title}" and removed its card memberships.`,
+  };
+}
+
+export function itemsForEpic(backlog: WorkspaceBacklog, epicId: string): BacklogItem[] {
+  return backlog.items.filter((item) => item.epicId === epicId);
+}
+
+export function epicProgress(backlog: WorkspaceBacklog, epicId: string): Record<BacklogColumn, number> & { total: number; blocked: number; verificationOutstanding: number } {
+  const items = itemsForEpic(backlog, epicId);
+  const counts = Object.fromEntries(BACKLOG_COLUMNS.map((column) => [column, items.filter((item) => item.column === column).length])) as Record<BacklogColumn, number>;
+  return {
+    ...counts,
+    total: items.length,
+    blocked: items.filter((item) => item.verificationScenarios?.at(-1)?.outcome === "blocked").length,
+    verificationOutstanding: items.filter((item) => item.column === "review" && !hasEvidence(item)).length,
+  };
+}
+
+export function renderEpics(backlog: WorkspaceBacklog): string {
+  const lines = [`# Epics — ${backlog.cwd}`];
+  if (!backlog.epics?.length) return `${lines[0]}\n\nNo Epics yet.`;
+  for (const epic of backlog.epics) {
+    const progress = epicProgress(backlog, epic.id);
+    lines.push(
+      "",
+      `- [${epicRef(epic)}](panda://epic/${epicRef(epic)}) **${epic.title}** — ${progress.done}/${progress.total} done, ${progress.review} in Review${progress.blocked ? `, ${progress.blocked} blocked` : ""}`,
+    );
+    if (epic.summary) lines.push(`  - ${epic.summary}`);
+    if (epic.scope) lines.push(`  - scope/outcome: ${epic.scope.replace(/\n+/g, " ")}`);
+    if (epic.acceptanceCriteria) lines.push(`  - acceptance: ${epic.acceptanceCriteria.replace(/\n+/g, " ")}`);
+    if (epic.acceptanceScenario) lines.push(`  - overall scenario: ${epic.acceptanceScenario.replace(/\n+/g, " ")}`);
+    for (const column of BACKLOG_COLUMNS) {
+      const cards = itemsForEpic(backlog, epic.id).filter((item) => item.column === column);
+      if (cards.length) lines.push(`  - ${COLUMN_LABELS[column]}: ${cards.map((item) => `[${cardRef(item)}](panda://backlog/${item.number})`).join(", ")}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 /**
  * The board as an agent reads it.
  *
@@ -902,6 +1199,10 @@ export function onHoldItems(backlog: WorkspaceBacklog): BacklogItem[] {
 export function renderBacklog(backlog: WorkspaceBacklog, only?: BacklogColumn): string {
   const columns = only ? [only] : BACKLOG_COLUMNS;
   const lines: string[] = [`# Backlog — ${backlog.cwd}`];
+
+  if (!only && backlog.epics?.length) {
+    lines.push("", `Epics: ${backlog.epics.map((epic) => `${epicRef(epic)} ${epic.title}`).join(" · ")}`);
+  }
 
   for (const column of columns) {
     const items = activeItemsInColumn(backlog, column);
@@ -920,7 +1221,7 @@ export function renderBacklog(backlog: WorkspaceBacklog, only?: BacklogColumn): 
       lines.push("_Filed by automation and not yet triaged — read before proposing these as work._");
     }
     for (const item of items) {
-      lines.push(...renderBacklogItem(item));
+      lines.push(...renderBacklogItem(item, backlog.epics?.find((epic) => epic.id === item.epicId)));
     }
   }
 
@@ -931,7 +1232,7 @@ export function renderBacklog(backlog: WorkspaceBacklog, only?: BacklogColumn): 
   if (held.length > 0) {
     lines.push("", `## ${ON_HOLD_LABEL} (${held.length})`, "_Parked by the user — kept, but not to be worked on now._");
     for (const item of held) {
-      lines.push(...renderBacklogItem(item));
+      lines.push(...renderBacklogItem(item, backlog.epics?.find((epic) => epic.id === item.epicId)));
     }
   }
 
@@ -945,7 +1246,7 @@ export function renderBacklog(backlog: WorkspaceBacklog, only?: BacklogColumn): 
   return lines.join("\n");
 }
 
-function renderBacklogItem(item: BacklogItem): string[] {
+function renderBacklogItem(item: BacklogItem, epic?: BacklogEpic): string[] {
   // The column is named on a held card because its section heading no longer
   // says it, and coming off hold puts it back there.
   const lines = [`- \`${cardRef(item)}\` **${item.title}**${item.onHold ? ` _(on hold, from ${COLUMN_LABELS[item.column]})_` : ""}`];
@@ -962,6 +1263,12 @@ function renderBacklogItem(item: BacklogItem): string[] {
   }
   if (item.verificationNotes) {
     lines.push(`  - verification: ${item.verificationNotes.replace(/\n+/g, " ")}`);
+  }
+  if (epic) lines.push(`  - epic: ${epicRef(epic)} ${epic.title}`);
+  if (item.verificationScenarios?.length) {
+    const latest = item.verificationScenarios.at(-1) as VerificationScenario;
+    lines.push(`  - latest scenario: ${latest.outcome} · ${latest.verificationType} · ${latest.title}`);
+    if (latest.coverageLimits) lines.push(`  - verification gaps: ${latest.coverageLimits.replace(/\n+/g, " ")}`);
   }
   if (item.attachments?.length) {
     lines.push(`  - attachments: ${item.attachments.length} (${describeAttachments(item.attachments)})`);
@@ -1007,6 +1314,10 @@ export function renderBacklogItemDetail(item: BacklogItem): string {
     item.description ? `\n${item.description}` : "",
     item.metadata ? `\nmetadata: ${item.metadata}` : "",
     item.verificationNotes ? `\nverification: ${item.verificationNotes}` : "",
+    item.epicId ? `\nepic: ${item.epicId}` : "",
+    item.verificationScenarios?.length
+      ? `\nverification scenarios:\n${item.verificationScenarios.map((scenario, index) => `- ${index === item.verificationScenarios!.length - 1 ? "LATEST · " : ""}${scenario.outcome} · ${scenario.verificationType} · ${scenario.title}${scenario.coverageLimits ? ` · limits: ${scenario.coverageLimits}` : ""}`).join("\n")}`
+      : "",
     item.attachments?.length
       ? `\nattachments:\n${item.attachments.map((attachment) => `- \`${attachment.id}\` ${attachment.kind} "${attachment.name}" — read ${attachment.path} to see it${attachment.caption ? `: ${attachment.caption}` : ""}`).join("\n")}`
       : "",

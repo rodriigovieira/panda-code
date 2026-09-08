@@ -521,7 +521,10 @@ export class CodexAppServerSessionManager {
     const client = this.deps.createClient({
       onNotification: (note) => this.handleNotification(note),
       onServerRequest: (request) => this.handleServerRequest(request),
-      onExit: (code) => this.handleClientExit(code),
+      // The process may report its exit after stop() has already installed a
+      // replacement client. Carry the originating client into the callback so
+      // a stale exit cannot tear down the new transport and its sessions.
+      onExit: (code) => this.handleClientExit(client, code),
     });
     this.client = client;
     const features = this.deps.experimentalFeatures;
@@ -542,8 +545,12 @@ export class CodexAppServerSessionManager {
       })
       .catch((error) => {
         this.deps.logMain("app-server:client-start-failed", { message: error instanceof Error ? error.message : String(error) });
-        this.client = null;
-        this.clientReady = null;
+        // A failed/disposed client can settle after another start has already
+        // replaced it. Only clear the generation that actually failed.
+        if (this.client === client) {
+          this.client = null;
+          this.clientReady = null;
+        }
         throw error;
       });
     return this.clientReady;
@@ -919,8 +926,12 @@ export class CodexAppServerSessionManager {
     this.deps.sendSnapshot(id, session);
   }
 
-  private handleClientExit(code: number | null): void {
-    this.deps.logMain("app-server:client-exit", { code, sessions: this.sessions.size });
+  private handleClientExit(client: CodexAppServerClient, code: number | null): void {
+    const stale = this.client !== client;
+    this.deps.logMain("app-server:client-exit", { code, sessions: this.sessions.size, stale });
+    if (stale) {
+      return;
+    }
     for (const [id, session] of this.sessions) {
       // The thread is gone with the client; a future prompt must wait for a
       // fresh thread/resume rather than fire turn/start at a dead process.

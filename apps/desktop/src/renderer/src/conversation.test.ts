@@ -1,15 +1,75 @@
 import { describe, expect, it } from "vitest";
 import type { ConversationItem } from "../../shared/ipc";
 import {
+  assistantMessagePresentation,
   groupQuietWork,
   COLLAPSIBLE_PROMPT_LENGTH,
   hiddenTranscriptCount,
+  latestTurnImportant,
+  latestTurnTldr,
   mergeConversationItems,
   parsePeerPrompt,
   selectTranscriptsToDrop,
   shouldCollapsePrompt,
   shouldReloadTranscript,
 } from "./conversation";
+
+describe("assistant turn titles", () => {
+  it("extracts a leading title marker and removes it from the visible body", () => {
+    expect(assistantMessagePresentation("\n**Title:** Add concise output titles\n\nImplemented on both clients.")).toEqual({
+      title: "Add concise output titles",
+      body: "Implemented on both clients.",
+    });
+  });
+
+  it("caps generated titles at ten words and ignores title text inside the answer", () => {
+    expect(assistantMessagePresentation("**Title:** One two three four five six seven eight nine ten eleven twelve\nBody").title)
+      .toBe("One two three four five six seven eight nine ten…");
+    expect(assistantMessagePresentation("The field is called Title: and remains content.")).toEqual({
+      body: "The field is called Title: and remains content.",
+    });
+  });
+});
+
+describe("turn TL;DR", () => {
+  it("extracts the final assistant recap for a completion alert", () => {
+    expect(latestTurnTldr([
+      { id: "user-1", kind: "user", body: "Ship it" },
+      { id: "assistant-1", kind: "assistant", body: "Finished.\n\n---\n\n**TL;DR:** Shipped the desktop fix and verified its focused tests." },
+      { id: "summary-1", kind: "system", body: "Worked for 1m" },
+    ])).toBe("Shipped the desktop fix and verified its focused tests.");
+  });
+
+  it("does not reuse a recap from an earlier turn", () => {
+    expect(latestTurnTldr([
+      { id: "assistant-1", kind: "assistant", body: "**TL;DR:** Old result." },
+      { id: "user-2", kind: "user", body: "Try something else" },
+      { id: "assistant-2", kind: "assistant", body: "The new turn failed before its recap." },
+    ])).toBeUndefined();
+  });
+
+  it("extracts an optional must-read line only from the current turn", () => {
+    expect(latestTurnImportant([
+      { id: "user-1", kind: "user", body: "Deploy it" },
+      {
+        id: "assistant-1",
+        kind: "assistant",
+        body: "---\n**TL;DR:** Deployment stopped safely.\n\n**Important:** Production is blocked until you choose whether to roll back.",
+      },
+    ])).toBe("Production is blocked until you choose whether to roll back.");
+
+    expect(latestTurnImportant([
+      { id: "assistant-1", kind: "assistant", body: "**Important:** Old warning." },
+      { id: "user-2", kind: "user", body: "Continue" },
+      { id: "assistant-2", kind: "assistant", body: "Finished normally." },
+    ])).toBeUndefined();
+
+    expect(latestTurnImportant([
+      { id: "user-1", kind: "user", body: "Summarize it" },
+      { id: "assistant-1", kind: "assistant", body: "**Important:** Ordinary body emphasis.\n\n---\n**TL;DR:** Nothing urgent." },
+    ])).toBeUndefined();
+  });
+});
 
 describe("peer prompts", () => {
   it("extracts a peer sender and hides the delivery preamble from the bubble body", () => {

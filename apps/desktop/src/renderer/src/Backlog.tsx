@@ -1,4 +1,4 @@
-import { ArrowRight, Bot, Camera, Check, MessageSquare, Pause, Pencil, Play, Plus, Rocket, Trash2, User, X } from "lucide-react";
+import { ArrowRight, Bot, Camera, Check, Flag, MessageSquare, Pause, Pencil, Play, Plus, Rocket, Trash2, User, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import {
@@ -7,6 +7,8 @@ import {
   cardRef,
   COLUMN_LABELS,
   emptyBacklog,
+  epicProgress,
+  epicRef,
   findBacklogItem,
   isColumnVisible,
   itemsInColumn,
@@ -14,6 +16,7 @@ import {
   onHoldItems,
   type BacklogColumn,
   type BacklogItem,
+  type BacklogEpic,
   type WorkspaceBacklog,
 } from "../../shared/backlog";
 import type { DesktopApi } from "../../shared/ipc";
@@ -57,6 +60,7 @@ type Props = {
    * hand them the thing they just left.
    */
   focusItemId?: string | null;
+  focusEpicId?: string | null;
   /** Turns a card's linked section ids into rows it can name and open. */
   resolveSections: (ids: readonly string[]) => LinkedSection[];
   onOpenSection: (sectionId: string) => void;
@@ -81,6 +85,7 @@ export function BacklogBoard({
   onClose,
   onCreateSession,
   focusItemId,
+  focusEpicId,
   resolveSections,
   onOpenSection,
 }: Props): ReactElement {
@@ -104,6 +109,13 @@ export function BacklogBoard({
    * board a session opens on is the short one every time.
    */
   const [showOnHold, setShowOnHold] = useState(false);
+  const [epicView, setEpicView] = useState<string | "new" | null>(null);
+  useEffect(() => {
+    if (!focusEpicId || !backlog.epics?.length) return;
+    const normalized = focusEpicId.toLowerCase().replace(/^e/, "");
+    const epic = backlog.epics.find((candidate) => candidate.id === focusEpicId || String(candidate.number) === normalized);
+    if (epic) setEpicView(epic.id);
+  }, [backlog.epics, focusEpicId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -305,6 +317,11 @@ export function BacklogBoard({
             <span title={cwd}>{workspaceName}</span>
           </div>
           <div className="backlog-head-actions">
+            <button className="quiet-action" type="button" onClick={() => setEpicView(backlog.epics?.[0]?.id ?? "new")}>
+              <Flag size={13} aria-hidden="true" />
+              Epics
+              {backlog.epics?.length ? <span className="backlog-head-badge">{backlog.epics.length}</span> : null}
+            </button>
             {/* Only when there is something behind it: a switch that reveals
                 nothing is a question the user has to answer every time. */}
             {heldCount > 0 ? (
@@ -439,6 +456,16 @@ export function BacklogBoard({
                         {item.title}
                       </div>
                       {item.summary ? <p className="backlog-card-summary">{item.summary}</p> : null}
+                      {item.epicId ? (
+                        <button
+                          type="button"
+                          className="backlog-epic-chip"
+                          onClick={(event) => { event.stopPropagation(); setEpicView(item.epicId as string); }}
+                        >
+                          <Flag size={10} aria-hidden="true" />
+                          {backlog.epics?.find((epic) => epic.id === item.epicId)?.title ?? "Epic"}
+                        </button>
+                      ) : null}
                       <footer className="backlog-card-foot">
                         {/* Leads the footer: it is the reason this card is on
                             screen at all, and the reason it usually is not. */}
@@ -596,6 +623,8 @@ export function BacklogBoard({
               onStartSession={() => startSession([openItem])}
               onOpenSection={onOpenSection}
               onUnlinkSection={(sectionId) => void mutate({ op: "unlink", cwd, id: openItem.id, sectionId })}
+              epics={backlog.epics ?? []}
+              onOpenEpic={(epicId) => { setEditing(null); setEpicView(epicId); }}
             />
           </div>
         ) : null}
@@ -617,9 +646,77 @@ export function BacklogBoard({
             }}
           />
         ) : null}
+
+        {epicView ? (
+          <EpicPanel
+            backlog={backlog}
+            selected={epicView}
+            onSelect={setEpicView}
+            onClose={() => setEpicView(null)}
+            onMutate={mutate}
+            cwd={cwd}
+            onOpenCard={(id) => { setEpicView(null); setEditing({ mode: "edit", id }); }}
+          />
+        ) : null}
       </section>
     </div>
   );
+}
+
+function EpicPanel({ backlog, selected, onSelect, onClose, onMutate, cwd, onOpenCard }: {
+  backlog: WorkspaceBacklog;
+  selected: string | "new";
+  onSelect: (id: string | "new") => void;
+  onClose: () => void;
+  onMutate: (mutation: Parameters<DesktopApi["mutateBacklog"]>[0]) => Promise<boolean>;
+  cwd: string;
+  onOpenCard: (id: string) => void;
+}): ReactElement {
+  const epic = backlog.epics?.find((candidate) => candidate.id === selected);
+  const [draft, setDraft] = useState(() => epicDraft(epic));
+  useEffect(() => setDraft(epicDraft(epic)), [epic?.id]);
+  const cards = epic ? backlog.items.filter((item) => item.epicId === epic.id) : [];
+  const progress = epic ? epicProgress(backlog, epic.id) : null;
+  const save = async (): Promise<void> => {
+    if (!draft.title.trim()) return;
+    const ok = epic
+      ? await onMutate({ op: "epic-update", cwd, id: epic.id, ...draft })
+      : await onMutate({ op: "epic-add", cwd, ...draft });
+    if (ok && !epic) onClose();
+  };
+  return (
+    <div className="backlog-editor-backdrop epic-backdrop" role="presentation" onClick={onClose}>
+      <section className="epic-panel" role="dialog" aria-modal="true" aria-label="Epics" onClick={(event) => event.stopPropagation()}>
+        <aside className="epic-list">
+          <header><strong>Epics</strong><button className="ghost-icon-button" type="button" onClick={() => onSelect("new")}><Plus size={15} /></button></header>
+          {(backlog.epics ?? []).map((candidate) => {
+            const counts = epicProgress(backlog, candidate.id);
+            return <button key={candidate.id} type="button" className={candidate.id === epic?.id ? "active" : ""} onClick={() => onSelect(candidate.id)}>
+              <span>{epicRef(candidate)} · {candidate.title}</span><small>{counts.done}/{counts.total} done · {counts.review} review</small>
+            </button>;
+          })}
+        </aside>
+        <main className="epic-detail">
+          <header><div><span className="task-main-label">{epic ? epicRef(epic) : "New Epic"}</span><strong>{epic?.title ?? "Create an Epic"}</strong></div><button className="ghost-icon-button" type="button" onClick={onClose}><X size={16} /></button></header>
+          {progress ? <div className="epic-progress"><strong>{progress.done}/{progress.total}</strong> done <span>{progress.review} review</span><span>{progress.in_progress} active</span>{progress.blocked ? <span className="is-blocked">{progress.blocked} blocked</span> : null}{progress.verificationOutstanding ? <span className="is-gap">{progress.verificationOutstanding} missing verification</span> : null}</div> : null}
+          <label>Title<input className="backlog-input" value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} /></label>
+          <label>Summary<input className="backlog-input" value={draft.summary} onChange={(e) => setDraft({ ...draft, summary: e.target.value })} /></label>
+          <label>Scope / outcome<textarea className="backlog-input backlog-textarea" rows={4} value={draft.scope} onChange={(e) => setDraft({ ...draft, scope: e.target.value })} /></label>
+          <label>Acceptance criteria<textarea className="backlog-input backlog-textarea" rows={4} value={draft.acceptanceCriteria} onChange={(e) => setDraft({ ...draft, acceptanceCriteria: e.target.value })} /></label>
+          <label>Overall acceptance scenario<textarea className="backlog-input backlog-textarea" rows={4} value={draft.acceptanceScenario} onChange={(e) => setDraft({ ...draft, acceptanceScenario: e.target.value })} /></label>
+          <div className="epic-actions"><button className="primary-action" type="button" onClick={() => void save()} disabled={!draft.title.trim()}>Save</button>{epic ? <button className="quiet-action danger" type="button" onClick={() => void onMutate({ op: "epic-delete", cwd, id: epic.id }).then((ok) => ok && onSelect(backlog.epics?.find((candidate) => candidate.id !== epic.id)?.id ?? "new"))}>Delete Epic</button> : null}</div>
+          {epic ? <section className="epic-cards"><span className="task-main-label">Cards by status</span>{BACKLOG_COLUMNS.map((column) => {
+            const grouped = cards.filter((item) => item.column === column);
+            return grouped.length ? <div key={column}><strong>{COLUMN_LABELS[column]} · {grouped.length}</strong>{grouped.map((item) => <button type="button" key={item.id} onClick={() => onOpenCard(item.id)}><span>{cardRef(item)} · {item.title}</span><small>{item.verificationScenarios?.at(-1)?.outcome ?? (item.verificationNotes ? "notes recorded" : "verification outstanding")}</small></button>)}</div> : null;
+          })}</section> : null}
+        </main>
+      </section>
+    </div>
+  );
+}
+
+function epicDraft(epic?: BacklogEpic) {
+  return { title: epic?.title ?? "", summary: epic?.summary ?? "", scope: epic?.scope ?? "", acceptanceCriteria: epic?.acceptanceCriteria ?? "", acceptanceScenario: epic?.acceptanceScenario ?? "" };
 }
 
 /** Keeps a card menu opened near an edge inside the window. Seven items + rules. */

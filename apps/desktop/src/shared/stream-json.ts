@@ -231,6 +231,26 @@ export function formatTurnTokens(value: number): string {
   return String(value);
 }
 
+/** Rebuild a Codex elapsed-time footer from its durable rollout completion. */
+export function codexTranscriptTurnSummaryItem(input: {
+  threadId: string;
+  turnId?: string;
+  durationMs: number;
+  timestamp?: string;
+  sequence: number;
+}): ConversationItem | undefined {
+  const duration = formatTurnDuration(input.durationMs);
+  if (!duration) return undefined;
+  return {
+    id: turnSummaryItemId(input.turnId ?? `${input.threadId}:turn:${input.sequence}`),
+    kind: "system",
+    title: TURN_SUMMARY_TITLE,
+    body: `Worked for ${duration}`,
+    timestamp: input.timestamp,
+    sequence: input.sequence,
+  };
+}
+
 const BODY_CAP = 25_000;
 
 function compactBody(value: string, maxLength = BODY_CAP): string {
@@ -1406,7 +1426,7 @@ function maybeEmitTurnSummary(state: StreamJsonState, event: StreamJsonEvent, re
 // the exec/Claude event path (via maybeEmitTurnSummary) and the app-server
 // `turn/completed` handler. `reportedMs` is the runtime's own duration when it
 // supplied one, else 0 to fall back to wall-clock.
-function pushTurnSummary(state: StreamJsonState, receivedAt: string, reportedMs: number): void {
+function pushTurnSummary(state: StreamJsonState, receivedAt: string, reportedMs: number, anchorOverride?: string): void {
   // Tokens consumed during this turn: the delta of the cumulative counter since
   // the turn began (robust across Claude/Codex). Falling back to the whole total
   // is only right when we never captured a start (the process resumed mid-turn);
@@ -1451,7 +1471,7 @@ function pushTurnSummary(state: StreamJsonState, receivedAt: string, reportedMs:
   }
 
   const anchor =
-    state.activeAssistantMessageId ?? state.claudeSessionId ?? state.codexThreadId ?? `turn:${state.sequence}`;
+    anchorOverride ?? state.activeAssistantMessageId ?? state.claudeSessionId ?? state.codexThreadId ?? `turn:${state.sequence}`;
   pushItem(state, {
     id: turnSummaryItemId(anchor),
     kind: "system",
@@ -1774,7 +1794,16 @@ export function applyAppServerNotification(
       // duration worth a footer, and a failed turn already got an error item.
       const durationMs = Number(turn?.durationMs ?? 0);
       if (status !== "failed") {
-        pushTurnSummary(state, receivedAt, Number.isFinite(durationMs) ? durationMs : 0);
+        // Codex persists the turn id and duration in its rollout's
+        // `task_complete` record. Anchor the live footer to that same id so a
+        // later transcript reload replaces it instead of rendering a second
+        // copy after hibernation.
+        pushTurnSummary(
+          state,
+          receivedAt,
+          Number.isFinite(durationMs) ? durationMs : 0,
+          asString(turn?.id),
+        );
       }
       return state;
     }

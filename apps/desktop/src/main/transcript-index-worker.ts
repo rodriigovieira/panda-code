@@ -31,7 +31,7 @@ import { compactSectionTitle } from "../shared/section-title";
 export type WorkerConfig = { directory: string; home: string };
 type OffsetRecord = { o: number; l: number; s?: string; m?: string };
 type StoredMetadata = TranscriptIndexMetadata & {
-  version: 5;
+  version: 6;
   mtimeMs: number;
   offsets: OffsetRecord[];
   searchBytes: number;
@@ -78,12 +78,12 @@ function writeJsonAtomic(path: string, value: unknown): void {
 function readMetadata(registration: TranscriptRegistration & { path: string }): StoredMetadata {
   try {
     const parsed = JSON.parse(readFileSync(metadataPath(registration.key), "utf8")) as StoredMetadata;
-    if (parsed.version === 5 && parsed.key === registration.key && parsed.path === registration.path) return parsed;
+    if (parsed.version === 6 && parsed.key === registration.key && parsed.path === registration.path) return parsed;
   } catch {
     // First index, an interrupted write, or a source path that moved.
   }
   return {
-    version: 5,
+    version: 6,
     key: registration.key,
     path: registration.path,
     runtime: registration.runtime,
@@ -230,6 +230,11 @@ function indexLine(meta: StoredMetadata, lineBuffer: Buffer, offset: number, sea
             meta.titleSource = /<runtime-handoff\b/i.test(searchText ?? "") ? "handoff" : "prompt";
           }
         }
+      } else if (entry.type === "event_msg" && payload?.type === "task_complete") {
+        // The live elapsed-time footer is synthetic state. Keep Codex's durable
+        // completion record in the page index so a hibernated/evicted section
+        // can rebuild that footer when its rollout is loaded again.
+        relevant = true;
       } else if (
         entry.type === "response_item" &&
         ["function_call", "custom_tool_call", "web_search_call", "function_call_output", "custom_tool_call_output"].includes(payload?.type)
@@ -414,7 +419,8 @@ function rawRelevant(runtime: TranscriptRuntime, line: string): boolean {
     if (runtime === "claude") return entry.type === "user" || entry.type === "assistant";
     const payload = entry.payload;
     return (
-      (entry.type === "event_msg" && (payload?.type === "user_message" || payload?.type === "agent_message")) ||
+      (entry.type === "event_msg" &&
+        (payload?.type === "user_message" || payload?.type === "agent_message" || payload?.type === "task_complete")) ||
       (entry.type === "response_item" &&
         payload?.type === "message" &&
         (payload.role === "user" || payload.role === "assistant")) ||

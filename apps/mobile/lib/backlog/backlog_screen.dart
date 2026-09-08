@@ -23,7 +23,8 @@ import 'backlog_models.dart';
 /// state: it shows what the desktop last said the board is, and says plainly
 /// when the desktop is not answering.
 class BacklogScreen extends ConsumerStatefulWidget {
-  const BacklogScreen({super.key, required this.cwd, required this.workspaceName});
+  const BacklogScreen(
+      {super.key, required this.cwd, required this.workspaceName});
 
   final String cwd;
   final String workspaceName;
@@ -32,13 +33,15 @@ class BacklogScreen extends ConsumerStatefulWidget {
   ConsumerState<BacklogScreen> createState() => _BacklogScreenState();
 }
 
-class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTickerProviderStateMixin {
+class _BacklogScreenState extends ConsumerState<BacklogScreen>
+    with SingleTickerProviderStateMixin {
   /// The columns currently on screen. Not every column is always one of them:
   /// Pending is drawn only while it has something to triage, so the tab bar is
   /// rebuilt (controller and all) whenever that changes under us — an agent
   /// filing a review finding is enough to make the tab appear.
   List<BacklogColumn> _columns = const WorkspaceBacklog().visibleColumns();
-  late TabController _tabs = TabController(length: _columns.length, vsync: this);
+  late TabController _tabs =
+      TabController(length: _columns.length, vsync: this);
   WorkspaceBacklog? _board;
   String? _error;
   bool _busy = false;
@@ -83,7 +86,8 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
     super.dispose();
   }
 
-  BacklogColumn get _currentColumn => _columns[_tabs.index.clamp(0, _columns.length - 1)];
+  BacklogColumn get _currentColumn =>
+      _columns[_tabs.index.clamp(0, _columns.length - 1)];
 
   /// Bring the tab bar in line with the board.
   ///
@@ -92,13 +96,15 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
   /// otherwise a Pending tab arriving on the left would slide the reader from
   /// Backlog into it mid-glance. Call inside `setState`.
   void _syncColumns() {
-    final next = (_board ?? const WorkspaceBacklog()).visibleColumns(includeOnHold: _showOnHold);
+    final next = (_board ?? const WorkspaceBacklog())
+        .visibleColumns(includeOnHold: _showOnHold);
     if (listEquals(next, _columns)) return;
     final current = _columns.isEmpty ? null : _currentColumn;
     final index = current == null ? 0 : next.indexOf(current);
     _columns = next;
     _tabs.dispose();
-    _tabs = TabController(length: next.length, initialIndex: index < 0 ? 0 : index, vsync: this);
+    _tabs = TabController(
+        length: next.length, initialIndex: index < 0 ? 0 : index, vsync: this);
   }
 
   Future<void> _load() => _run(() => _call(op: 'list'), silent: true);
@@ -106,7 +112,8 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
   /// Run one board operation, keeping the screen's busy/error state honest.
   /// [silent] is for the initial load and pull-to-refresh, where a toast on top
   /// of the error card would just say the same thing twice.
-  Future<void> _run(Future<WorkspaceBacklog> Function() action, {bool silent = false}) async {
+  Future<void> _run(Future<WorkspaceBacklog> Function() action,
+      {bool silent = false}) async {
     setState(() {
       _busy = true;
       if (silent) _error = null;
@@ -140,6 +147,10 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
     String? metadata,
     String? column,
     bool? onHold,
+    String? epicId,
+    bool clearEpic = false,
+    String? verificationNotes,
+    List<String>? removeAttachmentIds,
   }) async {
     final api = await ref.read(relayApiProvider.future);
     if (api == null) throw Exception('Not paired with a desktop.');
@@ -153,13 +164,20 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
       metadata: metadata,
       column: column,
       onHold: onHold,
+      epicId: epicId,
+      clearEpic: clearEpic,
+      verificationNotes: verificationNotes,
+      removeAttachmentIds: removeAttachmentIds,
     );
   }
 
   Future<void> _compose({BacklogItem? item}) async {
     final result = await Navigator.of(context).push<BacklogEditorResult>(
       MaterialPageRoute(
-        builder: (_) => BacklogItemScreen(item: item, column: item?.column ?? _currentColumn),
+        builder: (_) => BacklogItemScreen(
+            item: item,
+            column: item?.column ?? _currentColumn,
+            epics: _board?.epics ?? const []),
       ),
     );
     if (result == null) return;
@@ -177,7 +195,8 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
         context,
         ref,
         workspacePath: widget.cwd,
-        prompt: _sessionPrompt([(title: draft.title, description: draft.description)]),
+        prompt: _sessionPrompt(
+            [(title: draft.title, description: draft.description)]),
       );
       return;
     }
@@ -192,6 +211,12 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
           column: draft.column.wire,
           // Only on an edit: `add` has no notion of filing a card already parked.
           onHold: item == null ? null : draft.onHold,
+          epicId: draft.epicId,
+          clearEpic: item != null && draft.epicId == null,
+          verificationNotes: item == null ? null : draft.verificationNotes,
+          removeAttachmentIds: item == null || draft.removeAttachmentIds.isEmpty
+              ? null
+              : draft.removeAttachmentIds,
         ));
   }
 
@@ -210,8 +235,12 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
         title: const Text('Delete this item?'),
         content: Text(item.title),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Delete')),
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Delete')),
         ],
       ),
     );
@@ -247,7 +276,9 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
                   },
                 ),
             ListTile(
-              leading: Icon(item.onHold ? Icons.play_arrow_outlined : Icons.pause_outlined),
+              leading: Icon(item.onHold
+                  ? Icons.play_arrow_outlined
+                  : Icons.pause_outlined),
               title: Text(item.onHold ? 'Take off hold' : 'Put on hold'),
               subtitle: Text(
                 item.onHold
@@ -275,6 +306,157 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
 
   Future<void> _startSession(BacklogItem item) => _startSessionFrom([item]);
 
+  Future<void> _editEpic([BacklogEpic? epic]) async {
+    final title = TextEditingController(text: epic?.title ?? '');
+    final summary = TextEditingController(text: epic?.summary ?? '');
+    final scope = TextEditingController(text: epic?.scope ?? '');
+    final acceptance =
+        TextEditingController(text: epic?.acceptanceCriteria ?? '');
+    final scenario =
+        TextEditingController(text: epic?.acceptanceScenario ?? '');
+    final save = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+              title: Text(epic == null ? 'New Epic' : 'Edit ${epic.ref}'),
+              content: SingleChildScrollView(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                TextField(
+                    controller: title,
+                    decoration: const InputDecoration(labelText: 'Title')),
+                TextField(
+                    controller: summary,
+                    decoration: const InputDecoration(labelText: 'Summary')),
+                TextField(
+                    controller: scope,
+                    maxLines: 3,
+                    decoration:
+                        const InputDecoration(labelText: 'Scope / outcome')),
+                TextField(
+                    controller: acceptance,
+                    maxLines: 3,
+                    decoration: const InputDecoration(
+                        labelText: 'Acceptance criteria')),
+                TextField(
+                    controller: scenario,
+                    maxLines: 3,
+                    decoration: const InputDecoration(
+                        labelText: 'Overall acceptance scenario')),
+              ])),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Cancel')),
+                FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('Save'))
+              ],
+            ));
+    if (save != true || title.text.trim().isEmpty) return;
+    final api = await ref.read(relayApiProvider.future);
+    if (api == null) return;
+    await _run(() => api.backlog(widget.cwd,
+        op: epic == null ? 'epic-add' : 'epic-update',
+        id: epic?.id,
+        title: title.text.trim(),
+        summary: summary.text.trim(),
+        scope: scope.text.trim(),
+        acceptanceCriteria: acceptance.text.trim(),
+        acceptanceScenario: scenario.text.trim()));
+  }
+
+  void _openEpics() {
+    final board = _board;
+    if (board == null) return;
+    showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        builder: (sheetContext) => SafeArea(
+                child: SizedBox(
+              height: MediaQuery.sizeOf(sheetContext).height * .78,
+              child: Column(children: [
+                ListTile(
+                    title: const Text('Epics'),
+                    subtitle: const Text(
+                        'Outcome-level groups; section hierarchy stays separate.'),
+                    trailing: IconButton(
+                        icon: const Icon(Icons.add),
+                        onPressed: () {
+                          Navigator.pop(sheetContext);
+                          _editEpic();
+                        })),
+                Expanded(
+                    child: board.epics.isEmpty
+                        ? const Center(child: Text('No Epics yet.'))
+                        : ListView(children: [
+                            for (final epic in board.epics)
+                              ExpansionTile(
+                                leading: const Icon(Icons.flag_outlined),
+                                title: Text('${epic.ref} · ${epic.title}'),
+                                subtitle: Text(epic.summary),
+                                trailing: IconButton(
+                                    icon: const Icon(Icons.edit_outlined),
+                                    onPressed: () {
+                                      Navigator.pop(sheetContext);
+                                      _editEpic(epic);
+                                    }),
+                                children: [
+                                  if (epic.scope.isNotEmpty)
+                                    ListTile(
+                                        title: const Text('Scope / outcome'),
+                                        subtitle: Text(epic.scope)),
+                                  if (epic.acceptanceCriteria.isNotEmpty)
+                                    ListTile(
+                                        title:
+                                            const Text('Acceptance criteria'),
+                                        subtitle:
+                                            Text(epic.acceptanceCriteria)),
+                                  if (epic.acceptanceScenario.isNotEmpty)
+                                    ListTile(
+                                        title: const Text(
+                                            'Overall acceptance scenario'),
+                                        subtitle:
+                                            Text(epic.acceptanceScenario)),
+                                  for (final column in BacklogColumn.values)
+                                    if (board.items.any((item) =>
+                                        item.epicId == epic.id &&
+                                        item.column == column)) ...[
+                                      Padding(
+                                          padding: const EdgeInsets.fromLTRB(
+                                              16, 12, 16, 4),
+                                          child: Align(
+                                              alignment: Alignment.centerLeft,
+                                              child: Text(column.label,
+                                                  style: const TextStyle(
+                                                      fontWeight:
+                                                          FontWeight.bold)))),
+                                      for (final item in board.items.where(
+                                          (item) =>
+                                              item.epicId == epic.id &&
+                                              item.column == column))
+                                        ListTile(
+                                            title: Text(
+                                                '${item.ref} · ${item.title}'),
+                                            subtitle: Text(item
+                                                    .verificationScenarios
+                                                    .isNotEmpty
+                                                ? item.verificationScenarios
+                                                    .last.outcome
+                                                : (item.verificationNotes
+                                                        .isNotEmpty
+                                                    ? 'notes recorded'
+                                                    : 'verification outstanding')),
+                                            onTap: () {
+                                              Navigator.pop(sheetContext);
+                                              _compose(item: item);
+                                            })
+                                    ]
+                                ],
+                              )
+                          ])),
+              ]),
+            )));
+  }
+
   Future<void> _startSessionFrom(List<BacklogItem> items) async {
     if (items.isEmpty) return;
     _clearSelection();
@@ -282,7 +464,8 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
       context,
       ref,
       workspacePath: widget.cwd,
-      prompt: _sessionPrompt(items.map((item) => (title: item.title, description: item.description))),
+      prompt: _sessionPrompt(items
+          .map((item) => (title: item.title, description: item.description))),
     );
   }
 
@@ -308,7 +491,8 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
                   const Text('Backlog'),
                   Text(
                     widget.workspaceName,
-                    style: TextStyle(fontSize: 12, color: context.tokens.subtle),
+                    style:
+                        TextStyle(fontSize: 12, color: context.tokens.subtle),
                   ),
                 ],
               ),
@@ -317,10 +501,15 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
                 IconButton(
                   onPressed: () => _startSessionFrom(_selectedItems),
                   icon: const Icon(Icons.rocket_launch_outlined),
-                  tooltip: 'Start a session from ${_selected.length} card${_selected.length == 1 ? '' : 's'}',
+                  tooltip:
+                      'Start a session from ${_selected.length} card${_selected.length == 1 ? '' : 's'}',
                 ),
               ]
             : [
+                IconButton(
+                    onPressed: board == null ? null : _openEpics,
+                    icon: const Icon(Icons.flag_outlined),
+                    tooltip: 'Epics'),
                 // Only when there is something behind it — a switch that reveals
                 // nothing is a question the user has to answer every time.
                 if ((board?.onHold.length ?? 0) > 0)
@@ -334,7 +523,9 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
                     isSelected: _showOnHold,
                     icon: const Icon(Icons.pause_circle_outline),
                     selectedIcon: const Icon(Icons.pause_circle_filled),
-                    tooltip: _showOnHold ? 'Hide cards on hold' : 'Show ${board!.onHold.length} on hold',
+                    tooltip: _showOnHold
+                        ? 'Hide cards on hold'
+                        : 'Show ${board!.onHold.length} on hold',
                   ),
                 IconButton(
                   onPressed: _busy ? null : _load,
@@ -371,7 +562,10 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
         children: [
           if (_busy) const LinearProgressIndicator(minHeight: 2),
           if (_error != null)
-            _ErrorBar(message: _error!, hasBoard: board != null, onRetry: _busy ? null : _load),
+            _ErrorBar(
+                message: _error!,
+                hasBoard: board != null,
+                onRetry: _busy ? null : _load),
           Expanded(
             child: TabBarView(
               controller: _tabs,
@@ -380,7 +574,9 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
                   RefreshIndicator(
                     onRefresh: _load,
                     child: _ColumnList(
-                      items: board?.inColumn(column, includeOnHold: _showOnHold) ?? const [],
+                      items:
+                          board?.inColumn(column, includeOnHold: _showOnHold) ??
+                              const [],
                       loading: board == null && _busy,
                       unavailable: board == null && _error != null,
                       column: column,
@@ -389,8 +585,9 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
                       // the way a long press starts one; a long press always
                       // toggles, so picking up a second card doesn't reopen the
                       // first.
-                      onOpen: (item) =>
-                          selecting ? _toggleSelected(item.id) : _compose(item: item),
+                      onOpen: (item) => selecting
+                          ? _toggleSelected(item.id)
+                          : _compose(item: item),
                       onLongPress: (item) => _toggleSelected(item.id),
                       onActions: _openActions,
                     ),
@@ -405,7 +602,8 @@ class _BacklogScreenState extends ConsumerState<BacklogScreen> with SingleTicker
 }
 
 class _ErrorBar extends StatelessWidget {
-  const _ErrorBar({required this.message, required this.hasBoard, required this.onRetry});
+  const _ErrorBar(
+      {required this.message, required this.hasBoard, required this.onRetry});
 
   final String message;
   final bool hasBoard;
@@ -425,7 +623,9 @@ class _ErrorBar extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  hasBoard ? 'Couldn’t update backlog. Showing the last loaded board.' : 'Couldn’t load backlog. Try again.',
+                  hasBoard
+                      ? 'Couldn’t update backlog. Showing the last loaded board.'
+                      : 'Couldn’t load backlog. Try again.',
                   style: TextStyle(color: tokens.danger.text, fontSize: 12),
                 ),
                 TextButton(
@@ -433,8 +633,13 @@ class _ErrorBar extends StatelessWidget {
                     context: context,
                     builder: (context) => AlertDialog(
                       title: const Text('Backlog error details'),
-                      content: SingleChildScrollView(child: SelectableText(message)),
-                      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))],
+                      content:
+                          SingleChildScrollView(child: SelectableText(message)),
+                      actions: [
+                        TextButton(
+                            onPressed: () => Navigator.pop(context),
+                            child: const Text('Close'))
+                      ],
                     ),
                   ),
                   child: const Text('Details'),
@@ -533,7 +738,9 @@ class _Card extends StatelessWidget {
     return Opacity(
       opacity: item.onHold ? 0.72 : 1,
       child: Material(
-        color: isSelected ? tokens.agent.wash : (item.onHold ? tokens.panelSoft : tokens.panel),
+        color: isSelected
+            ? tokens.agent.wash
+            : (item.onHold ? tokens.panelSoft : tokens.panel),
         borderRadius: tokens.radius.mdR,
         child: InkWell(
           onTap: onOpen,
@@ -543,7 +750,9 @@ class _Card extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(12, 10, 4, 10),
             decoration: BoxDecoration(
               borderRadius: tokens.radius.mdR,
-              border: Border.all(color: isSelected ? tokens.agent.text : tokens.lineSoft, width: isSelected ? 1.5 : 1),
+              border: Border.all(
+                  color: isSelected ? tokens.agent.text : tokens.lineSoft,
+                  width: isSelected ? 1.5 : 1),
             ),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -561,13 +770,17 @@ class _Card extends StatelessWidget {
                             if (item.ref.isNotEmpty)
                               TextSpan(
                                 text: '${item.ref} ',
-                                style: TextStyle(color: tokens.subtle, fontWeight: FontWeight.w600),
+                                style: TextStyle(
+                                    color: tokens.subtle,
+                                    fontWeight: FontWeight.w600),
                               ),
                             TextSpan(text: item.title),
                           ],
                         ),
                         style: TextStyle(
-                            color: tokens.text, fontSize: 14, fontWeight: FontWeight.w600),
+                            color: tokens.text,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600),
                       ),
                       // The TL;DR when there is one, and the description only as
                       // a fallback for cards filed before the field existed. The
@@ -580,7 +793,10 @@ class _Card extends StatelessWidget {
                           _preview(item),
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
-                          style: TextStyle(color: tokens.muted, fontSize: 12.5, height: 1.35),
+                          style: TextStyle(
+                              color: tokens.muted,
+                              fontSize: 12.5,
+                              height: 1.35),
                         ),
                       ],
                       const SizedBox(height: 8),
@@ -600,7 +816,8 @@ class _Card extends StatelessWidget {
                                 item.metadata,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
-                                style: TextStyle(color: tokens.subtle, fontSize: 11),
+                                style: TextStyle(
+                                    color: tokens.subtle, fontSize: 11),
                               ),
                             ),
                           ],
@@ -620,7 +837,8 @@ class _Card extends StatelessWidget {
                   color: isSelected ? tokens.agent.text : null,
                   tooltip: isSelected ? 'Deselect' : 'Move or delete',
                   visualDensity: VisualDensity.compact,
-                  constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                  constraints:
+                      const BoxConstraints(minWidth: 36, minHeight: 36),
                 ),
               ],
             ),

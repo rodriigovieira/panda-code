@@ -12,6 +12,85 @@ export function shouldCollapsePrompt(value: string): boolean {
   return value.length > COLLAPSIBLE_PROMPT_LENGTH;
 }
 
+const TLDR_LINE = /^\s*(?:\*\*)?TL;DR:(?:\*\*)?\s*(.+?)\s*$/i;
+const IMPORTANT_LINE = /^\s*(?:\*\*)?Important:(?:\*\*)?\s*(.+?)\s*$/i;
+const TURN_TITLE_LINE = /^\s*(?:\*\*)?Title:(?:\*\*)?\s*(.+?)\s*$/i;
+const ATTENTION_TLDR_CAP = 240;
+const ATTENTION_IMPORTANT_CAP = 400;
+const TURN_TITLE_WORD_CAP = 10;
+const TURN_TITLE_CHARACTER_CAP = 80;
+
+function cappedLine(value: string, cap: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > cap
+    ? `${normalized.slice(0, cap - 1).trimEnd()}…`
+    : normalized;
+}
+
+export type AssistantMessagePresentation = {
+  body: string;
+  title?: string;
+};
+
+/**
+ * Pulls the agent-authored turn title out of a final reply. The marker is only
+ * recognized as the first non-empty line, so an ordinary mention of "Title:"
+ * later in an answer keeps rendering as message content.
+ */
+export function assistantMessagePresentation(value: string): AssistantMessagePresentation {
+  const lines = value.split("\n");
+  const lineIndex = lines.findIndex((line) => line.trim().length > 0);
+  if (lineIndex < 0) return { body: value };
+
+  const match = lines[lineIndex]!.match(TURN_TITLE_LINE);
+  if (!match?.[1]) return { body: value };
+
+  const words = match[1].replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  const wordCapped = words.length > TURN_TITLE_WORD_CAP
+    ? `${words.slice(0, TURN_TITLE_WORD_CAP).join(" ")}…`
+    : words.join(" ");
+  const title = cappedLine(wordCapped, TURN_TITLE_CHARACTER_CAP);
+  const bodyLines = [...lines.slice(0, lineIndex), ...lines.slice(lineIndex + 1)];
+  while (bodyLines[0]?.trim() === "") bodyLines.shift();
+
+  return { title, body: bodyLines.join("\n") };
+}
+
+/** Returns the final assistant recap from the current turn, when it supplied one. */
+export function latestTurnTldr(items: ConversationItem[]): string | undefined {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index]!;
+    if (item.kind === "user") return undefined;
+    if (item.kind !== "assistant" || item.id.startsWith("local-thinking:")) continue;
+
+    const lines = item.body.split("\n");
+    for (let lineIndex = lines.length - 1; lineIndex >= 0; lineIndex -= 1) {
+      const match = lines[lineIndex]!.match(TLDR_LINE);
+      if (!match?.[1]) continue;
+      return cappedLine(match[1], ATTENTION_TLDR_CAP);
+    }
+  }
+  return undefined;
+}
+
+/** Returns the exceptional must-read note attached to the current turn. */
+export function latestTurnImportant(items: ConversationItem[]): string | undefined {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index]!;
+    if (item.kind === "user") return undefined;
+    if (item.kind !== "assistant" || item.id.startsWith("local-thinking:")) continue;
+
+    const lines = item.body.split("\n");
+    const tldrIndex = lines.findIndex((line) => TLDR_LINE.test(line));
+    if (tldrIndex < 0) continue;
+    for (let lineIndex = tldrIndex + 1; lineIndex < lines.length; lineIndex += 1) {
+      const match = lines[lineIndex]!.match(IMPORTANT_LINE);
+      if (match?.[1]) return cappedLine(match[1], ATTENTION_IMPORTANT_CAP);
+    }
+  }
+  return undefined;
+}
+
 export type PeerPrompt = {
   body: string;
   relation: "parent" | "subthread" | "peer" | "delegated";

@@ -20,6 +20,7 @@ class BacklogDraft {
     this.onHold = false,
     this.verificationNotes = '',
     this.removeAttachmentIds = const [],
+    this.epicId,
   });
 
   final String title;
@@ -40,6 +41,7 @@ class BacklogDraft {
   /// Attachments the phone can drop but not add — no image bytes ride this
   /// screen yet, only the ids of ones the user removed while editing.
   final List<String> removeAttachmentIds;
+  final String? epicId;
 }
 
 /// What [BacklogItemScreen] hands back when it pops. Null means the user
@@ -100,6 +102,8 @@ Future<void> persistBacklogEditorResult(
     column: draft.column.wire,
     onHold: item == null ? null : draft.onHold,
     verificationNotes: item == null ? null : draft.verificationNotes,
+    epicId: draft.epicId,
+    clearEpic: item != null && draft.epicId == null,
     removeAttachmentIds: item == null || draft.removeAttachmentIds.isEmpty
         ? null
         : draft.removeAttachmentIds,
@@ -113,13 +117,17 @@ Future<void> persistBacklogEditorResult(
 /// instead of in a separate actions sheet.
 class BacklogItemScreen extends StatefulWidget {
   const BacklogItemScreen(
-      {super.key, required this.item, required this.column});
+      {super.key,
+      required this.item,
+      required this.column,
+      this.epics = const []});
 
   /// Null when composing a new card.
   final BacklogItem? item;
 
   /// The column a new card starts in, or the card's current column when editing.
   final BacklogColumn column;
+  final List<BacklogEpic> epics;
 
   @override
   State<BacklogItemScreen> createState() => _BacklogItemScreenState();
@@ -138,16 +146,22 @@ class _BacklogItemScreenState extends State<BacklogItemScreen> {
       TextEditingController(text: widget.item?.verificationNotes ?? '');
   late BacklogColumn _column = widget.column;
   late bool _onHold = widget.item?.onHold ?? false;
+  late String? _epicId = widget.item?.epicId;
   final FocusNode _descriptionFocus = FocusNode();
 
   /// Attachments dropped while editing — applied on save, same as every other
   /// field here. Adding one is agent-only, through the desktop's MCP tool.
   final Set<String> _removedAttachmentIds = {};
+  bool _showAllAttachments = false;
 
-  List<BacklogAttachment> get _visibleAttachments =>
+  List<BacklogAttachment> get _allVisibleAttachments =>
       (widget.item?.attachments ?? [])
           .where((a) => !_removedAttachmentIds.contains(a.id))
           .toList();
+  List<BacklogAttachment> get _visibleAttachments =>
+      _showAllAttachments || _allVisibleAttachments.length <= 12
+          ? _allVisibleAttachments
+          : _allVisibleAttachments.sublist(_allVisibleAttachments.length - 12);
 
   /// Whether the description shows as rendered Markdown or as its source.
   ///
@@ -188,6 +202,7 @@ class _BacklogItemScreenState extends State<BacklogItemScreen> {
         onHold: _onHold,
         verificationNotes: _verificationNotes.text.trim(),
         removeAttachmentIds: _removedAttachmentIds.toList(),
+        epicId: _epicId,
       )),
     );
   }
@@ -206,6 +221,7 @@ class _BacklogItemScreenState extends State<BacklogItemScreen> {
         description: _description.text.trim(),
         metadata: _metadata.text.trim(),
         column: _column,
+        epicId: _epicId,
       )),
     );
   }
@@ -247,6 +263,52 @@ class _BacklogItemScreenState extends State<BacklogItemScreen> {
     final evidence = <Widget>[
       Text('VERIFICATION', style: _label(tokens)),
       const SizedBox(height: 6),
+      if ((widget.item?.verificationScenarios ?? []).isEmpty)
+        Text(
+            'No scenario result recorded. Attachments alone do not establish a pass.',
+            style: TextStyle(color: tokens.subtle, fontSize: 12))
+      else
+        for (final scenario
+            in (widget.item?.verificationScenarios ?? []).reversed)
+          ExpansionTile(
+            tilePadding: EdgeInsets.zero,
+            initiallyExpanded:
+                scenario.id == widget.item?.verificationScenarios.last.id,
+            title: Text(
+                '${scenario.outcome.replaceAll('_', ' ')} · ${scenario.title}'),
+            subtitle: Text(scenario.verificationType),
+            children: [
+              ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Environment'),
+                  subtitle: Text(scenario.setup.isEmpty
+                      ? 'Not recorded'
+                      : scenario.setup)),
+              ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Actions'),
+                  subtitle: Text(scenario.actions.isEmpty
+                      ? 'Not recorded'
+                      : scenario.actions)),
+              ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Expected'),
+                  subtitle: Text(scenario.expectedOutcome.isEmpty
+                      ? 'Not recorded'
+                      : scenario.expectedOutcome)),
+              ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Actual'),
+                  subtitle: Text(scenario.actualOutcome.isEmpty
+                      ? 'Not recorded'
+                      : scenario.actualOutcome)),
+              if (scenario.coverageLimits.isNotEmpty)
+                ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Coverage limits'),
+                    subtitle: Text(scenario.coverageLimits)),
+            ],
+          ),
       TextField(
         controller: _verificationNotes,
         minLines: 2,
@@ -261,6 +323,14 @@ class _BacklogItemScreenState extends State<BacklogItemScreen> {
           attachments: _visibleAttachments,
           onRemove: (id) => setState(() => _removedAttachmentIds.add(id)),
         ),
+        if (_allVisibleAttachments.length > 12)
+          TextButton(
+            onPressed: () =>
+                setState(() => _showAllAttachments = !_showAllAttachments),
+            child: Text(_showAllAttachments
+                ? 'Show latest 12'
+                : 'Show ${_allVisibleAttachments.length - 12} earlier attachments'),
+          ),
       ],
     ];
     final leadsWithEvidence = _column == BacklogColumn.review;
@@ -313,6 +383,24 @@ class _BacklogItemScreenState extends State<BacklogItemScreen> {
               style: TextStyle(color: tokens.text, fontSize: 14),
               decoration: const InputDecoration(
                   hintText: 'One line: what this is, in short'),
+            ),
+            const SizedBox(height: 20),
+            Text('EPIC', style: _label(tokens)),
+            const SizedBox(height: 6),
+            DropdownButtonFormField<String>(
+              initialValue: _epicId ?? '',
+              items: [
+                const DropdownMenuItem(value: '', child: Text('No Epic')),
+                if (_epicId != null &&
+                    !widget.epics.any((epic) => epic.id == _epicId))
+                  DropdownMenuItem(
+                      value: _epicId, child: const Text('Current Epic')),
+                ...widget.epics.map((epic) => DropdownMenuItem(
+                    value: epic.id,
+                    child: Text('${epic.ref} · ${epic.title}'))),
+              ],
+              onChanged: (value) => setState(
+                  () => _epicId = (value ?? '').isEmpty ? null : value),
             ),
             const SizedBox(height: 20),
             if (leadsWithEvidence) ...[

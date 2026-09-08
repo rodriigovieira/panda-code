@@ -27,9 +27,12 @@ void main() {
   testWidgets('idle row overrides stale working badge in the open conversation',
       (tester) async {
     final row = _row(agent: AgentState.waiting).withRuntime(
-      const SessionRuntimeSnapshot(headSeq: 12, badge: RuntimeBadge(
-        agentState: AgentState.working, latestCommand: 'git push',
-      )),
+      const SessionRuntimeSnapshot(
+          headSeq: 12,
+          badge: RuntimeBadge(
+            agentState: AgentState.working,
+            latestCommand: 'git push',
+          )),
     );
     await tester.pumpWidget(_wrap(RuntimeFooter(row: row)));
     expect(find.text('Ready'), findsOneWidget);
@@ -39,9 +42,11 @@ void main() {
 
   testWidgets('working row overrides stale waiting badge', (tester) async {
     final row = _row(agent: AgentState.working).withRuntime(
-      const SessionRuntimeSnapshot(headSeq: 12, badge: RuntimeBadge(
-        agentState: AgentState.waiting,
-      )),
+      const SessionRuntimeSnapshot(
+          headSeq: 12,
+          badge: RuntimeBadge(
+            agentState: AgentState.waiting,
+          )),
     );
     await tester.pumpWidget(_wrap(RuntimeFooter(row: row)));
     expect(find.byType(CircularProgressIndicator), findsOneWidget);
@@ -49,8 +54,9 @@ void main() {
   });
 
   test('stale approval badge cannot replace an idle composer', () {
-    final row = _row(agent: AgentState.waiting).copyWith(runtime:
-      const RuntimeBadge(agentState: AgentState.needsAction, pendingPromptId: 'old'),
+    final row = _row(agent: AgentState.waiting).copyWith(
+      runtime: const RuntimeBadge(
+          agentState: AgentState.needsAction, pendingPromptId: 'old'),
     );
     expect(sessionAwaitsApproval(row), isFalse);
   });
@@ -223,6 +229,25 @@ void main() {
     );
     await tester.pumpWidget(_wrap(ConversationItemView(item: item)));
     expect(find.textContaining('#12', findRichText: true), findsOneWidget);
+  });
+
+  testWidgets('assistant turn title is lifted above the message body',
+      (tester) async {
+    const item = ConversationItem(
+      id: 'stream:titled',
+      kind: 'assistant',
+      title: null,
+      body: '**Title:** Add concise output titles\n\nImplemented on mobile.',
+      sequence: null,
+      model: null,
+      thinking: false,
+      tool: null,
+    );
+    await tester.pumpWidget(_wrap(ConversationItemView(item: item)));
+    expect(find.text('Add concise output titles'), findsOneWidget);
+    expect(find.textContaining('Implemented on mobile.', findRichText: true),
+        findsOneWidget);
+    expect(find.textContaining('Title:', findRichText: true), findsNothing);
   });
 
   test('thinking is detected from the desktop system/"Thinking" shape', () {

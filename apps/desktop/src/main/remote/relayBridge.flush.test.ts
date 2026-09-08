@@ -230,6 +230,58 @@ describe("relay bridge write path", () => {
     expect(calls).toEqual([]);
   });
 
+  it("coalesces growing assistant snapshots until a turn boundary", async () => {
+    bridge.observeLocalEvent("session:runtime", runtimeEvent());
+    await flush();
+    calls.length = 0;
+
+    bridge.observeLocalEvent("session:conversation", {
+      id: "session-1",
+      items: [{ id: "assistant-1", kind: "assistant", body: "Hel" }],
+    });
+    await flush();
+    bridge.observeLocalEvent("session:conversation", {
+      id: "session-1",
+      items: [{ id: "assistant-1", kind: "assistant", body: "Hello, complete answer." }],
+    });
+    await flush();
+    // Growing the same body used to append a fresh, ever-larger ciphertext on
+    // every stream tick. No transcript write occurs while it is still growing.
+    expect(names()).toEqual([]);
+
+    bridge.observeLocalEvent(
+      "session:runtime",
+      runtimeEvent({ agentState: "waiting", lastEventAt: new Date(2_000).toISOString() }),
+    );
+    await flush();
+    const appends = calls.filter((call) => call.name === "sessions:appendEvents");
+    expect(appends).toHaveLength(1);
+    expect(appends[0]?.args.events).toHaveLength(1);
+  });
+
+  it("publishes the latest assistant snapshot with a tool boundary", async () => {
+    bridge.observeLocalEvent("session:runtime", runtimeEvent());
+    await flush();
+    calls.length = 0;
+
+    bridge.observeLocalEvent("session:conversation", {
+      id: "session-1",
+      items: [{ id: "assistant-1", kind: "assistant", body: "I will inspect it." }],
+    });
+    bridge.observeLocalEvent("session:conversation", {
+      id: "session-1",
+      items: [
+        { id: "assistant-1", kind: "assistant", body: "I will inspect it now." },
+        { id: "tool-1", kind: "tool", body: "running", title: "Read" },
+      ],
+    });
+    await flush();
+
+    const appends = calls.filter((call) => call.name === "sessions:appendEvents");
+    expect(appends).toHaveLength(1);
+    expect(appends[0]?.args.events).toHaveLength(2);
+  });
+
   it("ignores the title and claude session id re-stated on every tick", async () => {
     bridge.observeLocalEvent("session:runtime", runtimeEvent({ claudeSessionId: "claude-1" }));
     bridge.observeLocalEvent("session:title", { id: "session-1", title: "Fix the flush" });

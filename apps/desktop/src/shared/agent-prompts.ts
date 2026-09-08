@@ -1,10 +1,16 @@
 // Instruction appended to every main agent session so the final message of a
-// turn includes a short, human-readable recap.
+// turn carries a short heading for the transcript and a human-readable recap.
 export const tldrSystemPrompt =
+  "At the very beginning of your FINAL response for a turn, add a single line that starts with `**Title:**` followed by a 5-10 word " +
+  "plain-language title summarizing the user's request for that turn. Do not reuse the section/session title. Do not add this line to " +
+  "intermediate updates. Panda Code lifts the line into the message header, so do not repeat it as a Markdown heading. " +
   "At the very end of your FINAL response for a turn - only once you have finished all work and are done calling tools - " +
   "append a short recap: an empty line, then a markdown horizontal rule (`---`) on its own line, then a single line that " +
   "starts with `**TL;DR:**` followed by a one- or two-sentence summary of what you did or found. " +
-  "Do NOT include a TL;DR in intermediate messages where you are still working or about to call a tool, and never add more than one TL;DR per turn.";
+  "Do NOT include a TL;DR in intermediate messages where you are still working or about to call a tool, and never add more than one TL;DR per turn. " +
+  "When, and only when, the user must notice something exceptionally important, add one final line below the TL;DR that starts with " +
+  "`**Important:**`. Reserve it for a P0 or urgent issue, a consequential or hard-to-reverse change, or a decision the user must make; " +
+  "do not use it for routine caveats, ordinary next steps, or general emphasis.";
 
 // Appended only while Settings → Conserve mode is on, and only to Claude
 // sections (Codex has no per-turn model override to delegate through).
@@ -261,7 +267,7 @@ const workspaceBacklogUsagePrompt =
 // three days later.
 //
 // The mechanical half of this is enforced in `backlog.ts` (a move to `done` with
-// no notes and no attachments is rejected for agent callers), so this paragraph
+// no recorded verification result is rejected for agent callers), so this paragraph
 // only has to carry the part code cannot: which column to use, what counts as
 // evidence for which kind of change, and the honesty clause. Stating the rule
 // here as well is not redundancy — an agent that knows the rule writes the note
@@ -279,7 +285,11 @@ const workspaceBacklogReviewPrompt =
   "If you genuinely could not verify something — no device, no credentials, a check that needs the user's own account — say that in the note, in " +
   "that many words, and move the card to review anyway. An honest gap is useful; a card that implies coverage it does not have is worse than no card. " +
   "The repo's own instructions (AGENTS.md, CLAUDE.md) are where the per-project recipe lives — which command runs this app, which URL, which " +
-  "deployment to query. Read them for the how; the bar itself is the same everywhere. ";
+  "deployment to query. Read them for the how; the bar itself is the same everywhere. " +
+  "For applicable changes, record a scenario with setup/environment and build or revision, actions, expected outcome, actual outcome " +
+  "(passed, failed, blocked, or not run), evidence links, and coverage limits. Label the evidence honestly as live E2E, mocked, renderer-only, " +
+  "native installed-app, API, or unit. A video alone is not a pass. Saving includes a persistence check when relevant; cancellation checks that " +
+  "nothing changed. Keep older attempts and identify the latest result. Attachments alone are artifacts, not proof of a pass. ";
 
 // A card that says "this works" and a card that shows it are different claims,
 // and only one of them survives a skim. This is what closes that gap: the
@@ -298,6 +308,8 @@ export const workspaceBacklogMcpPrompt =
   "This workspace has a shared backlog board — columns backlog, in_progress, review and done, one per project folder, visible to the user in the app. " +
   "`backlog_list` reads it, `backlog_add` files an item (title, summary, description, metadata), `backlog_update` edits one, moves it between columns, " +
   "or puts it on hold (`onHold`), and `backlog_delete` removes one. " +
+  "`epic_list`, `epic_add`, `epic_update`, and `epic_delete` manage flat outcome-level Epics; cards join or leave through `backlog_update.epic`. " +
+  "`backlog_verify` appends a scenario result without overwriting earlier attempts. " +
   workspaceBacklogPendingPrompt +
   workspaceBacklogReviewPrompt +
   workspaceBacklogUsagePrompt +
@@ -312,6 +324,8 @@ export const workspaceBacklogShellPrompt =
   "`panda-peers backlog hold|unhold <id>` parks one and brings it back), " +
   "and `panda-peers backlog delete <id>` removes one. Attach a screenshot or recording with `--attach <path>` (optionally `--caption <text>`) on `add` or " +
   "`update`, and write what it proved with `--verification <text>`. " +
+  "`panda-peers epic` lists Epics; `epic add|update|delete` manages them, and `backlog update <card> --epic <E#>` changes membership. " +
+  "`panda-peers backlog verify <card> --outcome ...` appends a scenario result and preserves history. " +
   workspaceBacklogPendingPrompt +
   workspaceBacklogReviewPrompt +
   workspaceBacklogUsagePrompt +

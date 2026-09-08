@@ -1348,6 +1348,8 @@ button:disabled,
   background: var(--accent-wash);
   color: var(--accent);
 }
+.thread-subthread-count.needs-action { color: var(--warn-text); border-color: var(--warn-edge); }
+.thread-subthread-count.complete { color: var(--run-text); border-color: var(--run-edge); }
 
 .thread-subthread-count svg {
   width: 11px;
@@ -2406,6 +2408,24 @@ button.conversation-line-header:disabled {
   flex: 0 0 auto;
   color: var(--subtle);
   font-size: 11px;
+}
+
+.conversation-turn-title {
+  flex: 1 1 auto;
+  min-width: 60px;
+  margin-left: auto;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-turn-title + time,
+.conversation-turn-title ~ .conversation-read-button {
+  margin-left: 0;
 }
 
 /* "Read in Markdown editor", parked at the top right of a reply. Quiet until
@@ -6745,12 +6765,17 @@ a.inline-card-ref {
 .agent-attention-kicker small { margin-left: auto; color: var(--subtle); font-weight: 600; text-transform: none; letter-spacing: 0; }
 .agent-attention-source { margin-top: 14px; color: var(--subtle); font-size: 12px; }
 .agent-attention-summary { margin: 5px 0 0; color: var(--text); font-size: 18px; font-weight: 680; line-height: 1.35; }
+.agent-attention-tldr { margin: 12px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.agent-attention-tldr strong { color: var(--text); }
+.agent-attention-important { margin: 12px 0 0; border: 1px solid color-mix(in srgb, var(--danger, #ef645f) 45%, transparent); border-radius: var(--r-md); padding: 10px 12px; background: color-mix(in srgb, var(--danger, #ef645f) 10%, transparent); color: var(--text); font-size: 13px; line-height: 1.5; }
+.agent-attention-important strong { color: var(--danger, #ef645f); }
 .agent-attention-detail { margin: 10px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
 .agent-attention-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
 .agent-attention-actions button { min-height: 34px; border: 1px solid var(--line); border-radius: var(--r-md); padding: 0 12px; background: var(--surface-raised); color: var(--text); cursor: pointer; }
 .agent-attention-actions button:hover { border-color: var(--line-strong); }
 .agent-attention-actions button.primary { border-color: var(--accent-edge-strong); background: var(--accent); color: var(--accent-contrast, white); }
-.agent-attention-actions button.quiet { margin-left: auto; color: var(--muted); }
+.agent-attention-actions button.quiet { color: var(--muted); }
+.agent-attention-actions button.push-right { margin-left: auto; }
 
 .agent-attention-minimized {
   position: fixed;
@@ -9330,6 +9355,52 @@ a.inline-card-ref {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.backlog-epic-chip,
+.task-epic-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent);
+  font: inherit;
+  padding: 3px 7px;
+  max-width: 100%;
+}
+
+.epic-backdrop { z-index: 8; }
+.epic-panel { width: min(1020px, calc(100vw - 56px)); height: min(760px, calc(100vh - 56px)); display: grid; grid-template-columns: 260px 1fr; overflow: hidden; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); box-shadow: var(--elev-overlay); }
+.epic-list { border-right: 1px solid var(--border); overflow: auto; padding: 12px; }
+.epic-list header, .epic-detail > header, .epic-actions, .epic-progress { display: flex; align-items: center; gap: 10px; }
+.epic-list header { justify-content: space-between; padding: 4px 6px 10px; }
+.epic-list > button { display: grid; width: 100%; gap: 3px; text-align: left; border: 0; border-radius: 8px; background: transparent; color: var(--text); padding: 9px; }
+.epic-list > button.active { background: var(--panel-hover); }
+.epic-list small, .epic-cards small { color: var(--text-subtle); }
+.epic-detail { overflow: auto; padding: 20px 24px 32px; }
+.epic-detail > header { justify-content: space-between; margin-bottom: 14px; }
+.epic-detail > header > div { display: grid; gap: 4px; }
+.epic-detail label { display: grid; gap: 6px; margin: 14px 0; color: var(--text-muted); font-size: 12px; font-weight: 650; }
+.epic-progress { flex-wrap: wrap; padding: 10px 12px; border-radius: 9px; background: var(--panel-soft); color: var(--text-muted); }
+.epic-progress .is-blocked, .task-scenario.is-blocked .task-scenario-outcome { color: var(--warn-text); }
+.epic-progress .is-gap { color: var(--danger-text); }
+.epic-cards { display: grid; gap: 14px; margin-top: 24px; }
+.epic-cards > div { display: grid; gap: 5px; }
+.epic-cards button { display: flex; justify-content: space-between; gap: 12px; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--text); padding: 8px 10px; text-align: left; }
+.task-evidence-more { margin-top: 8px; }
+.task-verification-gap { margin: 4px 0 10px; color: var(--text-subtle); font-size: 12px; }
+.task-scenarios { display: grid; gap: 7px; margin-bottom: 12px; }
+.task-scenario { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.task-scenario summary { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.task-scenario summary em { margin-left: auto; color: var(--text-subtle); font-size: 10px; font-style: normal; text-transform: uppercase; }
+.task-scenario-outcome { font-size: 10px; font-weight: 750; text-transform: uppercase; }
+.task-scenario.is-passed .task-scenario-outcome { color: var(--run-text); }
+.task-scenario.is-failed .task-scenario-outcome { color: var(--danger-text); }
+.task-scenario dl { display: grid; grid-template-columns: 82px 1fr; gap: 5px 10px; margin: 10px 0 0; font-size: 12px; }
+.task-scenario dt { color: var(--text-subtle); }
+.task-scenario dd { margin: 0; white-space: pre-wrap; }
+.task-scenario-links { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 
 .backlog-editor-backdrop {
   position: absolute;

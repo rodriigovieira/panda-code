@@ -116,6 +116,7 @@ import { effectiveHygiene } from "../shared/ipc";
 import {
   applyAppServerNotification,
   applyStreamJsonEvent,
+  codexTranscriptTurnSummaryItem,
   codexTranscriptMessageId,
   looksLikeSyntheticUserText,
   createStreamJsonState,
@@ -165,7 +166,10 @@ import {
 } from "../shared/backlog";
 import {
   createBacklogStore,
+  storeAddEpic as backlogStoreAddEpic,
+  storeDeleteEpic as backlogStoreDeleteEpic,
   storeDelete as backlogStoreDelete,
+  storeUpdateEpic as backlogStoreUpdateEpic,
   storeUpdate as backlogStoreUpdate,
   type BacklogStore,
 } from "../shared/backlog-store";
@@ -353,6 +357,8 @@ type CodexJsonLine = {
     message?: unknown;
     model?: string;
     content?: unknown;
+    turn_id?: string;
+    duration_ms?: number;
     info?: {
       total_token_usage?: {
         input_tokens?: number;
@@ -636,7 +642,13 @@ function applyBacklogMutation(mutation: BacklogMutation): BacklogMutationResult 
   // the card) has its file cleaned up too — the same path `backlog_update` and
   // `backlog_delete` use from the agent side.
   const result =
-    mutation.op === "update"
+    mutation.op === "epic-add"
+      ? backlogStoreAddEpic(store, cwd, mutation)
+      : mutation.op === "epic-update"
+        ? backlogStoreUpdateEpic(store, cwd, mutation.id, mutation)
+        : mutation.op === "epic-delete"
+          ? backlogStoreDeleteEpic(store, cwd, mutation.id)
+          : mutation.op === "update"
       ? backlogStoreUpdate(store, cwd, mutation.id, {
           title: mutation.title,
           summary: mutation.summary,
@@ -645,6 +657,8 @@ function applyBacklogMutation(mutation: BacklogMutation): BacklogMutationResult 
           column: mutation.column,
           onHold: mutation.onHold,
           verificationNotes: mutation.verificationNotes,
+          epicId: mutation.epicId,
+          addVerificationScenario: mutation.addVerificationScenario,
           removeAttachmentIds: mutation.removeAttachmentIds,
         })
       : mutation.op === "delete"
@@ -720,8 +734,17 @@ function applyRemoteBacklog(request: RemoteBacklogRequest): BacklogMutationResul
         column,
         onHold: request.onHold,
         verificationNotes: request.verificationNotes,
+        epicId: request.epicId,
         removeAttachmentIds: request.removeAttachmentIds,
       });
+    case "epic-add":
+      return applyBacklogMutation({ op: "epic-add", cwd: request.cwd, title: request.title ?? "", summary: request.summary, scope: request.scope, acceptanceCriteria: request.acceptanceCriteria, acceptanceScenario: request.acceptanceScenario });
+    case "epic-update":
+      if (!request.id) return { ok: false, message: "Updating an Epic needs its id." };
+      return applyBacklogMutation({ op: "epic-update", cwd: request.cwd, id: request.id, title: request.title, summary: request.summary, scope: request.scope, acceptanceCriteria: request.acceptanceCriteria, acceptanceScenario: request.acceptanceScenario });
+    case "epic-delete":
+      if (!request.id) return { ok: false, message: "Deleting an Epic needs its id." };
+      return applyBacklogMutation({ op: "epic-delete", cwd: request.cwd, id: request.id });
     case "move":
       if (!request.id) return { ok: false, message: "Moving a backlog item needs its id." };
       if (!column) return { ok: false, message: "Moving a backlog item needs a target column." };
@@ -2367,6 +2390,18 @@ function readCodexConversation(codexThreadId: string): ClaudeConversationResult 
         return;
       }
 
+      if (entry.type === "event_msg" && payload.type === "task_complete") {
+        const summary = codexTranscriptTurnSummaryItem({
+          threadId: codexThreadId,
+          turnId: payload.turn_id,
+          durationMs: Number(payload.duration_ms ?? 0),
+          timestamp: entry.timestamp,
+          sequence: lineIndex * 100,
+        });
+        if (summary) items.push(summary);
+        return;
+      }
+
       if (entry.type !== "response_item") {
         return;
       }
@@ -2474,6 +2509,17 @@ function parseIndexedCodexPage(codexThreadId: string, page: TranscriptIndexPage)
             model: model ?? currentModel,
           });
         }
+        continue;
+      }
+      if (entry.type === "event_msg" && payload.type === "task_complete") {
+        const summary = codexTranscriptTurnSummaryItem({
+          threadId: codexThreadId,
+          turnId: payload.turn_id,
+          durationMs: Number(payload.duration_ms ?? 0),
+          timestamp: entry.timestamp,
+          sequence: lineIndex,
+        });
+        if (summary) items.push(summary);
         continue;
       }
       if (entry.type !== "response_item") continue;

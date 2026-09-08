@@ -334,6 +334,7 @@ class _AssistantMessage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (body.trim().isEmpty) return const SizedBox.shrink();
+    final presentation = _assistantMessagePresentation(body);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: Column(
@@ -350,13 +351,31 @@ class _AssistantMessage extends StatelessWidget {
                 child: GestureDetector(
                   onLongPress: () =>
                       _showMessageActions(context, body, createdAt),
-                  child: MarkdownView(
-                    data: body,
-                    selectable: false,
-                    highlightQuery: highlightQuery,
-                    activeHighlight: activeMatch,
-                    cardNumbers: cardNumbers,
-                    onCardTap: onCardTap,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (presentation.title != null) ...[
+                        Text(
+                          presentation.title!,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: context.tokens.text,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                      ],
+                      MarkdownView(
+                        data: presentation.body,
+                        selectable: false,
+                        highlightQuery: highlightQuery,
+                        activeHighlight: activeMatch,
+                        cardNumbers: cardNumbers,
+                        onCardTap: onCardTap,
+                      ),
+                    ],
                   ),
                 ),
               ),
@@ -375,6 +394,29 @@ class _AssistantMessage extends StatelessWidget {
       ),
     );
   }
+}
+
+({String? title, String body}) _assistantMessagePresentation(String value) {
+  final lines = value.split('\n');
+  final lineIndex = lines.indexWhere((line) => line.trim().isNotEmpty);
+  if (lineIndex < 0) return (title: null, body: value);
+  final match =
+      RegExp(r'^\s*(?:\*\*)?Title:(?:\*\*)?\s*(.+?)\s*$', caseSensitive: false)
+          .firstMatch(lines[lineIndex]);
+  if (match == null || match.group(1) == null) {
+    return (title: null, body: value);
+  }
+
+  final words =
+      match.group(1)!.replaceAll(RegExp(r'\s+'), ' ').trim().split(' ');
+  var title =
+      words.length > 10 ? '${words.take(10).join(' ')}…' : words.join(' ');
+  if (title.length > 80) title = '${title.substring(0, 79).trimRight()}…';
+  final bodyLines = [...lines.take(lineIndex), ...lines.skip(lineIndex + 1)];
+  while (bodyLines.isNotEmpty && bodyLines.first.trim().isEmpty) {
+    bodyLines.removeAt(0);
+  }
+  return (title: title, body: bodyLines.join('\n'));
 }
 
 /// End-of-turn stats caption (duration + tokens) trailing an assistant reply.

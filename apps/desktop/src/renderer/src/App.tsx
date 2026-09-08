@@ -107,8 +107,11 @@ import { canAdopt, topLevelThreads } from "../../shared/workspace-peers";
 import { SECTION_TITLE_CAP, compactSectionTitle } from "../../shared/section-title";
 import { EMPTY_BTW, mergeBtwItems, serializeBtwContext, type BtwState } from "./btw";
 import {
+  assistantMessagePresentation,
   groupQuietWork,
   hiddenTranscriptCount as computeHiddenTranscriptCount,
+  latestTurnImportant,
+  latestTurnTldr,
   mergeConversationItems,
   parsePeerPrompt,
   selectTranscriptsToDrop,
@@ -120,7 +123,7 @@ import { exportFilename, parseExportCommand, serializeConversation } from "./exp
 import { DRAFT_THREAD_ID, isDraftThread, isSectionWorthKeeping, persistableThreads } from "./draft";
 import { recordRendererPerf, startRendererPerf } from "./perf-client";
 import { FormattedBody } from "./FormattedBody";
-import { BacklogCardsContext, OPEN_BACKLOG_ITEM_EVENT, type BacklogCardIndex } from "./inline";
+import { BacklogCardsContext, OPEN_BACKLOG_ITEM_EVENT, OPEN_EPIC_EVENT, type BacklogCardIndex } from "./inline";
 import { buildPromptWithImageAttachments } from "./prompt";
 import { promptHistoryPreview } from "./prompt-history";
 import {
@@ -3202,6 +3205,8 @@ const ConversationCard = memo(function ConversationCard({
   const promptBody = peerPrompt?.body ?? item.body;
   const attachedImages = item.kind === "user" ? attachedImagePathsFromBody(promptBody) : [];
   const displayBody = attachedImages.length > 0 ? bodyWithoutAttachedImageList(promptBody) : promptBody;
+  const assistantPresentation = item.kind === "assistant" ? assistantMessagePresentation(displayBody) : null;
+  const renderedBody = assistantPresentation?.body ?? displayBody;
   const preview = compactPreview(item.body);
   const icon =
     item.kind === "user" ? (
@@ -3270,7 +3275,10 @@ const ConversationCard = memo(function ConversationCard({
   // reading it in the transcript's column is the wrong shape for it; the final
   // reply — the card below — always gets the button.
   const readerTitle = "Read in Markdown editor";
-  const openInReader = (): void => openDocument({ text: item.body, title: item.title ?? "Reply" });
+  const openInReader = (): void => openDocument({
+    text: renderedBody,
+    title: assistantPresentation?.title ?? item.title ?? "Reply",
+  });
 
   if (item.kind === "assistant" && midTurn) {
     return (
@@ -3279,7 +3287,7 @@ const ConversationCard = memo(function ConversationCard({
           <Bot size={13} aria-hidden="true" />
         </span>
         <div className="conversation-passage-body">
-          <FormattedBody value={displayBody} />
+          <FormattedBody value={renderedBody} />
         </div>
         {documentWordCount(displayBody) >= READER_WORD_THRESHOLD ? (
           <button className="conversation-read-button" type="button" onClick={openInReader} aria-label={readerTitle} title={readerTitle}>
@@ -3315,8 +3323,13 @@ const ConversationCard = memo(function ConversationCard({
             {modelDisplayName(item.model)}
           </span>
         ) : null}
+        {assistantPresentation?.title ? (
+          <span className="conversation-turn-title" title={assistantPresentation.title}>
+            {assistantPresentation.title}
+          </span>
+        ) : null}
         {item.timestamp ? <time>{formatTime(item.timestamp)}</time> : null}
-        {item.kind === "assistant" && displayBody.trim().length > 0 ? (
+        {item.kind === "assistant" && renderedBody.trim().length > 0 ? (
           <button className="conversation-read-button" type="button" onClick={openInReader} aria-label={readerTitle} title={readerTitle}>
             <BookOpen size={13} aria-hidden="true" />
           </button>
@@ -3328,7 +3341,7 @@ const ConversationCard = memo(function ConversationCard({
         }`}
       >
         <div className="conversation-body">
-          <FormattedBody value={displayBody} />
+          <FormattedBody value={renderedBody} />
           {attachedImages.length > 0 ? <MessageImageAttachments paths={attachedImages} onPreviewImage={onPreviewImage} /> : null}
         </div>
         {item.kind === "user" && shouldCollapsePrompt(displayBody) ? (
@@ -4265,6 +4278,8 @@ const ThreadRow = memo(function ThreadRow({
   // parent: it is the state where "something is happening that you cannot
   // see" would otherwise be true.
   const busyChildren = children.filter((child) => child.agentState === "working").length;
+  const blockedChildren = children.filter((child) => child.agentState === "needs_action").length;
+  const completedChildren = children.filter((child) => attentionThreadIds.has(child.id)).length;
   const visibleChildren = Math.min(
     visibleSubthreadCounts[thread.id] ?? INITIAL_VISIBLE_SESSIONS,
     children.length,
@@ -4385,6 +4400,24 @@ const ThreadRow = memo(function ThreadRow({
                           busyChildren > 0
                             ? `${children.length} sub-thread${children.length === 1 ? "" : "s"}, ${busyChildren} running`
                             : `${children.length} sub-thread${children.length === 1 ? "" : "s"}`,
+                      }
+                    : null,
+                  collapsed && blockedChildren > 0
+                    ? {
+                        key: "subthreads-blocked",
+                        className: "thread-subthread-count needs-action",
+                        icon: <AlertTriangle size={11} aria-hidden="true" />,
+                        count: blockedChildren,
+                        label: `${blockedChildren} sub-thread${blockedChildren === 1 ? "" : "s"} blocked waiting for input`,
+                      }
+                    : null,
+                  collapsed && completedChildren > 0
+                    ? {
+                        key: "subthreads-complete",
+                        className: "thread-subthread-count complete",
+                        icon: <Check size={11} aria-hidden="true" />,
+                        count: completedChildren,
+                        label: `${completedChildren} sub-thread${completedChildren === 1 ? "" : "s"} completed since you last opened them`,
                       }
                     : null,
                   terminalCount > 0
@@ -4562,6 +4595,7 @@ export default function App(): React.ReactElement {
   // Card the board should scroll to and highlight, when the board was opened
   // from that card's own view.
   const [backlogFocusId, setBacklogFocusId] = useState<string | null>(null);
+  const [backlogEpicFocusId, setBacklogEpicFocusId] = useState<string | null>(null);
   /**
    * One backlog card, open on its own over whatever is on screen.
    *
@@ -4653,6 +4687,17 @@ export default function App(): React.ReactElement {
     const ids = Array.from(archivedThreadIds);
     if (ids.length > 0) void desktopApi.syncLocalArchivedThreads(ids);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const onOpenEpic = (event: Event): void => {
+      const id = (event as CustomEvent<{ id?: string }>).detail?.id;
+      if (!id) return;
+      setBacklogWorkspace(activeCwdRef.current);
+      setBacklogEpicFocusId(id);
+    };
+    window.addEventListener(OPEN_EPIC_EVENT, onOpenEpic);
+    return () => window.removeEventListener(OPEN_EPIC_EVENT, onOpenEpic);
   }, []);
   // Per-workspace "show archived" reveal, keyed by cwd like visibleSessionCounts.
   const [showArchivedByCwd, setShowArchivedByCwd] = useState<Record<string, boolean>>({});
@@ -6586,14 +6631,17 @@ export default function App(): React.ReactElement {
     if (agentAttentionAllowed(notificationChannels, thread.id, preferences.notificationsPaused, false)) {
       const now = Date.now();
       const needsAction = thread.agentState === "needs_action";
+      const important = needsAction ? undefined : latestTurnImportant(conversationItemsRef.current[thread.id] ?? []);
       setAttentionQueue((current) => [
         ...current.filter((event) => event.threadId !== thread.id),
         {
           id: `completion:${thread.id}:${now}`,
           threadId: thread.id,
           threadTitle: thread.title?.trim() || "Untitled section",
-          summary: needsAction ? "Needs your input" : "Finished — ready for your next prompt",
-          severity: needsAction ? "urgent" : "important",
+          summary: needsAction ? "Needs your input" : important ? "Important — please review" : "Finished — ready for your next prompt",
+          tldr: needsAction ? undefined : latestTurnTldr(conversationItemsRef.current[thread.id] ?? []),
+          important,
+          severity: needsAction || important ? "urgent" : "important",
           choices: [],
           createdAt: new Date(now).toISOString(),
         },
@@ -7618,6 +7666,7 @@ export default function App(): React.ReactElement {
     setTaskView(null);
     setBacklogWorkspace(null);
     setBacklogFocusId(null);
+    setBacklogEpicFocusId(null);
     setExpandedWorkspaces((current) => new Set(current).add(thread.cwd));
     setActiveThreadId(sectionId);
   }, []);
@@ -7675,6 +7724,7 @@ export default function App(): React.ReactElement {
     // section on screen runs in — the same board the agent in it writes to.
     setBacklogWorkspace(activeCwdRef.current);
     setBacklogFocusId(null);
+    setBacklogEpicFocusId(null);
   }, []);
 
   /**
@@ -11433,6 +11483,7 @@ export default function App(): React.ReactElement {
                   const { cwd } = workspaceMenu;
                   setWorkspaceMenu(null);
                   setBacklogWorkspace(cwd);
+                  setBacklogEpicFocusId(null);
                 }}
               >
                 <Kanban size={14} aria-hidden="true" />
@@ -11722,6 +11773,12 @@ export default function App(): React.ReactElement {
               </div>
               <div className="agent-attention-source" id="agent-attention-title">{attention.threadTitle}</div>
               <p className="agent-attention-summary" id="agent-attention-summary">{attention.summary}</p>
+              {attention.tldr ? (
+                <p className="agent-attention-tldr"><strong>TL;DR:</strong> {attention.tldr}</p>
+              ) : null}
+              {attention.important ? (
+                <p className="agent-attention-important"><strong>Important:</strong> {attention.important}</p>
+              ) : null}
               {attention.detail ? <p className="agent-attention-detail">{attention.detail}</p> : null}
               <div className="agent-attention-actions">
                 {attention.choices.map((choice) => (
@@ -11732,10 +11789,13 @@ export default function App(): React.ReactElement {
                 <button type="button" onClick={() => openAttentionThread(attention)}>Open section</button>
                 <button
                   type="button"
-                  className="quiet"
+                  className="quiet push-right"
                   onClick={() => setMinimizedAttentionIds((current) => new Set(current).add(attention.id))}
                 >
                   Later
+                </button>
+                <button type="button" className="quiet" onClick={() => dismissAttention(attention.id)}>
+                  Close
                 </button>
               </div>
             </section>
@@ -11906,11 +11966,13 @@ export default function App(): React.ReactElement {
           workspaceName={workspaceName(backlogWorkspace)}
           desktopApi={desktopApi}
           focusItemId={backlogFocusId}
+          focusEpicId={backlogEpicFocusId}
           resolveSections={resolveSections}
           onOpenSection={openSectionFromTask}
           onClose={() => {
             setBacklogWorkspace(null);
             setBacklogFocusId(null);
+            setBacklogEpicFocusId(null);
           }}
           onCreateSession={(items) => createSessionFromBacklogItems(backlogWorkspace, items)}
         />
@@ -11930,9 +11992,15 @@ export default function App(): React.ReactElement {
           onOpenBoard={() => {
             setBacklogWorkspace(taskView.cwd);
             setBacklogFocusId(taskView.itemId);
+            setBacklogEpicFocusId(null);
             setTaskView(null);
           }}
           onOpenSection={openSectionFromTask}
+          onOpenEpic={(epicId) => {
+            setBacklogWorkspace(taskView.cwd);
+            setBacklogEpicFocusId(epicId);
+            setTaskView(null);
+          }}
           onCreateSession={(item) => createSessionFromBacklogItems(taskView.cwd, [item])}
         />
       ) : null}

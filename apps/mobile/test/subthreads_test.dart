@@ -53,7 +53,7 @@ void main() {
       final rows = [
         row('a'),
         row('b', parent: 'a', state: AgentState.working),
-        row('c', parent: 'a'),
+        row('c', parent: 'a', state: AgentState.needsAction),
       ];
 
       final nodes = layoutSubthreads(rows, collapsed: {'a'});
@@ -61,10 +61,12 @@ void main() {
       expect(nodes.map((n) => n.row.sessionId), ['a']);
       expect(nodes.single.childCount, 2);
       expect(nodes.single.runningChildCount, 1);
+      expect(nodes.single.blockedChildCount, 1);
       expect(nodes.single.collapsed, isTrue);
     });
 
-    test('pages by top-level rows, so a parent brings its sub-threads along', () {
+    test('pages by top-level rows, so a parent brings its sub-threads along',
+        () {
       final rows = [
         row('a'),
         row('a1', parent: 'a'),
@@ -106,7 +108,8 @@ void main() {
   });
 
   group('flattenSubtree', () {
-    test('anchors a root plus its descendants even when the root is not a '
+    test(
+        'anchors a root plus its descendants even when the root is not a '
         'top-level row itself', () {
       // Mirrors a pinned session: it renders in a featured section by its own
       // id, not because `subthreadRoots` picked it — it may even (rarely)
@@ -136,8 +139,7 @@ void main() {
   });
 
   group('subtreeIds', () {
-    test('collects a root and every descendant beneath it, depth-uncapped',
-        () {
+    test('collects a root and every descendant beneath it, depth-uncapped', () {
       final rows = [
         row('a'),
         row('b', parent: 'a'),

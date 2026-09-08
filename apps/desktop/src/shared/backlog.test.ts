@@ -2,15 +2,18 @@ import { describe, expect, it } from "vitest";
 import {
   activeItemsInColumn,
   addBacklogItem,
+  addBacklogEpic,
   backlogFileName,
   backlogSessionPrompt,
   deleteBacklogItem,
   emptyBacklog,
   findBacklogItem,
+  findBacklogEpic,
   hasEvidence,
   isColumnVisible,
   itemsForSection,
   itemsInColumn,
+  itemsForEpic,
   linkBacklogSection,
   moveBacklogItem,
   normalizeColumn,
@@ -18,8 +21,11 @@ import {
   parseBacklog,
   renderBacklog,
   renderBacklogItemDetail,
+  renderEpics,
   unlinkBacklogSection,
   updateBacklogItem,
+  updateBacklogEpic,
+  deleteBacklogEpic,
   MAX_ATTACHMENTS,
   MAX_BACKLOG_ITEMS,
   MAX_LINKED_SECTIONS,
@@ -554,7 +560,7 @@ describe("the evidence bar on done", () => {
 
   it("counts either half as evidence, and blank notes as neither", () => {
     expect(hasEvidence({ verificationNotes: "Ran the migration.", attachments: undefined })).toBe(true);
-    expect(hasEvidence({ verificationNotes: undefined, attachments: [attachment("a")] })).toBe(true);
+    expect(hasEvidence({ verificationNotes: undefined, attachments: [attachment("a")] })).toBe(false);
     expect(hasEvidence({ verificationNotes: undefined, attachments: undefined })).toBe(false);
     expect(hasEvidence({ verificationNotes: "   \n ", attachments: [] })).toBe(false);
   });
@@ -583,9 +589,9 @@ describe("the evidence bar on done", () => {
     expect(result.ok && result.item?.column).toBe("done");
   });
 
-  it("takes an attachment as the evidence, with no note written", () => {
+  it("does not mistake an attachment for a verification result", () => {
     const result = updateBacklogItem(carded(), "id-0", { column: "done", addAttachments: [attachment("a")], requireEvidence: true }, NOW);
-    expect(result.ok && result.item?.column).toBe("done");
+    expect(result.ok).toBe(false);
   });
 
   it("takes evidence already on the card from an earlier call", () => {
@@ -619,6 +625,71 @@ describe("the evidence bar on done", () => {
       "id-0",
     );
     expect(proven.ok && proven.item?.column).toBe("done");
+  });
+});
+
+describe("Epics", () => {
+  it("adds, edits and deletes an Epic without deleting its cards", () => {
+    const created = addBacklogEpic(board([{ title: "Ship it" }]), { title: "Reliable review", summary: "Evidence users can trust." }, NOW, "epic-1");
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(findBacklogEpic(created.backlog, "E1")?.id).toBe("epic-1");
+    const assigned = updateBacklogItem(created.backlog, "#1", { epicId: "epic-1" }, NOW);
+    expect(assigned.ok && itemsForEpic(assigned.backlog, "epic-1")).toHaveLength(1);
+    if (!assigned.ok) return;
+    const edited = updateBacklogEpic(assigned.backlog, "E1", { acceptanceScenario: "Complete the cross-card user journey." }, NOW);
+    expect(edited.ok && findBacklogEpic(edited.backlog, "E1")?.acceptanceScenario).toContain("cross-card");
+    if (!edited.ok) return;
+    const deleted = deleteBacklogEpic(edited.backlog, "E1", NOW);
+    expect(deleted.ok && deleted.backlog.items).toHaveLength(1);
+    expect(deleted.ok && deleted.backlog.items[0]?.epicId).toBeUndefined();
+  });
+
+  it("preserves a version-1 board with no Epic fields", () => {
+    const legacy = parseBacklog(JSON.stringify({ version: 1, cwd: "/repo", items: [{ id: "a", title: "Keep" }] }), "/repo", NOW);
+    expect(legacy.epics).toBeUndefined();
+    expect(legacy.nextEpicNumber).toBeUndefined();
+  });
+
+  it("renders progress and authoritative card links instead of copied evidence", () => {
+    const created = addBacklogEpic(board([{ title: "One", column: "review" }, { title: "Two", column: "done" }]), { title: "Outcome" }, NOW, "epic-1");
+    if (!created.ok) throw new Error(created.message);
+    let backlog = created.backlog;
+    for (const item of backlog.items) {
+      const assigned = updateBacklogItem(backlog, item.id, { epicId: "epic-1" }, NOW);
+      if (assigned.ok) backlog = assigned.backlog;
+    }
+    const rendered = renderEpics(backlog);
+    expect(rendered).toContain("1/2 done, 1 in Review");
+    expect(rendered).toContain("Review: [#1](panda://backlog/1)");
+    expect(rendered).toContain("Done: [#2](panda://backlog/2)");
+  });
+});
+
+describe("verification scenarios", () => {
+  const scenario = {
+    title: "Save survives reload",
+    setup: "Packaged app at abc123",
+    actions: "Edit, save, close, reopen",
+    expectedOutcome: "Saved Epic remains",
+    actualOutcome: "Saved Epic remained",
+    outcome: "passed" as const,
+    verificationType: "installed_app",
+    evidenceAttachmentIds: ["shot"],
+    coverageLimits: "Dark theme only",
+  };
+
+  it("appends attempts and identifies the latest without losing history", () => {
+    const first = updateBacklogItem(board([{ title: "Ship it" }]), "#1", { addVerificationScenario: scenario }, NOW);
+    if (!first.ok) throw new Error(first.message);
+    const second = updateBacklogItem(first.backlog, "#1", { addVerificationScenario: { ...scenario, actualOutcome: "Relay unavailable", outcome: "blocked" } }, "2026-08-03T11:00:00.000Z");
+    expect(second.ok && second.item?.verificationScenarios).toHaveLength(2);
+    expect(second.ok && second.item?.verificationScenarios?.at(-1)?.outcome).toBe("blocked");
+  });
+
+  it("counts a recorded scenario as evidence even when the actual outcome is blocked", () => {
+    const result = updateBacklogItem(board([{ title: "Ship it" }]), "#1", { addVerificationScenario: { ...scenario, outcome: "blocked" } }, NOW);
+    expect(result.ok && hasEvidence(result.item ?? {})).toBe(true);
   });
 });
 

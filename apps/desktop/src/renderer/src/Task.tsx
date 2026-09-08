@@ -1,4 +1,4 @@
-import { Bot, ExternalLink, Kanban, Link2, MessageSquare, Pause, Play, Rocket, Trash2, User, X } from "lucide-react";
+import { Bot, ExternalLink, Flag, Kanban, Link2, MessageSquare, Pause, Play, Rocket, Trash2, User, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 import { FormattedBody } from "./FormattedBody";
@@ -14,6 +14,7 @@ import {
   ON_HOLD_LABEL,
   type BacklogAttachment,
   type BacklogColumn,
+  type BacklogEpic,
   type BacklogItem,
   type WorkspaceBacklog,
 } from "../../shared/backlog";
@@ -60,6 +61,7 @@ export type TaskPatch = {
   verificationNotes?: string;
   /** The board's own UI only ever drops an attachment — attaching a file is an agent's job, through the MCP tool. */
   removeAttachmentIds?: string[];
+  epicId?: string | null;
 };
 
 type DetailProps = {
@@ -80,6 +82,8 @@ type DetailProps = {
    */
   onOpenBoard?: () => void;
   error?: string | null;
+  epics?: readonly BacklogEpic[];
+  onOpenEpic?: (epicId: string) => void;
 };
 
 export function TaskDetail({
@@ -95,16 +99,22 @@ export function TaskDetail({
   onUnlinkSection,
   onOpenBoard,
   error,
+  epics = [],
+  onOpenEpic,
 }: DetailProps): ReactElement {
   const [preview, setPreview] = useState<BacklogAttachment | null>(null);
+  const [showAllEvidence, setShowAllEvidence] = useState(false);
   const mainRef = useRef<HTMLDivElement | null>(null);
   const attachments = item.attachments ?? [];
+  const visibleAttachments = showAllEvidence ? attachments : attachments.slice(-12);
+  const scenarios = item.verificationScenarios ?? [];
 
   // Opening a second card reuses this DOM, so without a reset it opens halfway
   // down whatever the last card was scrolled to — and the region that scrolls
   // out from under the old content is exactly where stale paint shows up.
   useEffect(() => {
     mainRef.current?.scrollTo({ top: 0 });
+    setShowAllEvidence(false);
   }, [item.id]);
 
   // Capture phase, ahead of the overlay's own Escape listener (which closes
@@ -214,7 +224,7 @@ export function TaskDetail({
             <section className="task-evidence">
               <span className="task-main-label">Evidence</span>
               <ul className="task-attachment-grid">
-                {attachments.map((attachment) => (
+                {visibleAttachments.map((attachment) => (
                   <li key={attachment.id} className="task-attachment-thumb-wrap">
                     <button
                       type="button"
@@ -247,6 +257,11 @@ export function TaskDetail({
                   </li>
                 ))}
               </ul>
+              {attachments.length > 12 ? (
+                <button className="quiet-action task-evidence-more" type="button" onClick={() => setShowAllEvidence((value) => !value)}>
+                  {showAllEvidence ? "Show latest 12" : `Show ${attachments.length - 12} earlier attachments`}
+                </button>
+              ) : null}
             </section>
           ) : null}
 
@@ -268,6 +283,36 @@ export function TaskDetail({
               every other field here: empty is a placeholder, not a hidden block. */}
           <div className="task-verification">
             <span className="task-main-label">Verification</span>
+            {scenarios.length ? (
+              <div className="task-scenarios">
+                {[...scenarios].reverse().map((scenario, index) => (
+                  <details key={scenario.id} open={index === 0} className={`task-scenario is-${scenario.outcome}`}>
+                    <summary>
+                      <span className="task-scenario-outcome">{scenario.outcome.replace("_", " ")}</span>
+                      <strong>{scenario.title}</strong>
+                      {index === 0 ? <em>Latest</em> : null}
+                    </summary>
+                    <dl>
+                      <dt>Environment</dt><dd>{scenario.setup || "Not recorded"}</dd>
+                      <dt>Actions</dt><dd>{scenario.actions || "Not recorded"}</dd>
+                      <dt>Expected</dt><dd>{scenario.expectedOutcome || "Not recorded"}</dd>
+                      <dt>Actual</dt><dd>{scenario.actualOutcome || "Not recorded"}</dd>
+                      <dt>Coverage</dt><dd>{scenario.verificationType}{scenario.coverageLimits ? ` · ${scenario.coverageLimits}` : ""}</dd>
+                    </dl>
+                    {scenario.evidenceAttachmentIds?.length ? (
+                      <div className="task-scenario-links">
+                        {scenario.evidenceAttachmentIds.map((id) => {
+                          const evidence = attachments.find((attachment) => attachment.id === id);
+                          return evidence ? <button key={id} type="button" onClick={() => setPreview(evidence)}>{evidence.caption ?? evidence.name}</button> : null;
+                        })}
+                      </div>
+                    ) : null}
+                  </details>
+                ))}
+              </div>
+            ) : (
+              <p className="task-verification-gap">No scenario result recorded. Attachments alone do not establish a pass.</p>
+            )}
             <InlineField
               value={item.verificationNotes ?? ""}
               multiline
@@ -281,6 +326,26 @@ export function TaskDetail({
         </div>
 
         <aside className="task-side">
+          <div className="task-side-block">
+            <span className="task-side-label">Epic</span>
+            {item.epicId ? (
+              <button className="task-epic-link" type="button" onClick={() => onOpenEpic?.(item.epicId as string)}>
+                <Flag size={12} aria-hidden="true" />
+                {epics.find((epic) => epic.id === item.epicId)?.title ?? "Missing Epic"}
+              </button>
+            ) : null}
+            <select
+              className="backlog-input backlog-select"
+              aria-label="Epic"
+              value={item.epicId ?? ""}
+              onChange={(event) => onPatch({ epicId: event.target.value || null })}
+            >
+              <option value="">No Epic</option>
+              {epics.map((epic) => (
+                <option key={epic.id} value={epic.id}>E{epic.number} · {epic.title}</option>
+              ))}
+            </select>
+          </div>
           <div className="task-side-block">
             <span className="task-side-label">Status</span>
             <div className="task-status-picker" role="group" aria-label="Column">
@@ -659,6 +724,7 @@ type OverlayProps = {
   onOpenBoard: () => void;
   onOpenSection: (sectionId: string) => void;
   onCreateSession: (item: BacklogItem) => void;
+  onOpenEpic?: (epicId: string) => void;
 };
 
 /**
@@ -675,6 +741,7 @@ export function TaskOverlay({
   onOpenBoard,
   onOpenSection,
   onCreateSession,
+  onOpenEpic,
 }: OverlayProps): ReactElement | null {
   const { backlog, error, mutate } = useWorkspaceBacklog(cwd, desktopApi);
   const item = useMemo(() => findBacklogItem(backlog, itemId), [backlog, itemId]);
@@ -716,6 +783,8 @@ export function TaskOverlay({
         onOpenSection={onOpenSection}
         onUnlinkSection={(sectionId) => void mutate({ op: "unlink", cwd, id: item.id, sectionId })}
         onOpenBoard={onOpenBoard}
+        epics={backlog.epics ?? []}
+        onOpenEpic={onOpenEpic}
       />
     </div>
   );

@@ -29,6 +29,8 @@ import { localDocPath, openDocument } from "./documents";
  */
 export const BACKLOG_LINK_PREFIX = "panda://backlog/";
 export const OPEN_BACKLOG_ITEM_EVENT = "panda:open-backlog-item";
+export const EPIC_LINK_PREFIX = "panda://epic/";
+export const OPEN_EPIC_EVENT = "panda:open-epic";
 
 export function backlogLinkId(href: string): string | null {
   if (!href.startsWith(BACKLOG_LINK_PREFIX)) {
@@ -38,6 +40,12 @@ export function backlogLinkId(href: string): string | null {
   // `#12` / `12` (a card number, the form everything now writes) or a uuid, in
   // full or in the prefix form agents used to quote.
   return /^#?\d{1,6}$/.test(id) || /^[0-9a-fA-F-]{4,}$/.test(id) ? id : null;
+}
+
+export function epicLinkId(href: string): string | null {
+  if (!href.startsWith(EPIC_LINK_PREFIX)) return null;
+  const id = href.slice(EPIC_LINK_PREFIX.length).trim();
+  return /^E?\d{1,6}$/i.test(id) || /^[0-9a-fA-F-]{4,}$/.test(id) ? id : null;
 }
 
 /**
@@ -254,6 +262,13 @@ function renderToken(token: Token, key: string): ReactNode {
             {renderTokens(link.tokens, key)}
           </a>
         );
+      }
+      const epicId = epicLinkId(link.href);
+      if (epicId) {
+        return <a className="inline-app-link" href={link.href} key={key} onClick={(event) => {
+          event.preventDefault();
+          window.dispatchEvent(new CustomEvent(OPEN_EPIC_EVENT, { detail: { id: epicId } }));
+        }}>{renderTokens(link.tokens, key)}</a>;
       }
       const mediaPath = localMediaPath(link.href);
       const mediaKind = mediaPath ? mediaKindForPath(mediaPath) : null;

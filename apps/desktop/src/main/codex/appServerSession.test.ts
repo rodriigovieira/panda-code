@@ -15,9 +15,14 @@ class FakeProcess extends EventEmitter implements AppServerProcess {
       this.writes.push(data);
     },
   };
+  constructor(private readonly emitExitOnKill = true) {
+    super();
+  }
   kill(): void {
     this.killed = true;
-    this.emit("exit", null);
+    if (this.emitExitOnKill) {
+      this.emit("exit", null);
+    }
   }
   sent(): Array<Record<string, unknown>> {
     return this.writes.join("").split("\n").filter(Boolean).map((line) => JSON.parse(line));
@@ -401,6 +406,58 @@ describe("CodexAppServerSessionManager", () => {
     expect(proc.killed).toBe(false);
     proc.reply("thread/unsubscribe", {});
     manager.stop("sec_2");
+  });
+
+  it("ignores an old client's delayed exit after a replacement client starts", async () => {
+    const processes: FakeProcess[] = [];
+    const snapshots: Array<{ id: string; agentState: string }> = [];
+    const manager = new CodexAppServerSessionManager({
+      createClient: (handlers) => {
+        // Real child_process exit events are asynchronous. Holding the first
+        // one lets this test reproduce the hibernation/start race from the app:
+        // stop the last old section, start a replacement, then receive the old
+        // SIGTERM exit after the replacement is already registered.
+        const proc = new FakeProcess(false);
+        processes.push(proc);
+        return new CodexAppServerClient({
+          spawn: () => proc,
+          clientInfo: { name: "panda_code", title: "Panda Code", version: "1" },
+          onNotification: handlers.onNotification,
+          onServerRequest: handlers.onServerRequest,
+          onExit: handlers.onExit,
+        });
+      },
+      logMain: () => {},
+      sendSnapshot: (id, session) => snapshots.push({ id, agentState: session.state.agentState }),
+    });
+
+    const firstStart = manager.start(request, "first prompt");
+    await settleStart(processes[0]!, firstStart, "th_old", "turn_old");
+    processes[0]!.push({
+      method: "turn/completed",
+      params: { threadId: "th_old", turn: { id: "turn_old", status: "completed" } },
+    });
+    manager.stop("sec_1");
+    expect(processes[0]!.killed).toBe(true);
+
+    const replacement = { ...request, id: "sec_2", codexThreadId: "th_new" };
+    const replacementStart = manager.start(replacement, "replacement prompt");
+    await vi.waitFor(() => expect(processes).toHaveLength(2));
+    await vi.waitFor(() => expect(processes[1]!.sent().some((message) => message.method === "initialize")).toBe(true));
+
+    // This is the delayed exit that used to clear `this.client`, mark sec_2 as
+    // exited, and make its pending prompt show "Send the prompt again".
+    processes[0]!.emit("exit", null, "SIGTERM");
+
+    processes[1]!.reply("initialize", { userAgent: "codex" });
+    await vi.waitFor(() => expect(processes[1]!.sent().some((message) => message.method === "thread/resume")).toBe(true));
+    processes[1]!.reply("thread/resume", { thread: { id: "th_new" } });
+    await vi.waitFor(() => expect(processes[1]!.sent().some((message) => message.method === "turn/start")).toBe(true));
+    processes[1]!.reply("turn/start", { turn: { id: "turn_new" } });
+    await expect(replacementStart).resolves.toEqual({ ok: true });
+
+    expect(manager.get("sec_2")?.state.agentState).toBe("working");
+    expect(snapshots.some((snapshot) => snapshot.id === "sec_2" && snapshot.agentState === "exited")).toBe(false);
   });
 
   it("locks semantic and native Codex titles against prompt fallback sync", async () => {

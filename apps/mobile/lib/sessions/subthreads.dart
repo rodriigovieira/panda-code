@@ -28,6 +28,7 @@ class SessionNode {
   /// How many of those are mid-turn — the reason a collapsed parent still
   /// deserves a badge: work you cannot see is happening under it.
   final int runningChildCount;
+  final int blockedChildCount;
 
   /// True when this node has children and they are folded away.
   final bool collapsed;
@@ -37,14 +38,14 @@ class SessionNode {
     required this.depth,
     this.childCount = 0,
     this.runningChildCount = 0,
+    this.blockedChildCount = 0,
     this.collapsed = false,
   });
 
   bool get hasChildren => childCount > 0;
 }
 
-bool _isRunning(SessionRow row) =>
-    row.agentState == AgentState.working;
+bool _isRunning(SessionRow row) => row.agentState == AgentState.working;
 
 /// The top-level rows of [rows], in the order given.
 ///
@@ -92,8 +93,9 @@ List<SessionNode> layoutSubthreads(
   final rootIds = roots.map((row) => row.sessionId).toSet();
   final childrenByParent = _childrenByParent(rows, excludeAsChild: rootIds);
 
-  final visibleRoots =
-      maxRoots == null || maxRoots >= roots.length ? roots : roots.take(maxRoots);
+  final visibleRoots = maxRoots == null || maxRoots >= roots.length
+      ? roots
+      : roots.take(maxRoots);
 
   final nodes = <SessionNode>[];
   for (final root in visibleRoots) {
@@ -146,6 +148,9 @@ List<SessionNode> _walkSubtree(
       depth: depth,
       childCount: children.length,
       runningChildCount: children.where(_isRunning).length,
+      blockedChildCount: children
+          .where((child) => child.agentState == AgentState.needsAction)
+          .length,
       collapsed: isCollapsed && children.isNotEmpty,
     ),
   ];
@@ -173,7 +178,8 @@ List<SessionNode> flattenSubtree(
   SessionRow root, {
   Set<String> collapsed = const <String>{},
 }) {
-  final childrenByParent = _childrenByParent(rows, excludeAsChild: {root.sessionId});
+  final childrenByParent =
+      _childrenByParent(rows, excludeAsChild: {root.sessionId});
   return _walkSubtree(root, 0, childrenByParent, collapsed);
 }
 

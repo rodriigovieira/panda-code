@@ -1,10 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PersistedThread } from "../shared/ipc";
 import { startPeerMessageServer } from "./peerMessaging";
-import { createPeerSection, listPeers, loadPeerTranscript, parseArgv, readPeer, requestAttention, sendPeerMessage, waitForSession } from "./peers-entry";
+import { addBacklog, addEpic, createPeerSection, listEpics, listPeers, loadPeerTranscript, parseArgv, readPeer, requestAttention, sendPeerMessage, updateBacklog, waitForSession } from "./peers-entry";
 
 describe("parseArgv", () => {
   it("keeps explicit attention authorization separate from the summary", () => {
@@ -165,6 +165,33 @@ describe("createPeerSection", () => {
     expect(await createPeerSection(options, { task: "do the thing" })).toContain("Opening sections is unavailable");
   });
 });
+
+describe("Epic and scenario agent tools", () => {
+  it("creates an Epic, assigns a card, and appends a scenario through the disk-backed entry points", () => {
+    const directory = mkdtempSync(join(tmpdir(), "panda-peers-epics-"));
+    const options = { threadsPath: join(directory, "threads.json"), cwd: "/repo", home: directory, backlogDir: directory };
+    writeFileSync(options.threadsPath, "[]", "utf8");
+    try {
+      expect(addEpic(options, { title: "Trusted review", acceptanceScenario: "Complete all card flows" })).toContain('Added E1 "Trusted review"');
+      expect(addBacklog(options, { title: "Persist membership", epicId: expectEpicId(directory) })).toContain("#1");
+      expect(updateBacklog(options, "#1", { addVerificationScenario: {
+        title: "Reload", setup: "test", actions: "save then read", expectedOutcome: "present", actualOutcome: "present",
+        outcome: "passed", verificationType: "unit",
+      } })).toContain("LATEST · passed · unit · Reload");
+      expect(listEpics(options)).toContain("0/1 done");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+function expectEpicId(directory: string): string {
+  const file = readdirSync(directory).find((name) => name.endsWith(".json") && name !== "threads.json");
+  const parsed = JSON.parse(readFileSync(join(directory, file as string), "utf8")) as { epics: Array<{ id: string }> };
+  const id = parsed.epics[0]?.id;
+  if (!id) throw new Error("Epic was not persisted");
+  return id;
+}
 
 /**
  * A fake `~` holding one Claude section's transcript, so the reader can be

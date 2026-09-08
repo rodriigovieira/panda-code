@@ -447,15 +447,6 @@ export const list = query({
       .withIndex("by_device", (q) => q.eq("deviceId", mobile.deviceId))
       .collect();
     const stars = new Map(starRows.map((s) => [s.sessionId, s]));
-    // Archive state lives in its own table too, same reason as stars. Unlike a
-    // star, an archived flag never forces a row back into the window — hiding
-    // a thread the activity window already dropped is a no-op — so this is a
-    // plain join, no `pinnedMisses`-style backfill.
-    const archiveRows = await ctx.db
-      .query("sessionArchive")
-      .withIndex("by_device", (q) => q.eq("deviceId", mobile.deviceId))
-      .collect();
-    const archives = new Map(archiveRows.map((a) => [a.sessionId, a]));
     // A PINNED thread must never fall out of the window. Pinning is the user
     // saying "keep this one reachable", and the whole point of a pin is that it
     // survives going quiet — so the ones the activity window missed are fetched
@@ -476,6 +467,25 @@ export const list = query({
       // never streamed (`setStarredByDevice`). Nothing to show until it does.
       if (row) rows.push(row);
     }
+    // Archive state lives in its own table too, same reason as stars. Fetch it
+    // ONLY for rows this query will return. A long-lived desktop can have
+    // thousands of archived sections; collecting that entire device range on
+    // every list invalidation made a 150-row response read ~2,000 documents.
+    // Indexed point reads keep this bounded by the visible window (+ pins), and
+    // archive rows outside it are irrelevant to the result.
+    const archiveRows = await Promise.all(
+      rows.map((row) =>
+        ctx.db
+          .query("sessionArchive")
+          .withIndex("by_device_session", (q) =>
+            q.eq("deviceId", mobile.deviceId).eq("sessionId", row.sessionId),
+          )
+          .unique(),
+      ),
+    );
+    const archives = new Map(
+      archiveRows.flatMap((archive) => archive ? [[archive.sessionId, archive] as const] : []),
+    );
     // Project to the low-churn routing/status shape ONLY. Deliberately excludes
     // `runtimeCipher` and `headSeq` (now in `sessionRuntime`): the mobile list
     // renders coarse status from `agentState`, and the open session view pulls

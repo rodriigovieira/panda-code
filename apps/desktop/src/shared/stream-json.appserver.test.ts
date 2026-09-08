@@ -1,10 +1,31 @@
 import { describe, expect, it } from "vitest";
-import { applyAppServerNotification, createStreamJsonState, streamRuntimeEvent, TURN_SUMMARY_TITLE } from "./stream-json";
+import {
+  applyAppServerNotification,
+  codexTranscriptTurnSummaryItem,
+  createStreamJsonState,
+  streamRuntimeEvent,
+  TURN_SUMMARY_TITLE,
+} from "./stream-json";
 import { codexPromptPayload } from "./agent-prompts";
 
 const AT = "2026-07-16T00:00:00.000Z";
 
 describe("applyAppServerNotification", () => {
+  it("rebuilds a persisted elapsed footer from a rollout task_complete record", () => {
+    expect(codexTranscriptTurnSummaryItem({
+      threadId: "th_1",
+      turnId: "t1",
+      durationMs: 954_765,
+      timestamp: "2026-09-08T08:22:19.094Z",
+      sequence: 623,
+    })).toMatchObject({
+      id: "stream:t1:summary",
+      kind: "system",
+      title: TURN_SUMMARY_TITLE,
+      body: "Worked for 15m 55s",
+    });
+  });
+
   it("captures the thread id from thread/started", () => {
     const state = createStreamJsonState();
     applyAppServerNotification(state, "thread/started", { thread: { id: "th_123" }, model: "gpt-5.6-sol" }, AT);
@@ -141,6 +162,7 @@ describe("applyAppServerNotification", () => {
     const summary = state.items.find((i) => i.title === TURN_SUMMARY_TITLE);
     expect(summary?.body).toContain("Worked for 12");
     expect(summary?.body).toContain("3.4k tokens");
+    expect(summary?.id).toBe("stream:t1:summary");
   });
 
   it("surfaces a failed turn instead of reporting a clean finish", () => {

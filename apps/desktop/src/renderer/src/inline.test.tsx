@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { BacklogCardsContext, backlogLinkId, renderInline } from "./inline";
+import { BacklogCardsContext, backlogLinkId, epicLinkId, renderInline } from "./inline";
 
 const html = (value: string): string => renderToStaticMarkup(<>{renderInline(value)}</>);
 
@@ -126,6 +126,15 @@ describe("backlogLinkId", () => {
     expect(backlogLinkId("https://example.com")).toBeNull();
     expect(backlogLinkId("panda://backlog/")).toBeNull();
     expect(backlogLinkId("panda://backlog/../../etc/passwd")).toBeNull();
+  });
+});
+
+describe("epicLinkId", () => {
+  it("takes stable Epic numbers and ids, but not paths", () => {
+    expect(epicLinkId("panda://epic/E12")).toBe("E12");
+    expect(epicLinkId("panda://epic/12")).toBe("12");
+    expect(epicLinkId("panda://epic/9e532a84")).toBe("9e532a84");
+    expect(epicLinkId("panda://epic/../../etc/passwd")).toBeNull();
   });
 });
 

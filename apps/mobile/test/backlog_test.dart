@@ -48,7 +48,9 @@ void main() {
       expect(columns.length, 5);
     });
 
-    test('keeps Review on the board while it is empty — it is a stage, not an inbox', () {
+    test(
+        'keeps Review on the board while it is empty — it is a stage, not an inbox',
+        () {
       final columns = board([
         {'id': 'a', 'title': 'Waiting', 'column': 'backlog'},
       ]).visibleColumns();
@@ -56,13 +58,20 @@ void main() {
       expect(columns, contains(BacklogColumn.review));
     });
 
-    test('a Pending holding only parked cards is empty until they are shown', () {
+    test('a Pending holding only parked cards is empty until they are shown',
+        () {
       final held = board([
-        {'id': 'a', 'title': 'Parked finding', 'column': 'pending', 'onHold': true},
+        {
+          'id': 'a',
+          'title': 'Parked finding',
+          'column': 'pending',
+          'onHold': true
+        },
       ]);
 
       expect(held.visibleColumns(), isNot(contains(BacklogColumn.pending)));
-      expect(held.visibleColumns(includeOnHold: true), contains(BacklogColumn.pending));
+      expect(held.visibleColumns(includeOnHold: true),
+          contains(BacklogColumn.pending));
     });
   });
 
@@ -218,6 +227,52 @@ void main() {
       final item = BacklogItem.fromDecrypted({'id': 'a', 'title': 'T'});
       expect(item.number, 0);
       expect(item.ref, '');
+    });
+  });
+
+  group('Epics and verification scenarios', () {
+    test('reads optional Epic membership and structured attempt history', () {
+      final parsed = WorkspaceBacklog.fromDecrypted({
+        'cwd': '/repo',
+        'epics': [
+          {
+            'id': 'e1',
+            'number': 4,
+            'title': 'Trusted review',
+            'summary': 'One outcome'
+          }
+        ],
+        'items': [
+          {
+            'id': 'a',
+            'title': 'Flow',
+            'epicId': 'e1',
+            'verificationScenarios': [
+              {
+                'id': 's1',
+                'title': 'Save persists',
+                'outcome': 'passed',
+                'verificationType': 'installed_app',
+                'actualOutcome': 'Persisted after reopen'
+              }
+            ]
+          }
+        ],
+      });
+      expect(parsed.epics.single.ref, 'E4');
+      expect(parsed.items.single.epicId, 'e1');
+      expect(
+          parsed.items.single.verificationScenarios.single.outcome, 'passed');
+    });
+
+    test('keeps legacy boards valid with no Epic or scenario fields', () {
+      final parsed = WorkspaceBacklog.fromDecrypted({
+        'items': [
+          {'id': 'a', 'title': 'Legacy'}
+        ]
+      });
+      expect(parsed.epics, isEmpty);
+      expect(parsed.items.single.verificationScenarios, isEmpty);
     });
   });
 

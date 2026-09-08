@@ -7,19 +7,25 @@ import type { PersistedThread } from "../shared/ipc";
 import {
   BACKLOG_COLUMNS,
   emptyBacklog,
+  findBacklogEpic,
   renderBacklog,
   renderBacklogItemDetail,
+  renderEpics,
   normalizeColumn,
   type BacklogAttachment,
   type BacklogColumn,
+  type VerificationOutcome,
 } from "../shared/backlog";
 import {
   attachBacklogFile,
   createBacklogStore,
   deleteBacklogAttachmentFiles,
   storeAdd as backlogStoreAdd,
+  storeAddEpic as backlogStoreAddEpic,
   storeDelete as backlogStoreDelete,
+  storeDeleteEpic as backlogStoreDeleteEpic,
   storeUpdate as backlogStoreUpdate,
+  storeUpdateEpic as backlogStoreUpdateEpic,
 } from "../shared/backlog-store";
 import { collectMachineStats } from "../shared/machine-probe";
 import { renderMachineStats } from "../shared/machine-stats";
@@ -868,6 +874,7 @@ export type BacklogAddRequest = {
   column?: string;
   verificationNotes?: string;
   attachments?: BacklogAttachmentRequest[];
+  epicId?: string;
 };
 
 /**
@@ -935,6 +942,19 @@ export type BacklogUpdateRequest = {
   verificationNotes?: string;
   addAttachments?: BacklogAttachmentRequest[];
   removeAttachmentIds?: string[];
+  epicId?: string | null;
+  addVerificationScenario?: {
+    title: string;
+    setup: string;
+    actions: string;
+    expectedOutcome: string;
+    actualOutcome: string;
+    outcome: VerificationOutcome;
+    verificationType: string;
+    evidenceAttachmentIds?: string[];
+    coverageLimits?: string;
+    createdBySection?: string;
+  };
 };
 
 export function updateBacklog(options: Options, idOrTitle: string, patch: BacklogUpdateRequest): string {
@@ -969,6 +989,34 @@ export function deleteBacklog(options: Options, idOrTitle: string): string {
 
   const result = backlogStoreDelete(createBacklogStore(options.backlogDir), options.cwd, idOrTitle);
   return result.ok ? result.message : `FAILED: ${result.message}`;
+}
+
+export function listEpics(options: Options): string {
+  if (!options.backlogDir) return backlogUnavailable();
+  return renderEpics(createBacklogStore(options.backlogDir).read(options.cwd));
+}
+
+export function addEpic(options: Options, input: { title: string; summary?: string; scope?: string; acceptanceCriteria?: string; acceptanceScenario?: string }): string {
+  if (!options.backlogDir) return backlogUnavailable();
+  const result = backlogStoreAddEpic(createBacklogStore(options.backlogDir), options.cwd, input);
+  return result.ok ? `${result.message}\n\n${renderEpics(result.backlog)}` : `FAILED: ${result.message}`;
+}
+
+export function updateEpic(options: Options, id: string, patch: { title?: string; summary?: string; scope?: string; acceptanceCriteria?: string; acceptanceScenario?: string }): string {
+  if (!options.backlogDir) return backlogUnavailable();
+  const result = backlogStoreUpdateEpic(createBacklogStore(options.backlogDir), options.cwd, id, patch);
+  return result.ok ? `${result.message}\n\n${renderEpics(result.backlog)}` : `FAILED: ${result.message}`;
+}
+
+export function deleteEpic(options: Options, id: string): string {
+  if (!options.backlogDir) return backlogUnavailable();
+  const result = backlogStoreDeleteEpic(createBacklogStore(options.backlogDir), options.cwd, id);
+  return result.ok ? result.message : `FAILED: ${result.message}`;
+}
+
+function resolveEpicId(options: Options, value: string | undefined): string | undefined {
+  if (!value || !options.backlogDir) return undefined;
+  return findBacklogEpic(createBacklogStore(options.backlogDir).read(options.cwd), value)?.id;
 }
 
 /**
@@ -1199,6 +1247,7 @@ const TOOLS = [
           description:
             "The evidence for this card, distinct from the description — what you actually checked, and what you did NOT. Paste the command and its real output for a backend change; pair with `attachments` for anything with pixels.",
         },
+        epic: { type: "string", description: "Optional Epic reference such as E2, or an unambiguous Epic title." },
         attachments: {
           type: "array",
           description:
@@ -1221,7 +1270,7 @@ const TOOLS = [
   {
     name: "backlog_update",
     description:
-      "Change a backlog item, or move it between columns — this is how you mark work started ('in_progress') and finished ('review'). Fields you omit are left as they are. Whenever you rewrite the description, rewrite the summary with it so the TL;DR does not describe an older state of the work.\n\nWhen the work is done, move it to 'review', not 'done': write `verificationNotes` saying what you actually checked and attach whatever shows it, then leave the card for the user. 'done' is their call once they have looked. This is enforced, not advice — a move to 'done' with no `verificationNotes` and no attachments is rejected.",
+      "Change a backlog item, or move it between columns — this is how you mark work started ('in_progress') and finished ('review'). Fields you omit are left as they are. Whenever you rewrite the description, rewrite the summary with it so the TL;DR does not describe an older state of the work.\n\nWhen the work is done, move it to 'review', not 'done': record what you actually checked and attach whatever shows it, then leave the card for the user. 'done' is their call once they have looked. This is enforced, not advice — an attachment by itself is not a verification result.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1245,6 +1294,7 @@ const TOOLS = [
           description:
             "The evidence for this card, in Markdown — what you actually checked, and what you did NOT. For a backend or CLI change, paste the command and its real output in a fenced block. For a UI change, describe what the attached screenshot shows. 'It compiles' and 'tests pass' without the output are claims, not evidence. Replaces the current note.",
         },
+        epic: { type: "string", description: "Epic reference to assign. Use an empty string to remove membership." },
         addAttachments: {
           type: "array",
           description:
@@ -1268,6 +1318,60 @@ const TOOLS = [
       required: ["id"],
       additionalProperties: false,
     },
+  },
+  {
+    name: "backlog_verify",
+    description:
+      "Append one scenario-based verification attempt to a card. Attempts are historical and immutable; the newest is shown as Latest. Record the actual result honestly—passed, failed, blocked, or not_run—and reference existing attachment ids rather than duplicating files.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Card number, id, or unambiguous title." },
+        title: { type: "string" },
+        setup: { type: "string", description: "Environment plus relevant build or revision." },
+        actions: { type: "string" },
+        expectedOutcome: { type: "string" },
+        actualOutcome: { type: "string" },
+        outcome: { type: "string", enum: ["passed", "failed", "blocked", "not_run"] },
+        verificationType: { type: "string", description: "For example live_e2e, mocked, renderer_only, installed_app, unit, or api." },
+        evidenceAttachmentIds: { type: "array", items: { type: "string" } },
+        coverageLimits: { type: "string", description: "What remains unverified or what this scenario does not cover." },
+      },
+      required: ["id", "title", "setup", "actions", "expectedOutcome", "actualOutcome", "outcome", "verificationType"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "epic_list",
+    description: "List this workspace's Epics, progress counts, blocked work, overall acceptance scenario, and member cards grouped by status.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "epic_add",
+    description: "Create a flat outcome-level Epic. Epics group existing cards; they do not own or nest conversation sections.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string" }, summary: { type: "string" }, scope: { type: "string" },
+        acceptanceCriteria: { type: "string" }, acceptanceScenario: { type: "string" },
+      },
+      required: ["title"], additionalProperties: false,
+    },
+  },
+  {
+    name: "epic_update",
+    description: "Edit an Epic's title, summary, scope/outcome, acceptance criteria, or overall acceptance scenario.",
+    inputSchema: {
+      type: "object", properties: {
+        id: { type: "string" }, title: { type: "string" }, summary: { type: "string" }, scope: { type: "string" },
+        acceptanceCriteria: { type: "string" }, acceptanceScenario: { type: "string" },
+      }, required: ["id"], additionalProperties: false,
+    },
+  },
+  {
+    name: "epic_delete",
+    description: "Delete an Epic and remove membership from its cards without deleting those cards or their evidence.",
+    inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
   },
   {
     name: "backlog_delete",
@@ -1770,6 +1874,8 @@ function callTool(options: Options, name: string, args: Record<string, unknown>)
     case "backlog_add": {
       const title = typeof args.title === "string" ? args.title.trim() : "";
       if (!title) return "backlog_add needs a `title`.";
+      const epicId = resolveEpicId(options, typeof args.epic === "string" ? args.epic : undefined);
+      if (typeof args.epic === "string" && args.epic.trim() && !epicId) return `No Epic matches ${JSON.stringify(args.epic)}. Call epic_list first.`;
       return addBacklog(options, {
         title,
         summary: typeof args.summary === "string" ? args.summary : undefined,
@@ -1778,6 +1884,7 @@ function callTool(options: Options, name: string, args: Record<string, unknown>)
         column: typeof args.column === "string" ? args.column : undefined,
         verificationNotes: typeof args.verificationNotes === "string" ? args.verificationNotes : undefined,
         attachments: parseAttachmentRequests(args.attachments),
+        epicId,
       });
     }
     case "backlog_update": {
@@ -1791,10 +1898,43 @@ function callTool(options: Options, name: string, args: Record<string, unknown>)
         column: typeof args.column === "string" ? args.column : undefined,
         onHold: typeof args.onHold === "boolean" ? args.onHold : undefined,
         verificationNotes: typeof args.verificationNotes === "string" ? args.verificationNotes : undefined,
+        epicId:
+          typeof args.epic === "string"
+            ? args.epic.trim()
+              ? (resolveEpicId(options, args.epic) ?? "__missing_epic__")
+              : null
+            : undefined,
         addAttachments: parseAttachmentRequests(args.addAttachments),
         removeAttachmentIds: Array.isArray(args.removeAttachmentIds) ? args.removeAttachmentIds.filter((id): id is string => typeof id === "string") : undefined,
       });
     }
+    case "backlog_verify": {
+      const id = typeof args.id === "string" ? args.id.trim() : "";
+      const outcome = typeof args.outcome === "string" ? args.outcome : "";
+      if (!id || !["passed", "failed", "blocked", "not_run"].includes(outcome)) return "backlog_verify needs a card id and valid outcome.";
+      return updateBacklog(options, id, {
+        addVerificationScenario: {
+          title: String(args.title ?? "Verification"),
+          setup: String(args.setup ?? ""),
+          actions: String(args.actions ?? ""),
+          expectedOutcome: String(args.expectedOutcome ?? ""),
+          actualOutcome: String(args.actualOutcome ?? ""),
+          outcome: outcome as VerificationOutcome,
+          verificationType: String(args.verificationType ?? "other"),
+          evidenceAttachmentIds: Array.isArray(args.evidenceAttachmentIds) ? args.evidenceAttachmentIds.filter((value): value is string => typeof value === "string") : undefined,
+          coverageLimits: typeof args.coverageLimits === "string" ? args.coverageLimits : undefined,
+          createdBySection: selfLabel(options),
+        },
+      });
+    }
+    case "epic_list":
+      return listEpics(options);
+    case "epic_add":
+      return addEpic(options, { title: String(args.title ?? ""), summary: typeof args.summary === "string" ? args.summary : undefined, scope: typeof args.scope === "string" ? args.scope : undefined, acceptanceCriteria: typeof args.acceptanceCriteria === "string" ? args.acceptanceCriteria : undefined, acceptanceScenario: typeof args.acceptanceScenario === "string" ? args.acceptanceScenario : undefined });
+    case "epic_update":
+      return updateEpic(options, String(args.id ?? ""), { title: typeof args.title === "string" ? args.title : undefined, summary: typeof args.summary === "string" ? args.summary : undefined, scope: typeof args.scope === "string" ? args.scope : undefined, acceptanceCriteria: typeof args.acceptanceCriteria === "string" ? args.acceptanceCriteria : undefined, acceptanceScenario: typeof args.acceptanceScenario === "string" ? args.acceptanceScenario : undefined });
+    case "epic_delete":
+      return deleteEpic(options, String(args.id ?? ""));
     case "backlog_delete": {
       const id = typeof args.id === "string" ? args.id.trim() : "";
       if (!id) return "backlog_delete needs an `id` — a card number like \"#12\". Call backlog_list first.";
@@ -2239,6 +2379,12 @@ function main(): void {
       metadata: flags.get("metadata"),
       column: flags.get("column"),
       verificationNotes: flags.get("verification"),
+      epicId:
+        flags.has("epic")
+          ? flags.get("epic")?.trim()
+            ? (resolveEpicId(options, flags.get("epic")) ?? "__missing_epic__")
+            : null
+          : undefined,
     };
     // One `--attach` per call, like every other repeatable-in-spirit flag here —
     // the underlying map holds one value per name. An agent attaching several
@@ -2261,11 +2407,11 @@ function main(): void {
         process.exitCode = 1;
         return;
       }
-      process.stdout.write(`${addBacklog(options, { title: subject, ...patch, attachments })}\n`);
+      process.stdout.write(`${addBacklog(options, { title: subject, ...patch, epicId: patch.epicId ?? undefined, attachments })}\n`);
       return;
     }
 
-    if (verb === "update" || verb === "move" || verb === "review" || verb === "done" || verb === "hold" || verb === "unhold") {
+    if (verb === "update" || verb === "move" || verb === "review" || verb === "done" || verb === "hold" || verb === "unhold" || verb === "verify") {
       if (!subject) {
         process.stdout.write(
           'Usage: panda-peers backlog update <#number-or-title> [--title <text>] [--summary <one line>] [--description <markdown>] [--metadata <text>] [--column backlog|in_progress|review|done] [--verification <text>] [--attach <path>] [--caption <text>] [--unattach <attachment id>]\n' +
@@ -2283,6 +2429,26 @@ function main(): void {
       const column = verb === "review" || verb === "done" ? verb : patch.column;
       const onHold = verb === "hold" ? true : verb === "unhold" ? false : undefined;
       const unattach = flags.get("unattach");
+      const scenarioOutcome = flags.get("outcome");
+      const addVerificationScenario = verb === "verify" && scenarioOutcome
+        ? {
+            title: flags.get("scenario") ?? "Verification",
+            setup: flags.get("setup") ?? "",
+            actions: flags.get("actions") ?? "",
+            expectedOutcome: flags.get("expected") ?? "",
+            actualOutcome: flags.get("actual") ?? "",
+            outcome: scenarioOutcome as VerificationOutcome,
+            verificationType: flags.get("type") ?? "other",
+            evidenceAttachmentIds: flags.get("evidence")?.split(",").map((id) => id.trim()).filter(Boolean),
+            coverageLimits: flags.get("limits"),
+            createdBySection: selfLabel(options),
+          }
+        : undefined;
+      if (verb === "verify" && !["passed", "failed", "blocked", "not_run"].includes(scenarioOutcome ?? "")) {
+        process.stdout.write('Usage: panda-peers backlog verify <card> --outcome passed|failed|blocked|not_run --scenario "<name>" --setup "<environment/revision>" --actions "<steps>" --expected "<expected>" --actual "<actual>" [--type live_e2e|mocked|renderer_only|installed_app|unit|api] [--evidence <attachment ids>] [--limits <gaps>]\n');
+        process.exitCode = 1;
+        return;
+      }
       process.stdout.write(
         `${updateBacklog(options, subject, {
           ...patch,
@@ -2291,6 +2457,7 @@ function main(): void {
           onHold,
           addAttachments: attachments,
           removeAttachmentIds: unattach ? [unattach] : undefined,
+          addVerificationScenario,
         })}\n`,
       );
       return;
@@ -2307,6 +2474,32 @@ function main(): void {
     }
 
     process.stdout.write(`Unknown backlog command ${JSON.stringify(verb)}. Use list, add, update, review, done, hold, unhold or delete.\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (command === "epic") {
+    const [verb, ...words] = [target, ...rest].filter((token) => token !== undefined);
+    const subject = words.join(" ").trim();
+    if (!verb || verb === "list" || verb === "show") {
+      process.stdout.write(`${listEpics(options)}\n`);
+      return;
+    }
+    if (verb === "add") {
+      if (!subject) { process.stdout.write('Usage: panda-peers epic add "<title>" [--summary <text>] [--scope <text>] [--acceptance <text>] [--scenario <text>]\n'); process.exitCode = 1; return; }
+      process.stdout.write(`${addEpic(options, { title: subject, summary: flags.get("summary"), scope: flags.get("scope"), acceptanceCriteria: flags.get("acceptance"), acceptanceScenario: flags.get("scenario") })}\n`);
+      return;
+    }
+    if (verb === "update") {
+      if (!subject) { process.stdout.write('Usage: panda-peers epic update <E#-or-title> [--title <text>] [--summary <text>] [--scope <text>] [--acceptance <text>] [--scenario <text>]\n'); process.exitCode = 1; return; }
+      process.stdout.write(`${updateEpic(options, subject, { title: flags.get("title"), summary: flags.get("summary"), scope: flags.get("scope"), acceptanceCriteria: flags.get("acceptance"), acceptanceScenario: flags.get("scenario") })}\n`);
+      return;
+    }
+    if (verb === "delete" || verb === "remove") {
+      process.stdout.write(`${deleteEpic(options, subject)}\n`);
+      return;
+    }
+    process.stdout.write(`Unknown epic command ${JSON.stringify(verb)}. Use list, add, update or delete.\n`);
     process.exitCode = 1;
     return;
   }

@@ -199,6 +199,13 @@ type MirrorState = {
   /** Whether the relay is known to hold a routing row for this session already. */
   registered: boolean;
   pendingItems: Map<string, PendingConversationItem>;
+  /**
+   * Latest snapshots of continuously-growing assistant/reasoning items. Keep
+   * these local while the agent is merely adding text, then promote them at a
+   * meaningful boundary (tool/message arrival, approval, turn end, or exit).
+   * This prevents rewriting an ever-larger ciphertext once per stream tick.
+   */
+  deferredItems: Map<string, PendingConversationItem>;
   sentItems: Map<string, string>;
   timer?: NodeJS.Timeout;
   flushing: boolean;
@@ -311,6 +318,10 @@ export type RemoteBacklogRequest = {
   onHold?: boolean;
   index?: number;
   verificationNotes?: string;
+  epicId?: string | null;
+  scope?: string;
+  acceptanceCriteria?: string;
+  acceptanceScenario?: string;
   /** The phone can drop an attachment but not add one — no bytes ride this channel yet. */
   removeAttachmentIds?: string[];
 };
@@ -724,6 +735,21 @@ function commandErrorMessage(error: unknown): string {
 function stableItemFingerprint(item: ConversationItem): string {
   const { sequence: _sequence, ...stable } = item;
   return JSON.stringify(stable);
+}
+
+/** Narrative bodies grow token by token; intermediate full snapshots are not deltas. */
+function isContinuouslyGrowingItem(item: ConversationItem): boolean {
+  const extended = item as ConversationItem & { thinking?: boolean };
+  return item.kind === "assistant" || extended.thinking === true ||
+    (item.kind === "system" && item.title === "Thinking");
+}
+
+/** Make the latest deferred narrative snapshots eligible for the next append. */
+function promoteDeferredItems(mirror: MirrorState): void {
+  for (const [itemId, entry] of mirror.deferredItems) {
+    mirror.pendingItems.set(itemId, entry);
+  }
+  mirror.deferredItems.clear();
 }
 
 function remoteImageExtension(mimeType: string, name: string): string {
@@ -1899,9 +1925,11 @@ export class RelayBridge {
         this.observeConversation(id, payload);
         break;
       case "session:prompt-submitted":
+        promoteDeferredItems(mirror);
         this.scheduleFlush(id, true);
         break;
       case "session:exit":
+        promoteDeferredItems(mirror);
         mirror.status = "exited";
         mirror.agentState = "exited";
         if (mirror.runtime) {
@@ -2555,6 +2583,10 @@ export class RelayBridge {
       onHold: typeof payload.onHold === "boolean" ? payload.onHold : undefined,
       index: typeof payload.index === "number" ? payload.index : undefined,
       verificationNotes: typeof payload.verificationNotes === "string" ? payload.verificationNotes : undefined,
+      epicId: typeof payload.epicId === "string" ? payload.epicId : payload.epicId === null ? null : undefined,
+      scope: typeof payload.scope === "string" ? payload.scope : undefined,
+      acceptanceCriteria: typeof payload.acceptanceCriteria === "string" ? payload.acceptanceCriteria : undefined,
+      acceptanceScenario: typeof payload.acceptanceScenario === "string" ? payload.acceptanceScenario : undefined,
       removeAttachmentIds: Array.isArray(payload.removeAttachmentIds)
         ? payload.removeAttachmentIds.filter((id): id is string => typeof id === "string")
         : undefined,
@@ -2744,6 +2776,7 @@ export class RelayBridge {
         metadataVersion: 0,
         registered: false,
         pendingItems: new Map(),
+        deferredItems: new Map(),
         sentItems: new Map(),
         flushing: false,
         queuedPrompts: [],
@@ -2794,6 +2827,7 @@ export class RelayBridge {
       ...(typeof payload.pendingPromptId === "string" ? { pendingPromptId: payload.pendingPromptId } : {}),
     };
     const mirror = this.mirror(sessionId);
+    const previousAgentState = mirror.agentState;
     const status: SessionStatus =
       runtime.agentState === "exited" ? "exited" : runtime.currentEventType === "process:error" ? "error" : "running";
     // A runtime tick arrives about once a second per streaming session, and only
@@ -2817,6 +2851,17 @@ export class RelayBridge {
     mirror.agentState = runtime.agentState;
     mirror.status = status;
     if (runtime.claudeSessionId) mirror.claudeSessionId = runtime.claudeSessionId;
+    // A state boundary is the point at which the phone needs the complete
+    // narrative: the turn finished, stopped for approval, or exited. Until then
+    // the latest snapshot stays local instead of being rewritten every tick.
+    if (
+      runtime.agentState !== previousAgentState &&
+      (runtime.agentState === "waiting" ||
+        runtime.agentState === "needs_action" ||
+        runtime.agentState === "exited")
+    ) {
+      promoteDeferredItems(mirror);
+    }
     this.scheduleFlush(sessionId, runtime.agentState === "exited" || runtime.agentState === "needs_action");
     // The turn just ended with something queued behind it — flush the oldest
     // entry now instead of waiting for the user to notice and tap "send now".
@@ -2859,6 +2904,7 @@ export class RelayBridge {
   private observeConversation(sessionId: string, payload: Record<string, unknown>): void {
     if (!Array.isArray(payload.items)) return;
     const mirror = this.mirror(sessionId);
+    let reachedBoundary = false;
     for (const candidate of payload.items) {
       if (!isRecord(candidate) || typeof candidate.id !== "string" || typeof candidate.body !== "string") continue;
       const item = candidate as ConversationItem;
@@ -2871,9 +2917,18 @@ export class RelayBridge {
       // (it dedups by id + sorts by timestamp), so it is safe to exclude.
       const serialized = stableItemFingerprint(item);
       if (mirror.sentItems.get(item.id) !== serialized) {
-        mirror.pendingItems.set(item.id, { item, serialized });
+        const entry = { item, serialized };
+        if (isContinuouslyGrowingItem(item) && mirror.agentState === "working") {
+          mirror.deferredItems.set(item.id, entry);
+        } else {
+          mirror.pendingItems.set(item.id, entry);
+          reachedBoundary = true;
+        }
       }
     }
+    // A user/tool/marker arrival is itself a meaningful transcript boundary.
+    // Include the latest assistant/reasoning snapshot in the same append.
+    if (reachedBoundary) promoteDeferredItems(mirror);
     if (typeof payload.claudeSessionId === "string") mirror.claudeSessionId = payload.claudeSessionId;
     if (mirror.pendingItems.size > 0) this.scheduleFlush(sessionId, false);
   }
